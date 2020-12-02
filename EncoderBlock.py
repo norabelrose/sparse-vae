@@ -1,6 +1,6 @@
 from torch import nn
 from .AutoencoderConfig import *
-from .RelativePositionalAttention import RelativePositionalAttention
+from .funnel_transformers.ops import RelativePositionalAttention
 
 
 class EncoderLayer(nn.Module):
@@ -17,4 +17,4 @@ class EncoderBlock(nn.Module):
         num_layers = config.latent_structure.block_sizes[block_index]
         self.layers = [EncoderLayer(config) for _ in range(num_layers)]
 
-    def forward(self):
+    #def forward(self):

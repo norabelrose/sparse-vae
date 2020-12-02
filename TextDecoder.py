@@ -1,20 +1,14 @@
 import fast_transformers
 import torch.nn.functional as F
-from .AutoencoderCells import *
-from .TextVAEConfig import TextVAEConfig
+from .AutoencoderConfig import AutoencoderConfig
 
 class TextDecoder(nn.Module):
-    def __init__(self, config: TextVAEConfig):
+    def __init__(self, config: AutoencoderConfig):
         super().__init__()
         
         # The architecture allows arbitrary scale factors- although it's unclear how well the model will do
         # if we train it using one tuple of scaling factors and then switch at test time
-        self.scale_factors = scale_factors
-        
-        # We implement weight tying by just having one cell that we iterate over multiple times
-        num_cells = len(scale_factors) if not tie_weights else 1
-        self.decoder_cells = [DecoderCell(768, 12) for _ in range(num_cells)]
-        self.combiner_cells = [CombinerCell(768) for _ in range(num_cells)]
+        self.scale_factors = config.latent_structure.scaling_factors
         
         # Build a linear 'Transformers are RNNs' autoregressive decoder
         if config.use_autoregressive_decoding:
