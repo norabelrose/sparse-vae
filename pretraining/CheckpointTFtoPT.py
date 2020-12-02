@@ -17,23 +17,11 @@
 from collections import OrderedDict
 import json
 
-
-from absl import flags
 import torch
 import tensorflow as tf
 import numpy as np
 
 from funnel_transformers.modeling import FunnelConfig
-flags.DEFINE_string("input_ckpt_path", "",
-                    help="input ckpt for cleaning")
-flags.DEFINE_string("input_config_path", "",
-                    help="input ckpt for cleaning")
-flags.DEFINE_string("output_pt_path", "",
-                    help="output path for torch version ckpt")
-flags.DEFINE_string("output_config_path", "",
-                    help="output path for torch version config")
-
-FLAGS = flags.FLAGS
 
 
 def convert_to_tensor(x, idx=None):
@@ -147,15 +135,14 @@ def modify_json_data(json_data):
     return json_data
 
 
-def clean_ckpt(_):
+def convert_checkpoint(input_ckpt_path, output_ckpt_path, input_config_path, output_config_path):
     """Core function."""
-    input_ckpt = FLAGS.input_ckpt_path
     model = {}
-    tf.reset_default_graph()
+    # tf.reset_default_graph()
 
-    tf.logging.info("Loading from %s", input_ckpt)
-    var_list = tf.train.list_variables(input_ckpt)
-    reader = tf.train.load_checkpoint(input_ckpt)
+    print("convert_checkpoint: Loading from ", input_ckpt_path)
+    var_list = tf.train.list_variables(input_ckpt_path)
+    reader = tf.train.load_checkpoint(input_ckpt_path)
     var_values, var_dtypes = {}, {}
 
     # clean optimizer
@@ -172,12 +159,12 @@ def clean_ckpt(_):
     new_model = OrderedDict()
     prefix = "model/"
     tgt_prefix = ""
-    with open(FLAGS.input_config_path) as f:
+    with open(input_config_path) as f:
         json_data = json.load(f)
     json_data = modify_json_data(json_data)
-    with open(FLAGS.output_config_path, "w") as f:
+    with open(output_config_path, "w") as f:
         json.dump(json_data, f, indent=4, sort_keys=True)
-    net_config = FunnelConfig(**json_data)
+    net_config = FunnelConfig.from_old_config(json_data)
     embed_param(new_model, tf_model, prefix, tgt_prefix)
     cum_layer_idx = 0
     for block_idx in range(net_config.n_block):
@@ -186,4 +173,4 @@ def clean_ckpt(_):
             ffn_param(new_model, tf_model, prefix, tgt_prefix, cum_layer_idx)
             ln_param(new_model, tf_model, prefix, tgt_prefix, cum_layer_idx)
             cum_layer_idx += 1
-    torch.save(new_model, FLAGS.output_pt_path)
+    torch.save(new_model, output_ckpt_path)

@@ -2,7 +2,7 @@ import fast_transformers
 import torch.nn.functional as F
 from .AutoencoderConfig import AutoencoderConfig
 
-class TextDecoder(nn.Module):
+class Decoder(nn.Module):
     def __init__(self, config: AutoencoderConfig):
         super().__init__()
         

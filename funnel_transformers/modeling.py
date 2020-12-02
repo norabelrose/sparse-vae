@@ -1,5 +1,4 @@
-"""Funnel-Transformer."""
-
+from __future__ import annotations
 import torch
 import torch.nn as nn
 
@@ -27,9 +26,12 @@ def parse_depth_string(depth_str):
 class FunnelConfig(SerializableObject):
     """ModelConfig contains fixed hyperparameters of a FunnelTFM model."""
 
-    keys = ["vocab_size", "d_embed", "d_model", "n_head", "d_head",
-            "d_inner", "dropout", "dropatt", "dropact", "block_size",
-            "pooling_type", "pooling_size", "separate_cls", "pool_q_only"]
+    # Maps the 'old' names of attributes used by the pretrained Funnel Transformer config files to the
+    # new, more descriptive names that we use. If there's no change, we don't map it here.
+    old_to_new: ClassVar[dict] = {
+        "dropatt": 'attention_dropout',
+        "dropact": 'ffn_dropout'
+    }
 
     vocab_size: int
     d_embed: int
@@ -46,6 +48,10 @@ class FunnelConfig(SerializableObject):
     separate_cls: bool
     pool_q_only: bool
 
+    attention_type: str = "rel_shift"
+    max_position_embeddings: int = 512
+    use_performer_attention: bool = False
+
     def __post_init__(self):
         block_size = self.block_size.split("_")
         self.n_block = len(block_size)
@@ -55,6 +61,15 @@ class FunnelConfig(SerializableObject):
             block_size_i = parse_depth_string(block_size[i])
             self.block_param.append(block_size_i[0])
             self.block_rep.append(block_size_i[1])
+
+    @classmethod
+    def from_old_config(cls, old_data: dict) -> FunnelConfig:
+        for old_key, value in old_data.items():
+            if old_key in cls.old_to_new:
+                new_key = cls.old_to_new[old_key]
+                old_data[new_key] = old_data.pop(old_key)
+
+        return cls.from_dict(old_data)
 
     @staticmethod
     def init_from_args(args):

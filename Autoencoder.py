@@ -3,11 +3,11 @@ from torch import nn
 from transformers import FunnelTokenizerFast, FunnelBaseModel
 from typing import *
 from .AutoencoderConfig import *
-from .TextEncoder import TextEncoder
-from .TextDecoder import TextDecoder
+from .Encoder import Encoder
+from .Decoder import Decoder
 
 
-class TextAutoencoder(nn.Module):
+class Autoencoder(nn.Module):
     def __init__(self, config: AutoencoderConfig):
         super().__init__()
 
@@ -21,8 +21,8 @@ class TextAutoencoder(nn.Module):
         else:
             funnel = None
 
-        self.encoder = TextEncoder(config, funnel_to_use = funnel)
-        self.decoder = TextDecoder(config, funnel_to_use = funnel)
+        self.encoder = Encoder(config, funnel_to_use = funnel)
+        self.decoder = Decoder(config, funnel_to_use = funnel)
 
         #num_cells = len(scale_factors) if not tie_weights else 1
         #self.combiner_cells = [CombinerCell(768, 12) for _ in range(num_cells)]

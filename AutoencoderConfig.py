@@ -2,8 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import *
 
-from transformers import FunnelConfig
 from Utilities import *
+from .funnel_transformers.modeling import FunnelConfig
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 
-class TextEncoder(nn.Module):
+class Encoder(nn.Module):
     def __init__(self, config: AutoencoderConfig, funnel_to_use: Optional[FunnelBaseModel] = None):
         super().__init__()
         
