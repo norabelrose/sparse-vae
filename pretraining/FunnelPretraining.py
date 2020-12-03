@@ -225,7 +225,7 @@ def electra_loss_func(generator, model, features, is_training):
             is_training,
             seg_id=seg_id,
             input_mask=pad_mask)
-        if generator.funnel_config.n_block > 1:
+        if generator.config.n_block > 1:
             masked_hidden, _ = generator.decoder(
                 masked_hiddens,
                 is_training,
@@ -261,7 +261,7 @@ def electra_loss_func(generator, model, features, is_training):
             is_training,
             seg_id=seg_id,
             input_mask=pad_mask)
-        if model.funnel_config.n_block > 1:
+        if model.config.n_block > 1:
             sample_hidden, _ = model.decoder(
                 sample_hiddens,
                 is_training,

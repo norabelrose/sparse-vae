@@ -1,11 +1,13 @@
 import os
+import re
 import requests
 import tarfile
-import tqdm.auto as tqdm
+import tensorflow as tf
+from collections import OrderedDict
+from tqdm.auto import tqdm
 from typing import *
 
-from .funnel_transformers.modeling import FunnelTransformer
-from .pretraining.CheckpointTFtoPT import convert_checkpoint
+from .funnel_transformers.modeling import FunnelTransformer, FunnelConfig
 
 
 class PretrainedModelManager:
@@ -14,6 +16,12 @@ class PretrainedModelManager:
         (6, 6, 6): "B6-6-6H768-ELEC",
         (8, 8, 8): "B8-8-8H1024-ELEC",
         (10, 10, 10): "B10-10-10H1024-ELEC"
+    }
+    block_size_to_dims: ClassVar[dict] = {
+        (4, 4, 4): (768, 12),  # d_model and num_heads
+        (6, 6, 6): (768, 12),
+        (8, 8, 8): (1024, 16),
+        (10, 10, 10): (1024, 16)
     }
 
     @classmethod
@@ -26,6 +34,7 @@ class PretrainedModelManager:
         if funnel_layout not in cls.block_size_to_name:
             return None
 
+        # noinspection PyTypeChecker
         name = cls.block_size_to_name[funnel_layout]
         if include_generator:
             name += "-FULL"
@@ -94,3 +103,62 @@ class PretrainedModelManager:
 
         if not os.path.exists(path):
             cls.download_model_for_block_layout(block_layout, include_generator)
+
+        raise NotImplementedError
+
+    @classmethod
+    def _get_generator_and_model_from_tf_ckpt(cls, path: str, block_layout: Tuple[int, ...]) -> \
+            Tuple[FunnelTransformer, FunnelTransformer]:
+        reader = tf.train.load_checkpoint(path)
+        var_list = tf.train.list_variables(path)
+
+        # noinspection PyTypeChecker
+        d_model, num_heads = cls.block_size_to_dims[block_layout]
+        generator = FunnelTransformer(FunnelConfig(
+            block_sizes=block_layout,
+            d_model=d_model // 4,
+            n_head=num_heads // 4
+        ))
+        model = FunnelTransformer(FunnelConfig(
+            block_sizes=block_layout,
+            d_model=d_model,
+            n_head=num_heads
+        ))
+        layer_regex = re.compile('layer_([0-9]+)/')
+
+        # Example: 'generator/encoder/layer_0/rel_attn/layer_norm/gamma' -> (0, 'attention.layer_norm.weight')
+        def apply_tf_variable_to_model_if_needed(funnel: FunnelTransformer, key_path: str, tf_reader):
+            if 'adam' in key_path:  # We don't care about optimizer states
+                return
+
+            result = layer_regex.match(key_path)
+            if result is None:  # Shouldn't actually happen but just in case
+                return
+
+            tensor = tf_reader.get_tensor(key_path)
+
+            layer_num = int(result.group(1))
+            key_path = key_path[result.span()[1]:]
+
+            tf_to_pt = OrderedDict([
+                ('r/kernel', 'r_kernel'),     # This is implemented as a separate layer in TF but not in PyTorch
+                ('/', '.'),
+                ('rel_attn', 'attention'),
+                ('_head', ''),                # e.g. 'q_head' -> 'q'
+                ('kernel', 'weight'),
+                ('beta', 'bias'),             # For layer norm
+                ('gamma', 'weight')
+            ])
+            for old, new in tf_to_pt:
+                key_path = key_path.replace(old, new)
+
+            funnel.apply_weight_tensor_with_key_path(layer_num, key_path, tensor)
+
+        for var_name, size in var_list:
+            if var_name.startswith('generator/encoder/'):
+                apply_tf_variable_to_model_if_needed(generator, var_name, reader)
+
+            if var_name.startswith('model/encoder/'):
+                apply_tf_variable_to_model_if_needed(model, var_name, reader)
+
+        return generator, model

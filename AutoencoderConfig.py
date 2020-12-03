@@ -6,7 +6,7 @@ from Utilities import *
 from .funnel_transformers.modeling import FunnelConfig
 
 
-@dataclass(frozen=True)
+@dataclass
 class LatentStructure(SerializableObject):
     # The number of layers in each block in the encoder; sequence is reversed for the decoder
     block_sizes: Tuple[int, ...]
@@ -120,8 +120,9 @@ class AutoencoderConfig(SerializableObject):
 
     def get_funnel_config(self) -> FunnelConfig:
         return FunnelConfig(
-            attention_type="factorized" if self.use_performer_attention else "relative_shift",
-            block_sizes=list(self.latent_structure.block_sizes[0:3]),
+            attention_type="factorized" if self.use_performer_attention else "rel_shift",
+            block_sizes=self.latent_structure.block_sizes[0:3],
             max_position_embeddings=self.max_sequence_length,
-            use_performer_attention=self.use_performer_attention
+            use_performer_attention=self.use_performer_attention,
+            hiddens_to_return='per_block'
         )
