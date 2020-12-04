@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import *
 import json
 import logging
 import os
@@ -8,6 +9,21 @@ import sys
 # Get a new dictionary inverting the keys and values from a source dictionary
 def invert(source: dict) -> dict:
     return dict((value, key) for key, value in source.items())
+
+
+# Swap positions in a list
+def swap(_list: List, index1: int, index2: int):
+    value1, value2 = _list[index1], _list[index2]
+    _list[index2] = value1
+    _list[index1] = value2
+
+
+# Performs a series of replace operations on a string defined by a list of tuples of strings
+def replace_all(string: str, mappings: List[Tuple[str, str]]) -> str:
+    for old, new in mappings:
+        string = string.replace(old, new)
+
+    return string
 
 
 # Convenience for saving and loading objects from JSON

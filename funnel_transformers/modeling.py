@@ -27,7 +27,7 @@ class FunnelConfig(SerializableObject):
     dropout: float = 0.1
     ffn_dropout: float = 0.0
     pooling_type: str = 'mean'
-    scaling_factor: int = 2
+    scaling_factors: Union[float, Tuple[float, ...]] = 2.0
     separate_cls: bool = True
     pool_q_only: bool = True
     truncate_seq: bool = True
@@ -44,6 +44,16 @@ class FunnelConfig(SerializableObject):
     # Which hidden states to return on forward(). Possible values: 'all', 'per_block', 'final'.
     hiddens_to_return: str = 'all'
 
+    def __post_init__(self):
+        # Turn a single floating point scaling factor x into (x, x, x...) of the appropriate length
+        if isinstance(self.scaling_factors, float):
+            factor = self.scaling_factors
+            self.scaling_factors = (factor for _ in range(len(self.block_sizes) - 1))
+
+        # Make it so scaling_factors and block_sizes are equal length; last scaling factor is 1.0 (no scaling)
+        if len(self.scaling_factors) < len(self.block_sizes):
+            self.scaling_factors += (1.0,)
+
 
 class FunnelTransformer(nn.Module):
     """FunnelTFM model."""
@@ -57,7 +67,7 @@ class FunnelTransformer(nn.Module):
 
         self.pos_drop = nn.Dropout(config.dropout)
 
-        self.attn_info = AttentionStructure(config)
+        self.attn_info = None
         self.attn_layers = nn.ModuleList()
         self.pffn_layers = nn.ModuleList()
         for block_index, size in enumerate(config.block_sizes):
@@ -81,37 +91,6 @@ class FunnelTransformer(nn.Module):
                 Dense(config.d_model, self.config.num_classes))
             self.cls_loss = nn.CrossEntropyLoss()
 
-    # key_path is string of form 'attention.q.weight' or 'ff.dense1.bias'
-    def apply_weight_tensor_with_key_path(self, layer_num: int, key_path: str, weights: torch.tensor):
-        keys = key_path.split('.')
-        last_key = key_path[-1]
-        dense = None
-
-        # For attention layers
-        if keys[0] == 'attention':
-            attention_layer = self.attn_layers[layer_num]
-
-            # Special case- parameters directly held by RelPosAtt, and not attached to a Dense layer
-            if hasattr(attention_layer, last_key):
-                # Possible attributes are: seg_embed, r_kernel, r_r_bias, r_s_bias, r_w_bias
-                setattr(attention_layer, last_key, weights)
-                return
-
-            if keys[1] in ('q', 'k', 'v'):
-                dense = getattr(attention_layer, keys[1] + "_head")  # q_head, k_head, v_head
-            elif keys[1] == 'o':
-                dense = attention_layer.post_proj
-            elif keys[1] == 'layer_norm':
-                dense = attention_layer.layer_norm
-        elif keys[0] == 'ff':
-            ff_layer = self.pffn_layers[layer_num]
-
-            if hasattr(ff_layer, keys[1]):
-                dense = getattr(ff_layer, keys[1])  # dense1, dense2, layer_norm
-
-        if hasattr(dense, last_key):
-            setattr(dense, last_key)  # weight, bias
-
     def forward(self, inputs, input_mask=None, seg_id=None, cls_target=None):
         if input_mask is None and self.config.pad_id is not None:
             input_mask = inputs == self.config.pad_id
@@ -125,17 +104,21 @@ class FunnelTransformer(nn.Module):
         if net_config.hiddens_to_return == 'all':
             hiddens.append(word_embed)
 
+        # Lazily create the Attention Structure object, or create a new one if the
+        # (padded) sequence length, dtype, or device of our input changed since last time
+        attn_info = self.attn_info
+        seq_len, dtype, device = output.size(1), output.dtype, output.device
+        if not attn_info or (seq_len, dtype, device) != (attn_info.seq_len, attn_info.dtype, attn_info.device):
+            self.attn_info = AttentionStructure(net_config, seq_len, dtype, device)
+
         layer_idx = 0
-        attn_struct = self.attn_info.init_attn_structure(output, seg_id, input_mask)
+        attn_struct = attn_info.get_fresh_attn_tuple(seg_id, input_mask)
         for block_idx, size in enumerate(net_config.block_sizes):
-            if net_config.separate_cls:
-                pooling_flag = output.size(1) > 2
-            else:
-                pooling_flag = output.size(1) > 1
+            # Just make sure we don't shrink the length down further than 1 token
+            pooling_flag = output.size(1) > 2 if net_config.separate_cls else output.size(1) > 1
 
             if block_idx > 0 and pooling_flag:
-                pooled_out, attn_struct, _ = self.attn_info.pre_attn_pooling(
-                    output, attn_struct)
+                pooled_out, attn_struct, _ = attn_info.pre_attn_pooling(output, attn_struct)
             for param_idx in range(size):
                 do_pooling = param_idx == 0 and block_idx > 0 and pooling_flag
 
@@ -189,3 +172,36 @@ def update_monitor_dict(tgt, src, prefix=None):
             tgt["{}/{}".format(prefix, k)] = v
 
     return tgt
+
+
+class FunnelLayer(nn.Module):
+    def __init__(self, config: FunnelConfig, block_index: int):
+        super().__init__()
+
+        self.attention = RelativePositionalAttention(config, block_index)
+        self.feedforward = PositionwiseFFN(config.d_model, config.d_model * 4, config.dropout, config.ffn_dropout)
+
+    # Q is different from K and V right after pooling; K and V are always the same
+    def forward(self, q, kv, attention_struct):
+        x = self.attention(q, kv, kv, attention_struct)
+        return self.feedforward(x)
+
+
+class FunnelBlock(nn.Module):
+    def __init__(self, config: FunnelConfig, block_index: int):
+        super().__init__()
+
+        block_size = config.block_sizes[block_index]
+        self.layers = [FunnelLayer(config, block_index) for _ in range(block_size)]
+
+        # Don't scale if we're the last block
+        self.scale_factor = config.scaling_factors if block_index != len(config.block_sizes) - 1 else 1.0
+
+    def forward(self, q, kv, attention_struct):
+        x = self.layers[0](q, kv, attention_struct)
+
+        for layer in self.layers[1:]:
+            x = layer(x, attention_struct)
+
+        if self.scale_factor == 1.0:
+            return x

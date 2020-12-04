@@ -5,7 +5,7 @@ import torch.nn.functional as F
 class AttentionStructure(nn.Module):
     """Relative multi-head attention."""
 
-    def __init__(self, net_config: FunnelConfig, dtype=torch.float32, device=None):
+    def __init__(self, net_config: FunnelConfig, seq_len, dtype=torch.float32, device=None):
         super(AttentionStructure, self).__init__()
 
         self.net_config = net_config
@@ -14,7 +14,15 @@ class AttentionStructure(nn.Module):
         self.sin_drop = nn.Dropout(net_config.dropout)
         self.cos_drop = nn.Dropout(net_config.dropout)
         self.attn_type = net_config.attention_type
+        self.seq_len = seq_len
         self.delta = None
+
+        # Save these for later
+        self.pos_enc = self.get_pos_enc(seq_len, dtype, device)
+        if net_config.separate_cls:
+            self.func_mask = F.pad(torch.ones([seq_len - 1, seq_len - 1], dtype=dtype, device=device), (1, 0, 1, 0))
+        else:
+            self.func_mask = None
 
     def stride_pool_pos(self, pos_id, bidx):
         net_config = self.net_config
@@ -91,7 +99,9 @@ class AttentionStructure(nn.Module):
             pooled_pos_id = pos_id
             pos_enc_list = []
 
-            for bidx, _ in enumerate(self.net_config.block_sizes):
+            config = self.net_config
+            q_stride, k_stride = 1.0
+            for bidx, scale_factor in enumerate(config.scaling_factors):
                 # For each block with bidx > 0, we need two types pos_encs:
                 #   - Attn(pooled-q, unpooled-kv)
                 #   - Attn(pooled-q, pooled-kv)
@@ -101,11 +111,12 @@ class AttentionStructure(nn.Module):
                     pooled_pos_id = self.stride_pool_pos(pos_id, bidx)
 
                     # construct rel_pos_id
-                    q_stride = self.net_config.scaling_factor ** bidx
-                    k_stride = self.net_config.scaling_factor ** (bidx - 1)
                     rel_pos_id = self.construct_rel_pos_seq(
                         q_pos=pooled_pos_id, q_stride=q_stride,
                         k_pos=pos_id, k_stride=k_stride)
+
+                    # K gets scaled to the same scale as Q after the first attention layer of the block
+                    k_stride = q_stride
 
                     # gather relative positional encoding
                     rel_pos_id = rel_pos_id[:, None] + zero_offset
@@ -117,10 +128,12 @@ class AttentionStructure(nn.Module):
                 #### Second type: Attn(pooled-q, pooled-kv)
                 # construct rel_pos_id
                 pos_id = pooled_pos_id
-                stride = self.net_config.scaling_factor ** bidx
                 rel_pos_id = self.construct_rel_pos_seq(
-                    q_pos=pos_id, q_stride=stride,
-                    k_pos=pos_id, k_stride=stride)
+                    q_pos=pos_id, q_stride=q_stride,
+                    k_pos=pos_id, k_stride=k_stride)
+
+                # We scale Q at the end of the block
+                q_stride *= scale_factor
 
                 # gather relative positional encoding
                 rel_pos_id = rel_pos_id[:, None] + zero_offset
@@ -144,36 +157,14 @@ class AttentionStructure(nn.Module):
         return seg_mat
 
     def get_attn_mask(self, input_mask):
-        if input_mask is None:
-            attn_mask = None
-        else:
-            attn_mask = input_mask[:, None, None, :]
-        return attn_mask
+        return None if input_mask is None else input_mask[:, None, None, :]
 
-    def init_attn_structure(self, hidden, seg_id=None, input_mask=None):
-        net_config = self.net_config
-        self.delta = 1
-        seq_len = hidden.size(1)
-        self.seq_len = seq_len
-        pos_enc = self.get_pos_enc(seq_len, hidden.dtype, hidden.device)
-
-        if seg_id is None:
-            seg_mat = None
-        else:
-            seg_mat = self.seg_id_to_mat(seg_id, seg_id)
-
-        if net_config.separate_cls:
-            func_mask = F.pad(
-                torch.ones([seq_len - 1, seq_len - 1],
-                           dtype=hidden.dtype,
-                           device=hidden.device),
-                (1, 0, 1, 0))
-        else:
-            func_mask = None
+    def get_fresh_attn_tuple(self, seg_id=None, input_mask=None):
+        self.delta = 1  # Reset our little counter
+        seg_mat = None if seg_id is None else self.seg_id_to_mat(seg_id, seg_id)
 
         attn_mask = self.get_attn_mask(input_mask)
-        attn_struct = (pos_enc, seg_mat, input_mask, attn_mask, func_mask)
-        return attn_struct
+        return self.pos_enc, seg_mat, input_mask, attn_mask, self.func_mask
 
     def stride_pool(self, tensor, axis):
         """Perform pooling by stride slicing the tensor along the given axis."""
