@@ -4,18 +4,25 @@ import json
 import logging
 import os
 import sys
+import torch
+
+Tensor = NewType('Tensor', torch.tensor)
+DataType = NewType('DataType', torch.dtype)
+Device = NewType('Device', torch.device)
 
 
 # Get a new dictionary inverting the keys and values from a source dictionary
 def invert(source: dict) -> dict:
     return dict((value, key) for key, value in source.items())
 
+N = TypeVar('N', Union[int, float])
 
-# Swap positions in a list
-def swap(_list: List, index1: int, index2: int):
-    value1, value2 = _list[index1], _list[index2]
-    _list[index2] = value1
-    _list[index1] = value2
+def product(numbers: Iterable[N]) -> N:
+    result = 1
+    for x in numbers:
+        result *= x
+
+    return x
 
 
 # Performs a series of replace operations on a string defined by a list of tuples of strings
@@ -25,6 +32,21 @@ def replace_all(string: str, mappings: List[Tuple[str, str]]) -> str:
 
     return string
 
+T = TypeVar('T', Union[List[Tensor], Tensor])
+
+def slice_tensors(x: T, axis: int, start: int = None, stop: int = None, step: int = None) -> T:
+    rank = x.dim() if isinstance(x, torch.tensor) else x[0].dim()
+    assert axis < rank
+
+    indices = []
+    for i in range(rank):
+        if i == axis:
+            indices.append(slice(start, stop, step))
+            break
+        else:
+            indices.append(slice(None))  # Include all elements along this axis; equivalent to : in x[:, 5]
+
+    return x[indices] if isinstance(x, torch.tensor) else [tensor[indices] for tensor in x]
 
 # Convenience for saving and loading objects from JSON
 class SerializableObject:

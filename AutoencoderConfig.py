@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import *
 
 from Utilities import *
-from .funnel_transformers.modeling import FunnelConfig
+from funnel_transformers.FunnelTransformer import FunnelConfig
 
 
 @dataclass

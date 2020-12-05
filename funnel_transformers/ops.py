@@ -2,13 +2,14 @@
 
 import numpy as np
 import torch.nn.init as init
-from .AttentionStructure import *
-
+from torch import nn
+from AttentionState import *
 
 INF = 1e6
 
 try:
     import apex
+
     LayerNorm = apex.normalization.FusedLayerNorm
 except ImportError as e:
     class LayerNorm(nn.LayerNorm):
@@ -32,6 +33,8 @@ except ImportError as e:
             return output
 
 
+# All these custom module classes are probably unnecessary, but we keep them them here in order
+# to maintain full backward compatibility with the original pretrained Funnel Transformer checkpoints.
 class GELU(nn.Module):
     def forward(self, x):
         cdf = 0.5 * (1.0 + torch.tanh(
@@ -71,8 +74,6 @@ def get_einsum_string(ndims, einsum_symbols=None):
 
 
 class Dense(nn.Module):
-    """Dense layer."""
-
     def __init__(self, inp_shape, out_shape, bias=True, reverse_order=False):
         super(Dense, self).__init__()
 
@@ -114,10 +115,7 @@ class Dense(nn.Module):
 
         return output
 
-
 class PositionwiseFFN(nn.Module):
-    """Positionwise Feed-forward Net."""
-
     def __init__(self, d_model, d_inner, dropout, dropact):
         super(PositionwiseFFN, self).__init__()
         self.pffn = nn.Sequential(
@@ -128,23 +126,13 @@ class PositionwiseFFN(nn.Module):
             nn.Dropout(dropout))
         self.layer_norm = LayerNorm(d_model)
 
-    @property
-    def dense1(self) -> Dense:
-        return self.pffn.children()[0]
-
-    @property
-    def dense2(self) -> Dense:
-        return self.pffn.children()[3]
-
     def forward(self, inputs):
         pffn_out = self.pffn(inputs)
-        output = self.layer_norm(inputs + pffn_out)
+        output = self.layer_norm(inputs + pffn_out)  # Residual connection
         return output
 
 
 class RelativePositionalAttention(nn.Module):
-    """Relative multi-head attention."""
-
     def __init__(self, net_config: FunnelConfig, block_index):
         super(RelativePositionalAttention, self).__init__()
 
@@ -161,7 +149,7 @@ class RelativePositionalAttention(nn.Module):
         self.att_drop = nn.Dropout(self.dropatt)
         self.hid_drop = nn.Dropout(self.dropout)
 
-        self.q_head = Dense(d_model, [n_head, d_head], bias=False,)
+        self.q_head = Dense(d_model, [n_head, d_head], bias=False)
         self.k_head = Dense(d_model, [n_head, d_head])
         self.v_head = Dense(d_model, [n_head, d_head])
 
@@ -171,9 +159,9 @@ class RelativePositionalAttention(nn.Module):
         self.r_s_bias = nn.Parameter(torch.zeros([n_head, d_head]))
         self.seg_embed = nn.Parameter(torch.zeros([2, n_head, d_head]))
 
-        self.post_proj = Dense([n_head, d_head], d_model,)
+        self.post_proj = Dense([n_head, d_head], d_model)
         self.layer_norm = LayerNorm(d_model)
-        self.scale = 1. / np.sqrt(d_head)
+        self.normalizer = 1. / np.sqrt(d_head)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -183,7 +171,47 @@ class RelativePositionalAttention(nn.Module):
         nn.init.uniform_(self.r_s_bias, b=0.1)
         nn.init.uniform_(self.seg_embed, b=0.1)
 
-    def rel_shift(self, x, row_axis, key_len, shift=1):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState) -> Tensor:
+        q_head = self.q_head(q)
+        k_head = self.k_head(k)
+        v_head = self.v_head(v)
+
+        q_head = q_head * self.normalizer
+        r_w_bias = self.r_w_bias * self.normalizer
+        # content based attention score
+        content_score = torch.einsum("...ind,...jnd->...nij", q_head + r_w_bias, k_head)
+
+        pos_bias = self._rel_pos_bias(q_head, k_head.size(1), attn_state)
+        seg_bias = self._rel_seg_bias(attn_state.segment_mask, q_head, attn_state)
+
+        # merge attention scores
+        attn_score = content_score + pos_bias + seg_bias
+
+        # precision safe
+        dtype = attn_score.dtype
+        attn_score = attn_score.float()
+
+        # perform masking
+        attn_mask = attn_state.attention_mask
+        if attn_mask is not None:
+            attn_score = attn_score - INF * attn_mask.float()
+
+        # attention distribution
+        attn_dist = torch.softmax(attn_score, dim=-1)
+        attn_dist = attn_dist.type(dtype)
+
+        attn_dist = self.att_drop(attn_dist)
+        # attention output
+        attn_vec = torch.einsum("...nij,...jnd->...ind", attn_dist, v_head)
+
+        attn_out = self.post_proj(attn_vec)
+        attn_out = self.hid_drop(attn_out)
+
+        output = self.layer_norm(q + attn_out)  # Residual connection
+        return output
+
+    @staticmethod
+    def _rel_shift(x, row_axis, key_len, shift=1):
         """Perform relative shift to form the relative attention score."""
         # Deal with negative indexing
         row_axis = row_axis % x.ndim
@@ -211,50 +239,45 @@ class RelativePositionalAttention(nn.Module):
 
         return y
 
-    def rel_pos_bias(self, pos_enc, q_head, k_len, func_mask=None):
-        scale = self.scale
+    def _rel_pos_bias(self, q_head, k_len, attn_state: AttentionState):
+        normalizer = self.normalizer
         r_r_bias = self.r_r_bias
         r_kernel = self.r_kernel
+        pos_enc = attn_state.positional_encoding
+
         if self.attn_type == "factorized":
             enc_q_1, enc_q_2, enc_k_1, enc_k_2 = pos_enc
-            q_head_r = torch.einsum("...inh,dnh->...ind",
-                                    q_head + r_r_bias * scale,
-                                    r_kernel)
+            q_head_r = torch.einsum("...inh,dnh->...ind", q_head + r_r_bias * normalizer, r_kernel)
             q_head_r_1 = q_head_r * torch.unsqueeze(enc_q_1, -2)
             q_head_r_2 = q_head_r * torch.unsqueeze(enc_q_2, -2)
             prefix_k = get_einsum_string(len(enc_k_1.shape) - 2)
             einsum_str = "...ind,{0}jd->...nij".format(prefix_k)
+
             bd = (torch.einsum(einsum_str, q_head_r_1, enc_k_1) +
                   torch.einsum(einsum_str, q_head_r_2, enc_k_2))
         elif self.attn_type == "rel_shift":
-            if k_len != q_head.size(1):
-                # pooling case
-                shift = 2
-                pos_enc = pos_enc[self.block_index][1]
-            else:
-                shift = 1
-                pos_enc = pos_enc[self.block_index][0]
-            q_head = q_head + r_r_bias * scale
+            shift = 1 + attn_state.pooled_q_unpooled_k_flag
+
+            q_head = q_head + r_r_bias * normalizer
             r_head = torch.einsum("td,dnh->tnh", pos_enc, r_kernel)
             bd = torch.einsum("bfnh,tnh->bnft", q_head, r_head)
-            bd = self.rel_shift(bd, -2, k_len, shift)
+            bd = self._rel_shift(bd, -2, k_len, shift)
         else:
             raise NotImplementedError
-        if func_mask is not None:
-            bd = bd * func_mask
+
+        if attn_state.not_cls_mask is not None:
+            bd = bd * attn_state.not_cls_mask
         return bd
 
-    def rel_seg_bias(self, seg_mat, q_head, func_mask=None):
+    def _rel_seg_bias(self, seg_mat, q_head, attn_state: AttentionState):
         # segment based attention score
-
         if seg_mat is None:
             seg_bias = 0
         else:
-            r_s_bias = self.r_s_bias * self.scale
+            r_s_bias = self.r_s_bias * self.normalizer
             seg_embed = self.seg_embed
 
-            seg_bias = torch.einsum("...ind,snd->...nis",
-                                    q_head + r_s_bias, seg_embed)
+            seg_bias = torch.einsum("...ind,snd->...nis", q_head + r_s_bias, seg_embed)
             tgt_shape = list(seg_mat.size())
             tgt_shape.insert(-2, self.net_config.n_head)
             seg_mat = torch.unsqueeze(seg_mat, -3).expand(tgt_shape)
@@ -262,43 +285,7 @@ class RelativePositionalAttention(nn.Module):
             _diff = _diff.expand(tgt_shape)
             _same = _same.expand(tgt_shape)
             seg_bias = torch.where(seg_mat, _same, _diff)
-            if func_mask is not None:
-                seg_bias *= func_mask
+            if attn_state.not_cls_mask is not None:
+                seg_bias *= attn_state.not_cls_mask
+
         return seg_bias
-
-    def forward(self, q, k, v, attn_struct):
-        pos_enc, seg_mat, input_mask, attn_mask, func_mask = attn_struct
-        q_head = self.q_head(q)
-        k_head = self.k_head(k)
-        v_head = self.v_head(v)
-
-        q_head = q_head * self.scale
-        r_w_bias = self.r_w_bias * self.scale
-        # content based attention score
-        content_score = torch.einsum("...ind,...jnd->...nij",
-                                     q_head + r_w_bias, k_head)
-        pos_bias = self.rel_pos_bias(pos_enc, q_head, k_head.size(1), func_mask)
-
-        seg_bias = self.rel_seg_bias(seg_mat, q_head, func_mask)
-        # merge attention scores
-        attn_score = content_score + pos_bias + seg_bias
-
-        # precision safe
-        dtype = attn_score.dtype
-        attn_score = attn_score.float()
-        # perform masking
-        if attn_mask is not None:
-            attn_score = attn_score - INF * attn_mask.float()
-        # attention probability
-        attn_prob = torch.softmax(attn_score, dim=-1)
-        attn_prob = attn_prob.type(dtype)
-
-        attn_prob = self.att_drop(attn_prob)
-        # attention output
-        attn_vec = torch.einsum("...nij,...jnd->...ind", attn_prob, v_head)
-
-        attn_out = self.post_proj(attn_vec)
-        attn_out = self.hid_drop(attn_out)
-
-        output = self.layer_norm(q + attn_out)
-        return output

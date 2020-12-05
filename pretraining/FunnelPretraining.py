@@ -26,7 +26,7 @@ from absl import flags
 import numpy as np
 import tensorflow.compat.v1 as tf
 
-from ..funnel_transformers import modeling
+from ..funnel_transformers import FunnelTransformer
 import data_utils
 import input_func_builder
 import model_utils
@@ -184,11 +184,11 @@ def mlm(features, mode):
     """MLM pretraining."""
     #### Build Model
     if FLAGS.model_config:
-        net_config = modeling.FunnelConfig.from_json(FLAGS.model_config)
+        net_config = FunnelTransformer.FunnelConfig.from_json(FLAGS.model_config)
     else:
-        net_config = modeling.FunnelConfig.init_from_flags()
+        net_config = FunnelTransformer.FunnelConfig.init_from_flags()
     net_config.save(os.path.join(FLAGS.model_dir, "net_config.json"))
-    model = modeling.FunnelTransformer(net_config)
+    model = FunnelTransformer.FunnelTransformer(net_config)
 
     #### Training or Evaluation
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
@@ -289,7 +289,7 @@ def electra_loss_func(generator, model, features, is_training):
 def get_generator_config(net_config):
     """Get generator net config."""
     args = {}
-    for key in modeling.FunnelConfig.keys:
+    for key in FunnelTransformer.FunnelConfig.keys:
         val = getattr(net_config, key)
         args[key] = val
 
@@ -297,7 +297,7 @@ def get_generator_config(net_config):
     for key in ["d_model", "d_inner", "n_head"]:
         args[key] = int(args[key] * FLAGS.width_shrink)
 
-    gen_config = modeling.FunnelConfig(**args)
+    gen_config = FunnelTransformer.FunnelConfig(**args)
 
     return gen_config
 
@@ -306,14 +306,14 @@ def electra(features, mode):
     """ELECTRA pretraining."""
     #### Build Model
     if FLAGS.model_config:
-        net_config = modeling.FunnelConfig.from_json(FLAGS.model_config)
+        net_config = FunnelTransformer.FunnelConfig.from_json(FLAGS.model_config)
     else:
-        net_config = modeling.FunnelConfig.init_from_flags()
-    model = modeling.FunnelTransformer(net_config)
+        net_config = FunnelTransformer.FunnelConfig.init_from_flags()
+    model = FunnelTransformer.FunnelTransformer(net_config)
     net_config.save(os.path.join(FLAGS.model_dir, "net_config.json"))
 
     gen_config = get_generator_config(net_config)
-    generator = modeling.FunnelTransformer(gen_config)
+    generator = FunnelTransformer.FunnelTransformer(gen_config)
 
     #### Training or Evaluation
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
@@ -390,9 +390,9 @@ def get_input_fn(split):
                   FLAGS.eval_batch_size)
 
     if FLAGS.model_config:
-        net_config = modeling.FunnelConfig.from_json(FLAGS.model_config)
+        net_config = FunnelTransformer.FunnelConfig.from_json(FLAGS.model_config)
     else:
-        net_config = modeling.FunnelConfig.init_from_flags()
+        net_config = FunnelTransformer.FunnelConfig.init_from_flags()
 
     kwargs = dict(
         tfrecord_dir=FLAGS.record_dir,

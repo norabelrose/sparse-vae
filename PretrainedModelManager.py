@@ -1,3 +1,4 @@
+import logging
 import requests
 import tarfile
 import tensorflow as tf
@@ -5,7 +6,7 @@ import torch
 from tqdm.auto import tqdm
 from Utilities import *
 
-from .funnel_transformers.modeling import FunnelTransformer, FunnelConfig
+from funnel_transformers.FunnelTransformer import FunnelTransformer, FunnelConfig
 
 
 class PretrainedModelManager:
@@ -48,7 +49,7 @@ class PretrainedModelManager:
 
         # Code copied from HuggingFace
         cache_dir = os.path.join(os.getenv('XDG_CACHE_HOME', '~/.cache'))
-        torch_cache_home = os.path.expanduser(os.getenv('TORCH_HOME', cache_dir, 'torch'))
+        torch_cache_home = os.path.expanduser(os.getenv('TORCH_HOME', cache_dir))
         text_vae_home = os.path.join(torch_cache_home, 'text-vae')
         pretrained_dir = os.path.join(text_vae_home, 'pretrained-models')
         model_path = os.path.join(pretrained_dir, name)
@@ -86,11 +87,7 @@ class PretrainedModelManager:
             f.extractall(path=name)  # Extract into a directory with the name of the model
         os.remove(download_path)
 
-        if include_generator:
-            print("Done. Now converting the checkpoint from TensorFlow to PyTorch...")
-            # convert_checkpoint()
-        else:
-            print("Finished.")
+        print("Done.")
 
     @classmethod
     def get_model(cls, block_layout: Tuple[int, ...], include_generator: bool = False) -> \
@@ -102,7 +99,10 @@ class PretrainedModelManager:
         if not os.path.exists(path):
             cls.download_model_for_block_layout(block_layout, include_generator)
 
-        raise NotImplementedError
+        if include_generator:
+            return cls._get_model_from_pt_ckpt(path, block_layout)
+        else:
+            return cls._get_generator_and_model_from_tf_ckpt(path, block_layout)
 
     @classmethod
     def _get_model_from_pt_ckpt(cls, path: str, block_layout: Tuple[int, ...]) -> FunnelTransformer:
@@ -114,14 +114,36 @@ class PretrainedModelManager:
             n_head=num_heads
         ))
 
+        # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the pretraining
+        # files will have the form 'attn_layers.2.v_head.bias'. We need to convert here.
         state_dict = torch.load(path)
-        model.load_state_dict(state_dict)
+        noninitialized_keys = []
 
-        raise NotImplementedError
+        for var_name, param, absolute_index in model.iterate_parameters_by_layer():
+            keys = var_name.split('.')
+            keys[0] = replace_all(keys[0], [  # attention.v_head.bias -> attn_layers.v_head.bias
+                ('attention', 'attn_layers'),
+                ('feedforward', 'pffn_layers')
+            ])
+
+            keys.insert(1, str(absolute_index))  # attn_layers.v_head.bias -> attn_layers.2.v_head.bias
+            old_name = '.'.join(keys)
+
+            try:
+                param.data = state_dict[old_name]
+            except KeyError:
+                noninitialized_keys.append({'new_name': var_name, 'old_name': old_name})
+
+        if len(noninitialized_keys) > 0:
+            logger = logging.getLogger(__name__)
+            logger.warning(f'PretrainedModelManager: Failed to initialize weights: {noninitialized_keys}')
+
+        return model
 
     @classmethod
     def _get_generator_and_model_from_tf_ckpt(cls, path: str, block_layout: Tuple[int, ...]) -> \
             Tuple[FunnelTransformer, FunnelTransformer]:
+        print("Loading model from TensorFlow checkpoint...")
         reader = tf.train.load_checkpoint(path)
 
         # noinspection PyTypeChecker
@@ -137,9 +159,11 @@ class PretrainedModelManager:
             n_head=num_heads
         ))
 
-        def convert_pt_parameter_name_to_tf(key_string: str, prefix: str) -> str:
-            # 'pffn_layers.17.pffn.0.bias' -> 'pffn_layers.17.layer_1.bias'
-            # 'pffn_layers.17.layer_norm.weight' -> 'pffn_layers.17.layer_norm.gamma'
+        def convert_pt_parameter_name_to_tf(key_string: str, abs_index: int, prefix: str) -> str:
+            # 'attention.v_head.bias' -> 'layer_2/rel_attn/v/bias'
+
+            # 'feedforward.pffn.0.bias' -> 'feedforward.layer_1.bias'
+            # 'feedforward.layer_norm.weight' -> 'feedforward.layer_norm.gamma'
             key_string = replace_all(key_string, [
                 ('layer_norm.weight', 'layer_norm.gamma'),
                 ('layer_norm.bias', 'layer_norm.beta'),
@@ -150,12 +174,11 @@ class PretrainedModelManager:
             ])
 
             keys = key_string.split('.')
+            keys.insert(0, "layer_" + str(abs_index))
 
-            swap(keys, 0, 1)                # 'pffn_layers.17.layer_1.bias' -> '17.pffn_layers.layer_1.bias'
-            keys[0] = "layer_" + keys[0]    # '17.pffn_layers.layer_1.bias' -> 'layer_17.pffn_layers.layer_1.bias'
-            keys[1] = replace_all(keys[1], [    # 'layer_17.pffn_layers.layer_1.bias' -> 'layer_17.ff.layer_1.bias'
-                ('attn_layers', 'rel_attn'),
-                ('pffn_layers', 'ff')
+            keys[1] = replace_all(keys[1], [    # 'layer_17.feedforward.layer_1.bias' -> 'layer_17.ff.layer_1.bias'
+                ('attention', 'rel_attn'),
+                ('feedforward', 'ff')
             ])
             keys[2] = replace_all(keys[2], [    # 'layer_17.rel_attn.v_head.bias' -> 'layer_17.rel_attn.v.bias'
                 ('_head', ''),
@@ -165,12 +188,13 @@ class PretrainedModelManager:
             # 'layer_17.rel_attn.v.bias' -> 'model/encoder/layer_17/rel_attn/v/bias'
             return prefix + '/'.join(keys)
 
-        for var_name, param in model.named_parameters():
-            tf_name = convert_pt_parameter_name_to_tf(var_name, 'model/encoder/')
+        for var_name, param, absolute_index in model.iterate_parameters_by_layer():
+            tf_name = convert_pt_parameter_name_to_tf(var_name, absolute_index, 'model/encoder/')
             param.data = reader.get_tensor(tf_name)
 
-        for var_name, param in generator.named_parameters():
-            tf_name = convert_pt_parameter_name_to_tf(var_name, 'generator/encoder/')
+        for var_name, param, absolute_index in model.iterate_parameters_by_layer():
+            tf_name = convert_pt_parameter_name_to_tf(var_name, absolute_index, 'generator/encoder/')
             param.data = reader.get_tensor(tf_name)
 
+        print("Finished.")
         return generator, model

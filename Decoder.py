@@ -1,14 +1,18 @@
 import fast_transformers
 import torch.nn.functional as F
-from .AutoencoderConfig import AutoencoderConfig
+from Autoencoder import *
+from FunnelTransformer import *
+
+
+class SamplingCell(nn.Module):
+    
+
 
 class Decoder(nn.Module):
-    def __init__(self, config: AutoencoderConfig):
+    def __init__(self, config: AutoencoderConfig, funnel_to_use = Autoencoder):
         super().__init__()
-        
-        # The architecture allows arbitrary scale factors- although it's unclear how well the model will do
-        # if we train it using one tuple of scaling factors and then switch at test time
-        self.scale_factors = config.latent_structure.scaling_factors
+
+        self.funnel_transformer = funnel_to_use or FunnelTransformer(config.get_funnel_config())
         
         # Build a linear 'Transformers are RNNs' autoregressive decoder
         if config.use_autoregressive_decoding:
@@ -24,34 +28,7 @@ class Decoder(nn.Module):
             builder.cross_attention_type = 'full'
             self.decoder_transformer = builder.get()
     
-    def forward(self, z_1, scaled_inputs: list = None):        
-        def expand_length(x, scale_factor):
-            x = x.transpose(-2, -1) # Text is [batch, len, embedding] but conv1d expects [batch, channels, len]
-            x_depth = x.shape[-2]
-            
-            kernel = torch.ones((x_depth, x_depth, scale_factor)) # Expand length dimension
-            x = F.conv_transpose1d(x, kernel, stride=scale_factor)
-            
-            return x.transpose(-2, 1) # Flip back to [batch, len, embedding]
-        
-        x = z_1
-        if not scaled_inputs:
-            # Pure sampling mode, no encoder
-            for scale in self.scale_factors:
-                x = expand_length(x, scale)
-        else:
-            # Encoder-decoder mode
-            for decoder_rep, combiner, scale in zip(scaled_inputs, self.combiner_cells, self.scale_factors):
-                x = expand_length(x, scale)
-                params = combiner(x, decoder_rep)
-                
-        
-        x = self.embedding_upscale1(x)
-        
-        x = expand_length(x, self.scale_factors[1])
-        x = self.embedding_upscale2(x)
-        
-        x = expand_length(x, self.scale_factors[2])
-        x = self.embedding_upscale3(x)
+    def forward(self, z_1, scaled_inputs: list = None):
+
         
         return x
