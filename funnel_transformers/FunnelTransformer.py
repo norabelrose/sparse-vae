@@ -45,9 +45,9 @@ class FunnelConfig(SerializableObject):
 
     def __post_init__(self):
         # Turn a single floating point scaling factor x into (x, x, x...) of the appropriate length
-        if isinstance(self.scaling_factors, float):
+        if isinstance(self.scaling_factors, int):
             factor = self.scaling_factors
-            self.scaling_factors = (factor for _ in range(len(self.block_sizes) - 1))
+            self.scaling_factors = tuple(factor for _ in range(len(self.block_sizes) - 1))
 
         # Make it so scaling_factors and block_sizes are equal length; last scaling factor is 1 (no scaling)
         if len(self.scaling_factors) < len(self.block_sizes):

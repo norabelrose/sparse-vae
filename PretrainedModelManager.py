@@ -26,7 +26,8 @@ class PretrainedModelManager:
     }
 
     @classmethod
-    def get_model(cls, block_layout: Tuple[int, ...], include_generator: bool = False) -> PretrainedModel:
+    def get_model(cls, block_layout: Tuple[int, ...], include_generator: bool = False,
+                  strict: bool = False) -> PretrainedModel:
         path = cls.path_to_cached_model_for_block_layout(block_layout, include_generator)
         if path is None:
             raise ValueError(f'PretrainedModelManager: No pretrained model exists with this block layout.')
@@ -35,9 +36,9 @@ class PretrainedModelManager:
             cls.download_model_for_block_layout(block_layout, include_generator)
 
         if include_generator:
-            return cls._get_model_from_pt_ckpt(path, block_layout)
+            return cls._get_generator_and_model_from_tf_ckpt(path, block_layout, strict)
         else:
-            return cls._get_generator_and_model_from_tf_ckpt(path, block_layout)
+            return cls._get_model_from_pt_ckpt(path, block_layout, strict)
 
     @classmethod
     def model_name_for_block_layout(cls, block_layout: Tuple[int, ...],
@@ -52,7 +53,9 @@ class PretrainedModelManager:
         # noinspection PyTypeChecker
         name = cls.block_size_to_name[funnel_layout]
         if include_generator:
-            name += "-FULL"
+            name += "-FULL-TF"
+        else:
+            name += "-PT"
 
         return name
 
@@ -69,6 +72,10 @@ class PretrainedModelManager:
         text_vae_home = os.path.join(torch_cache_home, 'text-vae')
         pretrained_dir = os.path.join(text_vae_home, 'pretrained-models')
         model_path = os.path.join(pretrained_dir, name)
+        if include_generator:
+            model_path = os.path.join(model_path, 'model.ckpt')
+        else:
+            model_path = os.path.join(model_path, 'model.pt')
 
         return Path(model_path)
 
@@ -77,20 +84,22 @@ class PretrainedModelManager:
                                         use_tqdm: bool = True):
         name = cls.model_name_for_block_layout(block_layout, include_generator)
 
-        # If we want to get the generator weights, we need to download the TensorFlow checkpoint and then convert it.
-        name += "-TF" if include_generator else "-PT"
-
         url = f"http://storage.googleapis.com/funnel-transformer/funnel_ckpts_all/{name}.tar.gz"
-        download_path = cls.path_to_cached_model_for_block_layout(block_layout, include_generator)
-        download_path.parent.mkdir(parents=True, exist_ok=True)  # Make sure parent dir exists
-        download_path = download_path.with_suffix('.tar.gz')
+        ckpt_path = cls.path_to_cached_model_for_block_layout(block_layout, include_generator)
+        
+        folder_path = ckpt_path.parent
+        folder_parent = folder_path.parent
+        folder_parent.mkdir(parents=True, exist_ok=True)  # Make sure parent dir exists
+        archive_path = folder_path.with_suffix('.tar.gz')
+        
+        print(f'Folder parent {folder_parent} folder path {folder_path} archive_path {archive_path}')
 
-        with open(download_path, 'wb') as f:
+        with open(archive_path, 'wb') as f:
             print(f"Downloading pretrained model from {url}...")
 
             response = requests.get(url, stream=True)
             total_length = int(response.headers.get('content-length'))
-            iterator = response.iter_content(chunk_size=1048576)
+            iterator = response.iter_content(chunk_size=5242880)  # 5 MB
 
             if total_length is None and use_tqdm:
                 print("Didn't get a content-length header, so we can't show a progress bar. Continuing...")
@@ -107,14 +116,17 @@ class PretrainedModelManager:
                 pbar.close()
 
         print("Done. Now unzipping...")
-        with tarfile.open(download_path, 'r:gz') as f:
-            f.extractall(path=name)  # Extract into a directory with the name of the model
-        os.remove(download_path)
+        with tarfile.open(archive_path, 'r:gz') as f:
+            f.extractall(path=folder_parent)
+        os.remove(archive_path)
 
         print("Done.")
-
+    
     @classmethod
-    def _get_model_from_pt_ckpt(cls, path: Path, block_layout: Tuple[int, ...]) -> FunnelTransformer:
+    def _get_model_from_pt_ckpt(cls, path: Path, block_layout: Tuple[int, ...],
+                                strict: bool = False) -> FunnelTransformer:
+        print("Loading from pretrained PyTorch checkpoint...")
+        
         # noinspection PyTypeChecker
         d_model, num_heads = cls.block_size_to_dims[block_layout]
         model = FunnelTransformer(FunnelConfig(
@@ -146,11 +158,16 @@ class PretrainedModelManager:
         if len(noninitialized_keys) > 0:
             logger = logging.getLogger(__name__)
             logger.warning(f'PretrainedModelManager: Failed to initialize weights: {noninitialized_keys}')
-
+            
+            if strict:
+                return None
+        
+        print("Done.")
         return model
 
     @classmethod
-    def _get_generator_and_model_from_tf_ckpt(cls, path: Path, block_layout: Tuple[int, ...]) -> ElectraModel:
+    def _get_generator_and_model_from_tf_ckpt(cls, path: Path, block_layout: Tuple[int, ...],
+                                              strict: bool = False) -> ElectraModel:
         print("Loading model from TensorFlow checkpoint...")
         reader = tf.train.load_checkpoint(str(path))
 
@@ -195,14 +212,24 @@ class PretrainedModelManager:
 
             # 'layer_17.rel_attn.v.bias' -> 'model/encoder/layer_17/rel_attn/v/bias'
             return prefix + '/'.join(keys)
-
+        
         for var_name, param, absolute_index in model.enumerate_parameters_by_layer():
             tf_name = convert_pt_parameter_name_to_tf(var_name, absolute_index, 'model/encoder/')
-            param.data = reader.get_tensor(tf_name)
+            
+            weights = reader.get_tensor(tf_name)
+            if weights is None and strict:
+                return None
+            
+            param.data = torch.from_numpy(weights)
 
         for var_name, param, absolute_index in model.enumerate_parameters_by_layer():
             tf_name = convert_pt_parameter_name_to_tf(var_name, absolute_index, 'generator/encoder/')
-            param.data = reader.get_tensor(tf_name)
+            
+            weights = reader.get_tensor(tf_name)
+            if weights is None and strict:
+                return None
+            
+            param.data = torch.from_numpy(weights)
 
         print("Finished.")
         return generator, model
