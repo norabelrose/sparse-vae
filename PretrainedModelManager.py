@@ -31,8 +31,8 @@ class PretrainedModelManager:
         path = cls.path_to_cached_model_for_block_layout(block_layout, include_generator)
         if path is None:
             raise ValueError(f'PretrainedModelManager: No pretrained model exists with this block layout.')
-
-        if not os.path.exists(path):
+        
+        if not os.path.exists(path.parent):
             cls.download_model_for_block_layout(block_layout, include_generator)
 
         if include_generator:
@@ -92,8 +92,6 @@ class PretrainedModelManager:
         folder_parent.mkdir(parents=True, exist_ok=True)  # Make sure parent dir exists
         archive_path = folder_path.with_suffix('.tar.gz')
         
-        print(f'Folder parent {folder_parent} folder path {folder_path} archive_path {archive_path}')
-
         with open(archive_path, 'wb') as f:
             print(f"Downloading pretrained model from {url}...")
 
@@ -139,6 +137,13 @@ class PretrainedModelManager:
         # files will have the form 'attn_layers.2.v_head.bias'. We need to convert here.
         state_dict = torch.load(str(path))
         noninitialized_keys = []
+        
+        # Don't forget about the embeddings
+        model.input_layer.load_state_dict({
+            '0.lookup_table': state_dict['input_layer.0.lookup_table'],
+            '1.weight': state_dict['input_layer.1.weight'],
+            '1.bias': state_dict['input_layer.1.bias']
+        }, strict=True)
 
         for var_name, param, absolute_index in model.enumerate_parameters_by_layer():
             keys = var_name.split('.')
