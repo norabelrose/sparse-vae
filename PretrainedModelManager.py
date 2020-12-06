@@ -58,7 +58,7 @@ class PretrainedModelManager:
 
     @classmethod
     def path_to_cached_model_for_block_layout(cls, block_layout: Tuple[int, ...],
-                                              include_generator: bool = False) -> Optional[str]:
+                                              include_generator: bool = False) -> Optional[Path]:
         name = cls.model_name_for_block_layout(block_layout, include_generator)
         if not name:  # Sanity check
             return None
@@ -90,7 +90,7 @@ class PretrainedModelManager:
 
             response = requests.get(url, stream=True)
             total_length = int(response.headers.get('content-length'))
-            iterator = response.iter_content(chunk_size=1024)
+            iterator = response.iter_content(chunk_size=1048576)
 
             if total_length is None and use_tqdm:
                 print("Didn't get a content-length header, so we can't show a progress bar. Continuing...")
@@ -103,6 +103,9 @@ class PretrainedModelManager:
                 if use_tqdm:
                     pbar.update(len(chunk))
 
+            if use_tqdm:
+                pbar.close()
+
         print("Done. Now unzipping...")
         with tarfile.open(download_path, 'r:gz') as f:
             f.extractall(path=name)  # Extract into a directory with the name of the model
@@ -111,7 +114,7 @@ class PretrainedModelManager:
         print("Done.")
 
     @classmethod
-    def _get_model_from_pt_ckpt(cls, path: str, block_layout: Tuple[int, ...]) -> FunnelTransformer:
+    def _get_model_from_pt_ckpt(cls, path: Path, block_layout: Tuple[int, ...]) -> FunnelTransformer:
         # noinspection PyTypeChecker
         d_model, num_heads = cls.block_size_to_dims[block_layout]
         model = FunnelTransformer(FunnelConfig(
@@ -122,7 +125,7 @@ class PretrainedModelManager:
 
         # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the pretraining
         # files will have the form 'attn_layers.2.v_head.bias'. We need to convert here.
-        state_dict = torch.load(path)
+        state_dict = torch.load(str(path))
         noninitialized_keys = []
 
         for var_name, param, absolute_index in model.enumerate_parameters_by_layer():
@@ -147,9 +150,9 @@ class PretrainedModelManager:
         return model
 
     @classmethod
-    def _get_generator_and_model_from_tf_ckpt(cls, path: str, block_layout: Tuple[int, ...]) -> ElectraModel:
+    def _get_generator_and_model_from_tf_ckpt(cls, path: Path, block_layout: Tuple[int, ...]) -> ElectraModel:
         print("Loading model from TensorFlow checkpoint...")
-        reader = tf.train.load_checkpoint(path)
+        reader = tf.train.load_checkpoint(str(path))
 
         # noinspection PyTypeChecker
         d_model, num_heads = cls.block_size_to_dims[block_layout]
