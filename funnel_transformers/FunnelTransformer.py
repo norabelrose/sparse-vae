@@ -1,13 +1,16 @@
 from __future__ import annotations
+
 import torch.nn as nn
 
-from AttentionState import *
-from Utilities import *
-from ops import LayerNorm
-from ops import EmbeddingLookup
-from ops import RelativePositionalAttention
-from ops import PositionwiseFFN
-from ops import Dense
+from .AttentionState import AttentionState
+from ..Utilities import *
+from copy import deepcopy
+from dataclasses import *
+from .ops import LayerNorm
+from .ops import EmbeddingLookup
+from .ops import RelativePositionalAttention
+from .ops import PositionwiseFFN
+from .ops import Dense
 
 
 @dataclass
@@ -36,6 +39,7 @@ class FunnelConfig(SerializableObject):
     rezero_blocks: Optional[Iterable[int]] = field(default_factory=tuple)  # Blocks for which to use ReZero
     max_position_embeddings: int = 512
     return_attention_state: bool = False    # Useful for a VAE encoder; can reuse the state in the decoder
+    return_block_outputs: bool = False      # Whether to return the pre-pooling output of each block on forward()
     use_performer_attention: bool = False
     upsampling: bool = False                 # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
@@ -73,32 +77,9 @@ class FunnelTransformer(nn.Module):
                 Dense(config.d_model, self.config.num_classes))
             self.cls_loss = nn.CrossEntropyLoss()
 
-    # Add a Callable (e.g. a Module) that will be called with the final hidden state of the block at
-    # block_index, just before pooling occurs. A list with the output of all hidden state listeners
-    # will be included in the output of forward().
-    def add_hidden_state_listener(self, listener: Callable, block_index: int):
-        assert not self.config.upsampling
-        self.blocks[block_index].add_hidden_state_listener(listener)
-
-    # Add a Callable (e.g. a Module) that will be called with the hidden state of the model at a location
-    # (either a block index or a (block index, layer index) tuple)— just AFTER nearest-neighbor upsampling
-    # occurs if applicable. The output of *this transform* will then be passed on to the next module. This
-    # makes it possible to add extra information (possibly stochastically) to the upsampling process.
-    def add_upsampling_transform(self, transform: Callable, location: Union[int, Tuple[int, int]]):
-        assert self.config.upsampling
-
-        if isinstance(location, tuple):
-            block_index = location[0]
-            layer_index = location[1]
-        else:
-            block_index = location
-            layer_index = -1
-
-        self.blocks[block_index].add_upsampling_transform(transform, layer_index)
-
     # Returns a copy of the transformer whose upsampling parameter is flipped
     def inverted_copy(self, reverse_layer_order: bool = True, reinitialize_blocks = ()):
-        new_funnel: FunnelTransformer = self.deepcopy()
+        new_funnel: FunnelTransformer = deepcopy(self)
         new_funnel.config.upsampling = not self.config.upsampling
 
         for block in reinitialize_blocks:
@@ -117,30 +98,36 @@ class FunnelTransformer(nn.Module):
 
         return new_funnel
 
-    # Convenient method for loading old checkpoints
-    def iterate_parameters_by_layer(self) -> Iterator[Tuple[str, torch.nn.Parameter, int]]:
+    def enumerate_layers(self) -> Iterator[int, FunnelLayer]:
         absolute_index = 0
         for block in self.blocks:
             for layer in block.layers:
-                for var_name, param in layer.named_parameters():
-                    yield var_name, param, absolute_index
-
+                yield absolute_index, layer
                 absolute_index += 1
+
+    # Convenient method for loading old checkpoints
+    def enumerate_parameters_by_layer(self) -> Iterator[Tuple[str, torch.nn.Parameter, int]]:
+        for index, layer in self.enumerate_layers():
+            for var_name, param in layer.named_parameters():
+                yield var_name, param, index
 
     # All inputs should be of shape (batch, length)
     def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None, cls_target: Tensor = None):
         attn_state = self.attention_state
         attn_state.configure_for_input(x, input_mask, seg_id)
 
-        listener_outputs = []
+        hidden_states = []
         x = self.input_layer(x)  # x.shape == (batch, length, d_model)
 
         q = kv = x
         for block in self.blocks:
-            q, kv, temp = block(q, kv, attn_state)
-            listener_outputs.extend(temp)
+            q, kv = block(q, kv, attn_state)
 
-        output = (q,)
+            if self.config.return_block_outputs:
+                hidden_states.append(kv)
+
+        # When return_block_outputs == True, we return a list of hidden states (including the last output)
+        output = (q,) if not hidden_states else (hidden_states,)
 
         if cls_target is not None:
             ret_dict = {}
@@ -157,9 +144,6 @@ class FunnelTransformer(nn.Module):
 
             output += (ret_dict,)
 
-        if len(listener_outputs):
-            output += (listener_outputs,)
-
         if self.config.return_attention_state:
             attn_state.reset(keep_masks=True)
             output += (attn_state,)
@@ -175,6 +159,9 @@ class FunnelLayer(nn.Module):
         self.feedforward = PositionwiseFFN(config.d_model, config.d_model * 4, config.dropout, config.ffn_dropout)
         self.output_transforms = []
 
+    # Add a Callable (e.g. a Module) that will be called with the output of this layer. The output of *this transform*
+    # will then be passed on to the next layer. This makes it possible to add extra information (possibly
+    # stochastically) to the upsampling process.
     def add_output_transform(self, transform: Callable):
         self.output_transforms.append(transform)
 
@@ -192,10 +179,6 @@ class FunnelBlock(nn.Module):
     def __init__(self, config: FunnelConfig, block_index: int):
         super().__init__()
 
-        # We specifically don't make this an nn.ModuleList because 1) listeners don't have to be Modules,
-        # and 2) listeners that are Modules should be children of the Module that called add_hidden_state_listener
-        self.hidden_state_listeners = []
-
         block_size = config.block_sizes[block_index]
         self.layers = nn.ModuleList([FunnelLayer(config, block_index) for _ in range(block_size)])
 
@@ -204,20 +187,12 @@ class FunnelBlock(nn.Module):
     def activate_rezero(self):
         self.rezero_alpha = nn.Parameter(torch.tensor(0))
 
-    def add_hidden_state_listener(self, listener: Callable):
-        self.hidden_state_listeners.append(listener)
-
-    def add_upsampling_transform(self, transform: Callable, layer_index: int = -1):
-        self.layers[layer_index].add_output_transform(transform)
-
     def forward(self, q, kv, attention_state: AttentionState) -> Tuple[Tensor, Tensor, List[Any]]:
         with attention_state.pooled_q_unpooled_k():
             kv = self.layers[0](q, kv, attention_state)
 
         for layer in self.layers[1:]:
             kv = layer(kv, kv, attention_state)
-
-        listener_output = [listener(kv) for listener in self.hidden_state_listeners]
 
         # With ReZero, we introduce an additional residual connection between blocks, where the output of each
         # block is multiplied by a parameter alpha that is initialized to zero. When alpha == 0, the block has
@@ -226,4 +201,4 @@ class FunnelBlock(nn.Module):
             kv = q + (kv * self.rezero_alpha)
 
         q = attention_state.scale_input(kv)
-        return q, kv, listener_output
+        return q, kv

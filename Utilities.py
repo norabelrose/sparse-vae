@@ -15,7 +15,7 @@ Device = NewType('Device', torch.device)
 def invert(source: dict) -> dict:
     return dict((value, key) for key, value in source.items())
 
-N = TypeVar('N', Union[int, float])
+N = TypeVar('N', bound=Union[int, float])
 
 def product(numbers: Iterable[N]) -> N:
     result = 1
@@ -32,7 +32,13 @@ def replace_all(string: str, mappings: List[Tuple[str, str]]) -> str:
 
     return string
 
-T = TypeVar('T', Union[List[Tensor], Tensor])
+
+def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor) -> Tensor:
+    eps = torch.empty_like(mu).normal_(0., 1.)
+    return torch.exp(logsigma) * eps + mu
+
+
+T = TypeVar('T', bound=Union[List[Tensor], Tensor])
 
 def slice_tensors(x: T, axis: int, start: int = None, stop: int = None, step: int = None) -> T:
     rank = x.dim() if isinstance(x, torch.tensor) else x[0].dim()

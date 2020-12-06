@@ -1,7 +1,11 @@
-from FunnelTransformer import *
+from __future__ import annotations
+
+from copy import copy
 from dataclasses import *
-import torch
 import torch.nn.functional as F
+from ..Utilities import *
+if TYPE_CHECKING:   # Avoid circular dependency
+    from .FunnelTransformer import FunnelConfig
 
 # A tensor if attention_type == "rel_shift", but a list of tensors if attention_type == "factorized"
 PositionalEncoding = NewType('PositionalEncoding', Union[Tensor, List[Tensor]])
@@ -85,6 +89,9 @@ class AttentionState:
         if self.cache_masks:
             self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
 
+    def invert_block_order(self):
+        self._pos_encodings.reverse()
+
     # This method should be called at the end of a forward pass
     def reset(self, keep_masks: bool = False):
         self._current_block = 0
@@ -142,8 +149,8 @@ class AttentionState:
         scaling_factor = self.funnel_config.scaling_factors[self._current_block]
 
         # Downsample the Q portion of these masks
-        self.not_cls_mask = self._stride_downsample(self.not_cls_mask, 0, scaling_factor)
-        self.segment_mask = self._stride_downsample(self.segment_mask, 1, scaling_factor)
+        self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
+        self.segment_mask = self._stride_downsample(self.segment_mask, -2, scaling_factor)
 
         # We don't cache pooled Q, unpooled K masks because they aren't needed for upsampling
 
@@ -156,8 +163,8 @@ class AttentionState:
         scaling_factor = self.funnel_config.scaling_factors[self._current_block]
 
         # Downsample the K portion of these masks
-        self.not_cls_mask = self._stride_downsample(self.not_cls_mask, 1, scaling_factor)
-        self.segment_mask = self._stride_downsample(self.segment_mask, 2, scaling_factor)
+        self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -1, scaling_factor)
+        self.segment_mask = self._stride_downsample(self.segment_mask, -1, scaling_factor)
 
         if self.cache_masks:
             self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
@@ -232,7 +239,7 @@ class AttentionState:
         attn_type = config.attention_type
         self._pos_encodings.clear()
 
-        scaling_factors = config.scaling_factors.copy()
+        scaling_factors = copy(config.scaling_factors)
         if config.upsampling:
             seq_len *= product(scaling_factors)  # What's the sequence length we WILL have at the end?
             scaling_factors.reverse()  # Create the encodings backwards from the end

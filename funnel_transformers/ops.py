@@ -1,9 +1,11 @@
-"""Common operations used to construct model."""
+from __future__ import annotations
 
 import numpy as np
 import torch.nn.init as init
 from torch import nn
-from AttentionState import *
+from .AttentionState import *
+if TYPE_CHECKING:   # Avoid circular dependency
+    from .FunnelTransformer import FunnelConfig
 
 INF = 1e6
 

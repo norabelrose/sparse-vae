@@ -2,8 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import *
 
-from Utilities import *
-from funnel_transformers.FunnelTransformer import FunnelConfig
+from .Utilities import *
+from .funnel_transformers.FunnelTransformer import FunnelConfig
 
 
 @dataclass
@@ -123,6 +123,7 @@ class AutoencoderConfig(SerializableObject):
             attention_type="factorized" if self.use_performer_attention else "rel_shift",
             block_sizes=self.latent_structure.block_sizes[0:3],
             max_position_embeddings=self.max_sequence_length,
+            return_block_outputs=True,
             use_performer_attention=self.use_performer_attention,
             hiddens_to_return='per_block'
         )

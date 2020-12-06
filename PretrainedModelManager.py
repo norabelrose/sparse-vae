@@ -2,11 +2,13 @@ import logging
 import requests
 import tarfile
 import tensorflow as tf
-import torch
 from tqdm.auto import tqdm
-from Utilities import *
+from pathlib import Path
 
-from funnel_transformers.FunnelTransformer import FunnelTransformer, FunnelConfig
+from .funnel_transformers.FunnelTransformer import *
+
+ElectraModel = NewType('ElectraModel', Tuple[FunnelTransformer, FunnelTransformer])
+PretrainedModel = NewType('PretrainedModel', Union[FunnelTransformer, ElectraModel])
 
 
 class PretrainedModelManager:
@@ -22,6 +24,20 @@ class PretrainedModelManager:
         (8, 8, 8): (1024, 16),
         (10, 10, 10): (1024, 16)
     }
+
+    @classmethod
+    def get_model(cls, block_layout: Tuple[int, ...], include_generator: bool = False) -> PretrainedModel:
+        path = cls.path_to_cached_model_for_block_layout(block_layout, include_generator)
+        if path is None:
+            raise ValueError(f'PretrainedModelManager: No pretrained model exists with this block layout.')
+
+        if not os.path.exists(path):
+            cls.download_model_for_block_layout(block_layout, include_generator)
+
+        if include_generator:
+            return cls._get_model_from_pt_ckpt(path, block_layout)
+        else:
+            return cls._get_generator_and_model_from_tf_ckpt(path, block_layout)
 
     @classmethod
     def model_name_for_block_layout(cls, block_layout: Tuple[int, ...],
@@ -54,7 +70,7 @@ class PretrainedModelManager:
         pretrained_dir = os.path.join(text_vae_home, 'pretrained-models')
         model_path = os.path.join(pretrained_dir, name)
 
-        return model_path
+        return Path(model_path)
 
     @classmethod
     def download_model_for_block_layout(cls, block_layout: Tuple[int, ...], include_generator: bool = False,
@@ -66,21 +82,26 @@ class PretrainedModelManager:
 
         url = f"http://storage.googleapis.com/funnel-transformer/funnel_ckpts_all/{name}.tar.gz"
         download_path = cls.path_to_cached_model_for_block_layout(block_layout, include_generator)
+        download_path.parent.mkdir(parents=True, exist_ok=True)  # Make sure parent dir exists
+        download_path = download_path.with_suffix('.tar.gz')
 
         with open(download_path, 'wb') as f:
             print(f"Downloading pretrained model from {url}...")
 
             response = requests.get(url, stream=True)
-            total_length = response.headers.get('content-length')
-            iterator = response.iter_content(chunk_size=500000)
+            total_length = int(response.headers.get('content-length'))
+            iterator = response.iter_content(chunk_size=1024)
 
             if total_length is None and use_tqdm:
                 print("Didn't get a content-length header, so we can't show a progress bar. Continuing...")
             elif use_tqdm:
-                iterator = tqdm(iterator, desc="Downloading model")
+                pbar = tqdm(desc="Downloading model", total=int(total_length), unit='bytes')
 
             for chunk in iterator:
                 f.write(chunk)
+
+                if use_tqdm:
+                    pbar.update(len(chunk))
 
         print("Done. Now unzipping...")
         with tarfile.open(download_path, 'r:gz') as f:
@@ -88,21 +109,6 @@ class PretrainedModelManager:
         os.remove(download_path)
 
         print("Done.")
-
-    @classmethod
-    def get_model(cls, block_layout: Tuple[int, ...], include_generator: bool = False) -> \
-            Union[FunnelTransformer, Tuple[FunnelTransformer, FunnelTransformer]]:
-        path = cls.path_to_cached_model_for_block_layout(block_layout, include_generator)
-        if path is None:
-            raise ValueError(f'PretrainedModelManager: No pretrained model exists with this block layout.')
-
-        if not os.path.exists(path):
-            cls.download_model_for_block_layout(block_layout, include_generator)
-
-        if include_generator:
-            return cls._get_model_from_pt_ckpt(path, block_layout)
-        else:
-            return cls._get_generator_and_model_from_tf_ckpt(path, block_layout)
 
     @classmethod
     def _get_model_from_pt_ckpt(cls, path: str, block_layout: Tuple[int, ...]) -> FunnelTransformer:
@@ -119,7 +125,7 @@ class PretrainedModelManager:
         state_dict = torch.load(path)
         noninitialized_keys = []
 
-        for var_name, param, absolute_index in model.iterate_parameters_by_layer():
+        for var_name, param, absolute_index in model.enumerate_parameters_by_layer():
             keys = var_name.split('.')
             keys[0] = replace_all(keys[0], [  # attention.v_head.bias -> attn_layers.v_head.bias
                 ('attention', 'attn_layers'),
@@ -141,8 +147,7 @@ class PretrainedModelManager:
         return model
 
     @classmethod
-    def _get_generator_and_model_from_tf_ckpt(cls, path: str, block_layout: Tuple[int, ...]) -> \
-            Tuple[FunnelTransformer, FunnelTransformer]:
+    def _get_generator_and_model_from_tf_ckpt(cls, path: str, block_layout: Tuple[int, ...]) -> ElectraModel:
         print("Loading model from TensorFlow checkpoint...")
         reader = tf.train.load_checkpoint(path)
 
@@ -188,11 +193,11 @@ class PretrainedModelManager:
             # 'layer_17.rel_attn.v.bias' -> 'model/encoder/layer_17/rel_attn/v/bias'
             return prefix + '/'.join(keys)
 
-        for var_name, param, absolute_index in model.iterate_parameters_by_layer():
+        for var_name, param, absolute_index in model.enumerate_parameters_by_layer():
             tf_name = convert_pt_parameter_name_to_tf(var_name, absolute_index, 'model/encoder/')
             param.data = reader.get_tensor(tf_name)
 
-        for var_name, param, absolute_index in model.iterate_parameters_by_layer():
+        for var_name, param, absolute_index in model.enumerate_parameters_by_layer():
             tf_name = convert_pt_parameter_name_to_tf(var_name, absolute_index, 'generator/encoder/')
             param.data = reader.get_tensor(tf_name)
 
