@@ -26,7 +26,7 @@ class PretrainedModelManager:
     }
 
     @classmethod
-    def get_model(cls, block_layout: Tuple[int, ...], include_generator: bool = False,
+    def get_model(cls, block_layout: Tuple[int, ...], config: FunnelConfig = None, include_generator: bool = False,
                   strict: bool = False) -> PretrainedModel:
         path = cls.path_to_cached_model_for_block_layout(block_layout, include_generator)
         if path is None:
@@ -121,17 +121,18 @@ class PretrainedModelManager:
         print("Done.")
     
     @classmethod
-    def _get_model_from_pt_ckpt(cls, path: Path, block_layout: Tuple[int, ...],
+    def _get_model_from_pt_ckpt(cls, path: Path, block_layout: Tuple[int, ...], config: FunnelConfig = None,
                                 strict: bool = False) -> FunnelTransformer:
         print("Loading from pretrained PyTorch checkpoint...")
         
         # noinspection PyTypeChecker
         d_model, num_heads = cls.block_size_to_dims[block_layout]
-        model = FunnelTransformer(FunnelConfig(
-            block_sizes=block_layout,
-            d_model=d_model,
-            n_head=num_heads
-        ))
+        model_config = config or FunnelConfig()
+        model_config.block_sizes = block_layout
+        model_config.d_model = d_model
+        model_config.n_head = num_heads
+
+        model = FunnelTransformer(model_config)
 
         # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the pretraining
         # files will have the form 'attn_layers.2.v_head.bias'. We need to convert here.
@@ -227,7 +228,7 @@ class PretrainedModelManager:
             
             param.data = torch.from_numpy(weights)
 
-        for var_name, param, absolute_index in model.enumerate_parameters_by_layer():
+        for var_name, param, absolute_index in generator.enumerate_parameters_by_layer():
             tf_name = convert_pt_parameter_name_to_tf(var_name, absolute_index, 'generator/encoder/')
             
             weights = reader.get_tensor(tf_name)

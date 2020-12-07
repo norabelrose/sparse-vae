@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import copy
 from dataclasses import *
 import torch.nn.functional as F
@@ -137,37 +138,30 @@ class AttentionState:
 
     # We use with-statements to keep track of whether we need to yield tensors that are appropriate
     # for when q.shape[1] < k.shape[1]; that is, right after a downsampling operation.
+    @contextmanager
     def pooled_q_unpooled_k(self):  # with attention_state.pooled_q_unpooled_k(): ...
-        return self
+        # We're entering a pooled_q_unpooled_k block
+        if self._current_block > 0:
+            self.pooled_q_unpooled_k_flag = True
+            scaling_factor = self.funnel_config.scaling_factors[self._current_block]
 
-    # We're entering a pooled_q_unpooled_k block
-    def __enter__(self):
-        if self._current_block == 0:  # We don't actually do pooling before the first block
-            return
+            # Downsample the Q portion of these masks
+            self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
+            self.segment_mask = self._stride_downsample(self.segment_mask, -2, scaling_factor)
 
-        self.pooled_q_unpooled_k_flag = True
-        scaling_factor = self.funnel_config.scaling_factors[self._current_block]
+        yield   # Compute attention and stuff...
 
-        # Downsample the Q portion of these masks
-        self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
-        self.segment_mask = self._stride_downsample(self.segment_mask, -2, scaling_factor)
+        # We're exiting a pooled_q_unpooled_k block
+        if self._current_block > 0:
+            self.pooled_q_unpooled_k_flag = False
+            scaling_factor = self.funnel_config.scaling_factors[self._current_block]
 
-        # We don't cache pooled Q, unpooled K masks because they aren't needed for upsampling
+            # Downsample the K portion of these masks
+            self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -1, scaling_factor)
+            self.segment_mask = self._stride_downsample(self.segment_mask, -1, scaling_factor)
 
-    # We're exiting a pooled_q_unpooled_k block
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._current_block == 0:  # We don't actually do pooling before the first block
-            return
-
-        self.pooled_q_unpooled_k_flag = False
-        scaling_factor = self.funnel_config.scaling_factors[self._current_block]
-
-        # Downsample the K portion of these masks
-        self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -1, scaling_factor)
-        self.segment_mask = self._stride_downsample(self.segment_mask, -1, scaling_factor)
-
-        if self.cache_masks:
-            self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
+            if self.cache_masks:
+                self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
 
     # Used for scaling multiple different kinds of tensors (pos encodings, text representations, etc.)
     def _scale_tensor(self, x: Tensor, scaling_factor: int, upsample: bool, mode: str = None) -> Tensor:

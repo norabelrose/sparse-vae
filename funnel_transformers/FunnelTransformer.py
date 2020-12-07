@@ -53,15 +53,37 @@ class FunnelConfig(SerializableObject):
         if len(self.scaling_factors) < len(self.block_sizes):
             self.scaling_factors += (1,)
 
+    # Get a dictionary compatible with the old ModelConfig class from Funnel-Transformers
+    def get_backward_compatible_dict(self) -> Dict:
+        return {
+            "vocab_size": self.vocab_size,
+            "d_embed": self.d_model,
+            "d_model": self.d_model,
+            "n_head": self.n_head,
+            "d_head": self.d_model // self.n_head,
+            "d_inner": self.d_model * 4,
+            "dropout": self.dropout,
+            "dropatt": self.attention_dropout,
+            "dropact": self.ffn_dropout,
+            "block_size": '_'.join([str(x) for x in self.block_sizes]),
+            "pooling_type": self.pooling_type,
+            "pooling_size": 2,
+            "separate_cls": self.separate_cls,
+            "pool_q_only": self.pool_q_only
+        }
 
 class FunnelTransformer(nn.Module):
     def __init__(self, config: FunnelConfig):
         super(FunnelTransformer, self).__init__()
         self.config = config
-        self.input_layer = nn.Sequential(
-            EmbeddingLookup(config.vocab_size, config.d_model),
-            LayerNorm(config.d_model),
-            nn.Dropout(config.dropout))
+
+        if not config.upsampling:
+            self.input_layer = nn.Sequential(
+                EmbeddingLookup(config.vocab_size, config.d_model),
+                LayerNorm(config.d_model),
+                nn.Dropout(config.dropout))
+        else:
+            self.output_linear = nn.Linear(config.d_model, config.vocab_size)
 
         self.blocks = nn.ModuleList([FunnelBlock(config, index) for index in range(len(config.block_sizes))])
         for block_index in config.rezero_blocks:
@@ -117,7 +139,8 @@ class FunnelTransformer(nn.Module):
         attn_state.configure_for_input(x, input_mask, seg_id)
 
         hidden_states = []
-        x = self.input_layer(x)  # x.shape == (batch, length, d_model)
+        if not self.config.upsampling:
+            x = self.input_layer(x)  # x.shape == (batch, length, d_model)
 
         q = kv = x
         for block in self.blocks:
@@ -125,6 +148,11 @@ class FunnelTransformer(nn.Module):
 
             if self.config.return_block_outputs:
                 hidden_states.append(kv)
+
+        # Non-autoregressively generate a softmax distribution over words
+        if self.config.upsampling:
+            q = self.output_linear(q)
+            q = nn.functional.softmax(q, dim=-1)
 
         # When return_block_outputs == True, we return a list of hidden states (including the last output)
         output = (q,) if not hidden_states else (hidden_states,)
