@@ -49,12 +49,12 @@ class AttentionState:
         # The pooled Q, unpooled K encodings are at index 1
         return self._pos_encodings[self._current_block][int(self.pooled_q_unpooled_k_flag)]
 
-    # This method should be called before .positional_encoding is queried in a forward pass
+    # This method should be called before any AttentionState properties are queried in a forward pass
     def configure_for_input(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None):
         # Only spend the FLOPs on computing new positional encodings if we actually have to (we usually shouldn't)
         new_seq_len, new_device, new_dtype = x.shape[1], x.device, x.dtype
         if (new_seq_len, new_device, new_dtype) != (self._last_seq_len, self._last_device, self._last_dtype):
-            self._pos_encodings = self._generate_pos_encodings(new_seq_len, new_device, new_dtype)
+            self._generate_pos_encodings(new_seq_len, new_dtype, new_device)
 
             self._last_seq_len = x.shape[1]
             self._last_device = x.device
@@ -92,6 +92,33 @@ class AttentionState:
 
     def invert_block_order(self):
         self._pos_encodings.reverse()
+    
+    # We use with-statements to keep track of whether we need to yield tensors that are appropriate
+    # for when q.shape[1] < k.shape[1]; that is, right after a downsampling operation.
+    @contextmanager
+    def pooled_q_unpooled_k(self):  # with attention_state.pooled_q_unpooled_k(): ...
+        # We're entering a pooled_q_unpooled_k block
+        if self._current_block > 0:
+            self.pooled_q_unpooled_k_flag = True
+            scaling_factor = self.funnel_config.scaling_factors[self._current_block - 1]
+
+            # Downsample the Q portion of these masks
+            self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
+            self.segment_mask = self._stride_downsample(self.segment_mask, -2, scaling_factor)
+
+        yield   # Compute attention and stuff...
+
+        # We're exiting a pooled_q_unpooled_k block
+        if self._current_block > 0:
+            self.pooled_q_unpooled_k_flag = False
+            scaling_factor = self.funnel_config.scaling_factors[self._current_block - 1]
+
+            # Downsample the K portion of these masks
+            self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -1, scaling_factor)
+            self.segment_mask = self._stride_downsample(self.segment_mask, -1, scaling_factor)
+
+            if self.cache_masks:
+                self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
 
     # This method should be called at the end of a forward pass
     def reset(self, keep_masks: bool = False):
@@ -103,7 +130,7 @@ class AttentionState:
         if not keep_masks:
             self._mask_stack.clear()
 
-    # Either pool or upsample the tensor, which ever is appropriate for the current block.
+    # Either pool or upsample the tensor, whichever is appropriate for the current block.
     def scale_input(self, x: Tensor) -> Tensor:
         config = self.funnel_config
         factors = config.scaling_factors
@@ -136,33 +163,6 @@ class AttentionState:
         self._current_block += 1
         return x
 
-    # We use with-statements to keep track of whether we need to yield tensors that are appropriate
-    # for when q.shape[1] < k.shape[1]; that is, right after a downsampling operation.
-    @contextmanager
-    def pooled_q_unpooled_k(self):  # with attention_state.pooled_q_unpooled_k(): ...
-        # We're entering a pooled_q_unpooled_k block
-        if self._current_block > 0:
-            self.pooled_q_unpooled_k_flag = True
-            scaling_factor = self.funnel_config.scaling_factors[self._current_block]
-
-            # Downsample the Q portion of these masks
-            self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
-            self.segment_mask = self._stride_downsample(self.segment_mask, -2, scaling_factor)
-
-        yield   # Compute attention and stuff...
-
-        # We're exiting a pooled_q_unpooled_k block
-        if self._current_block > 0:
-            self.pooled_q_unpooled_k_flag = False
-            scaling_factor = self.funnel_config.scaling_factors[self._current_block]
-
-            # Downsample the K portion of these masks
-            self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -1, scaling_factor)
-            self.segment_mask = self._stride_downsample(self.segment_mask, -1, scaling_factor)
-
-            if self.cache_masks:
-                self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
-
     # Used for scaling multiple different kinds of tensors (pos encodings, text representations, etc.)
     def _scale_tensor(self, x: Tensor, scaling_factor: int, upsample: bool, mode: str = None) -> Tensor:
         if x is None:
@@ -171,12 +171,12 @@ class AttentionState:
         config = self.funnel_config
         mode = mode or config.pooling_type
 
-        # Remove the [CLS] token if we're protecting it from getting scaled
+        # Remove [CLS] temporarily to protect it from the scaling
         if config.separate_cls:
-            if config.truncate_seq:
-                x = torch.cat([x[:, :1], x[:, :-1]], dim=1)
-            else:
-                x = torch.cat([x[:, :1], x], dim=1)
+            cls_token = x[:, :1]  # Save for later
+            
+            # If truncate_seq == True, we also remove the token at the right end of the sequence to 'make it even'
+            x = x[:, 1:-1] if config.truncate_seq else x[:, 1:]
 
         if not upsample:
             stride = (scaling_factor, 1)
@@ -205,6 +205,9 @@ class AttentionState:
         else:
             # For now we only support nearest-neighbor interpolation
             x = F.interpolate(x, scale_factor=scaling_factor, mode='nearest')
+        
+        if config.separate_cls:
+            x = torch.cat([cls_token, x], dim=1)  # Tack [CLS] back on
 
         return x
 
@@ -214,12 +217,15 @@ class AttentionState:
             return None
 
         config = self.funnel_config
-        stop = -1 if config.separate_cls and config.truncate_seq else None
+        stop = -scaling_factor if config.separate_cls and config.truncate_seq else None
         strided = slice_tensors(x, axis, stop=stop, step=scaling_factor)
 
         if config.separate_cls:
-            cls = slice_tensors(x, axis, stop=1)
-            strided = [torch.cat([x, y], axis=axis) for x, y in zip(cls, strided)]
+            cls_token = slice_tensors(x, axis, stop=1)
+            if torch.is_tensor(x):
+                strided = torch.cat([cls_token, strided], axis=axis)
+            else:
+                strided = [torch.cat([x, y], axis=axis) for x, y in zip(cls_token, strided)]
 
         return strided
 
@@ -237,15 +243,18 @@ class AttentionState:
         if config.upsampling:
             seq_len *= product(scaling_factors)  # What's the sequence length we WILL have at the end?
             scaling_factors.reverse()  # Create the encodings backwards from the end
+        
+        # Used by both factorized and rel shift
+        d_model = config.d_model
+        d_model_half = d_model // 2
+        freq_seq = torch.arange(d_model_half, dtype=dtype, device=device)
+        inv_freq = 1 / (10000 ** (freq_seq / d_model_half))
 
         if attn_type == "factorized":
-            pos_seq = torch.arange(0, seq_len, 1.0, dtype=dtype, device=device)
+            pos_seq = torch.arange(seq_len, dtype=dtype, device=device)
             pos_seq_q, pos_seq_k = pos_seq, pos_seq
-            d_model = self.net_config.d_model
-            d_model_half = d_model // 2
-            freq_seq = torch.arange(0, d_model_half, 1.0, dtype=dtype, device=device)
-            inv_freq = 1 / (10000 ** (freq_seq / d_model_half))
-            sinusoid_q = torch.einsum("...i,d->...id", pos_seq_q, inv_freq)
+            
+            sinusoid_q = torch.einsum("...i,d->...id", pos_seq_q, inv_freq)  # Outer product
             sinusoid_k = torch.einsum("...i,d->...id", pos_seq_k, inv_freq)
             sin_enc_q = torch.sin(sinusoid_q)
             cos_enc_q = torch.cos(sinusoid_q)
@@ -260,14 +269,16 @@ class AttentionState:
             self._pos_encodings.append(encoding_block)
 
             # Now create all the scaled down ones
+            q_stride = 1
             for scaling_factor in scaling_factors:
                 if scaling_factor == 1:  # Ignore the placeholder 1 at the end of the list
                     break
 
                 last_encoding = encoding_block[-1]
+                q_stride *= scaling_factor
 
-                q_pooled = self._stride_downsample(last_encoding[:2], 1, scaling_factor)
-                k_pooled = self._stride_downsample(last_encoding[2:], 1, scaling_factor)
+                q_pooled = self._stride_downsample(last_encoding[:2], 1, q_stride)
+                k_pooled = self._stride_downsample(last_encoding[2:], 1, q_stride)
 
                 encoding_block = [q_pooled + last_encoding[2:], q_pooled + k_pooled]
                 self._pos_encodings.append(encoding_block)
@@ -275,39 +286,56 @@ class AttentionState:
             return [[enc_q_1, enc_q_2, enc_k_1, enc_k_2]]
 
         elif attn_type == "rel_shift":
-            d_model = config.d_model
-            d_model_half = d_model // 2
-            freq_seq = torch.arange(0, d_model_half, 1.0, dtype=dtype, device=device)
-            inv_freq = 1 / (10000 ** (freq_seq / d_model_half))
-
             # initialize an extra long position sequnece
             rel_pos_id = torch.arange(-seq_len * 2, seq_len * 2, 1.0, dtype=dtype, device=device)
             zero_offset = seq_len * 2
 
-            sinusoid = torch.einsum("...i,d->...id", rel_pos_id, inv_freq)
+            sinusoid = torch.einsum("...i,d->...id", rel_pos_id, inv_freq)  # Outer product
             sin_enc = torch.sin(sinusoid)
             cos_enc = torch.cos(sinusoid)
             pos_enc = torch.cat([sin_enc, cos_enc], dim=-1)
 
             # Pre-compute and cache the rel_pos_id for all blocks
-            pos_id = torch.arange(0, seq_len, dtype=dtype, device=device)
+            pos_id = torch.arange(seq_len, dtype=dtype, device=device)
 
             #### Attn(pooled-q, pooled-kv) type
-            pos_enc_1 = self._pos_ids_to_encoding(q_ids=pos_id, q_stride=1, k_ids=pos_id, k_stride=1,
+            pos_enc_2 = self._pos_ids_to_encoding(q_ids=pos_id, q_stride=1, k_ids=pos_id, k_stride=1,
                                                   gather_source=pos_enc, zero_offset=zero_offset, d_model=d_model)
-            self._pos_encodings.append([pos_enc_1])
+            self._pos_encodings.append([pos_enc_2])
 
             # Now create all the scaled down ones
+            q_stride = 1
+            k_stride = 1
             for scaling_factor in scaling_factors:
                 if scaling_factor == 1:  # Ignore the placeholder 1 at the end of the list
                     break
+                
+                q_stride *= scaling_factor
+                
+                # Stride pool the positional encodings
+                if config.separate_cls:
+                    # Under separate [cls], we treat the [cls] as the first token in
+                    # the previous block of the 1st real block. Since the 1st real
+                    # block always has position 1, the position of the previous block
+                    # will 1 - 2**bidx, where `2 ** bidx` is the current stride.
+                    cls_pos = pos_id.new_tensor([1 - q_stride])
+                    if config.truncate_seq:
+                        pooled_pos_id = pos_id[1:-1]
+                    else:
+                        pooled_pos_id = pos_id[1:]
+                    pooled_pos_id = torch.cat([cls_pos, pooled_pos_id[::scaling_factor]], 0)
+                else:
+                    pooled_pos_id = pos_id[::scaling_factor]
 
-                #### pos_enc_1 == Attn(pooled-q, pooled-kv) and pos_enc_2 == Attn(pooled-q, unpooled-kv)
-                pos_enc_1 = self._pos_ids_to_encoding(q_ids=pos_id, q_stride=scaling_factor, k_ids=pos_id,
-                                                      k_stride=1, gather_source=pos_enc, zero_offset=zero_offset,
+                #### pos_enc_1 == Attn(pooled-q, unpooled-kv) and pos_enc_2 == Attn(pooled-q, pooled-kv)
+                pos_enc_2 = self._pos_ids_to_encoding(q_ids=pooled_pos_id, q_stride=q_stride, k_ids=pos_id,
+                                                      k_stride=k_stride, gather_source=pos_enc, zero_offset=zero_offset,
                                                       d_model=d_model)
-                pos_enc_2 = self._pos_ids_to_encoding(q_ids=pos_id, q_stride=scaling_factor, k_ids=pos_id,
-                                                      k_stride=scaling_factor, gather_source=pos_enc,
+                pos_id = pooled_pos_id
+                k_stride = q_stride
+                
+                pos_enc_1 = self._pos_ids_to_encoding(q_ids=pos_id, q_stride=q_stride, k_ids=pos_id,
+                                                      k_stride=k_stride, gather_source=pos_enc,
                                                       zero_offset=zero_offset, d_model=d_model)
                 self._pos_encodings.append([pos_enc_1, pos_enc_2])
 
@@ -329,6 +357,6 @@ class AttentionState:
         rel_ids = torch.arange(max_dist, min_dist - 1, -k_stride, dtype=torch.long, device=q_ids.device)
 
         # gather relative positional encoding
-        rel_ids = rel_ids[:, None] + zero_offset
-        rel_ids = rel_ids.expand(rel_ids.size(0), d_model)
+        rel_ids = rel_ids.unsqueeze(-1) + zero_offset
+        rel_ids = rel_ids.expand(rel_ids.size(0), d_model)  # Broadcast the relative positions across the embedding dim
         return torch.gather(gather_source, 0, rel_ids)

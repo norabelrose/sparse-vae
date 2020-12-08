@@ -127,10 +127,7 @@ class PretrainedModelManager:
         
         # noinspection PyTypeChecker
         d_model, num_heads = cls.block_size_to_dims[block_layout]
-        model_config = config or FunnelConfig()
-        model_config.block_sizes = block_layout
-        model_config.d_model = d_model
-        model_config.n_head = num_heads
+        model_config = config or FunnelConfig(block_sizes=block_layout, d_model=d_model, n_head=num_heads)
 
         model = FunnelTransformer(model_config)
 

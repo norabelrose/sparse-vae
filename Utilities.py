@@ -41,8 +41,9 @@ def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor) -> Tensor:
 T = TypeVar('T', bound=Union[List[Tensor], Tensor])
 
 def slice_tensors(x: T, axis: int, start: int = None, stop: int = None, step: int = None) -> T:
-    rank = x.dim() if isinstance(x, torch.tensor) else x[0].dim()
+    rank = x.dim() if torch.is_tensor(x) else x[0].dim()
     assert axis < rank
+    axis = axis % rank # for negative indices
 
     indices = []
     for i in range(rank):
@@ -52,7 +53,21 @@ def slice_tensors(x: T, axis: int, start: int = None, stop: int = None, step: in
         else:
             indices.append(slice(None))  # Include all elements along this axis; equivalent to : in x[:, 5]
 
-    return x[indices] if isinstance(x, torch.tensor) else [tensor[indices] for tensor in x]
+    return x[indices] if torch.is_tensor(x) else [tensor[indices] for tensor in x]
+
+# Used to make 'args' objects for the old FunnelTFM model
+class DynamicDict(dict):
+    def __getattr__(self, item):
+        try:
+            return self[item]
+        except KeyError:
+            return super().__getattribute__(item)
+
+    def __setattr__(self, key, value):
+        try:
+            self[key] = value
+        except KeyError:
+            super().__setattr__(key, value)
 
 # Convenience for saving and loading objects from JSON
 class SerializableObject:

@@ -67,10 +67,22 @@ class FunnelConfig(SerializableObject):
             "dropact": self.ffn_dropout,
             "block_size": '_'.join([str(x) for x in self.block_sizes]),
             "pooling_type": self.pooling_type,
-            "pooling_size": 2,
+            
+            # We lose info here since Funnel-Transformers doesn't support different scaling factors for each block
+            "pooling_size": self.scaling_factors[0],
             "separate_cls": self.separate_cls,
             "pool_q_only": self.pool_q_only
         }
+    
+    # For the "args" parameter in the old FunnelTFM.__init__()
+    def get_backward_compatible_args(self) -> Dict:
+        return DynamicDict(
+            pad_id=self.pad_id,
+            num_class= self.num_classes,
+            seg_id_cls= self.seg_id_cls,
+            truncate_seq= self.truncate_seq,
+            attn_type= self.attention_type
+        )
 
 class FunnelTransformer(nn.Module):
     def __init__(self, config: FunnelConfig):
@@ -135,12 +147,12 @@ class FunnelTransformer(nn.Module):
 
     # All inputs should be of shape (batch, length)
     def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None, cls_target: Tensor = None):
-        attn_state = self.attention_state
-        attn_state.configure_for_input(x, input_mask, seg_id)
-
         hidden_states = []
         if not self.config.upsampling:
             x = self.input_layer(x)  # x.shape == (batch, length, d_model)
+        
+        attn_state = self.attention_state
+        attn_state.configure_for_input(x, input_mask, seg_id)
 
         q = kv = x
         for block in self.blocks:
