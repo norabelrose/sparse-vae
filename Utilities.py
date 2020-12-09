@@ -4,9 +4,13 @@ import json
 import logging
 import os
 import sys
-import torch
+from typing import Optional, Any, Callable, Union
 
-Tensor = NewType('Tensor', torch.tensor)
+import torch
+from torch import Tensor
+from torch._C import device, dtype
+
+Tensor: Callable[[Any, Optional[dtype], Union[device, str, None], bool], Tensor] = NewType('Tensor', torch.tensor)
 DataType = NewType('DataType', torch.dtype)
 Device = NewType('Device', torch.device)
 
@@ -15,15 +19,6 @@ Device = NewType('Device', torch.device)
 def invert(source: dict) -> dict:
     return dict((value, key) for key, value in source.items())
 
-N = TypeVar('N', bound=Union[int, float])
-
-def product(numbers: Iterable[N]) -> N:
-    result = 1
-    for x in numbers:
-        result *= x
-
-    return x
-
 
 # Performs a series of replace operations on a string defined by a list of tuples of strings
 def replace_all(string: str, mappings: List[Tuple[str, str]]) -> str:
@@ -31,6 +26,10 @@ def replace_all(string: str, mappings: List[Tuple[str, str]]) -> str:
         string = string.replace(old, new)
 
     return string
+
+
+def gaussian_kl_divergence(mu1: Tensor, mu2: Tensor, logsigma1: Tensor, logsigma2: Tensor) -> Tensor:
+    return -0.5 + logsigma2 - logsigma1 + 0.5 * (logsigma1.exp() ** 2 + (mu1 - mu2) ** 2) / (logsigma2.exp() ** 2)
 
 
 def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor) -> Tensor:
@@ -43,7 +42,7 @@ T = TypeVar('T', bound=Union[List[Tensor], Tensor])
 def slice_tensors(x: T, axis: int, start: int = None, stop: int = None, step: int = None) -> T:
     rank = x.dim() if torch.is_tensor(x) else x[0].dim()
     assert axis < rank
-    axis = axis % rank # for negative indices
+    axis = axis % rank  # for negative indices
 
     indices = []
     for i in range(rank):

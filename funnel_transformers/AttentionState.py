@@ -3,10 +3,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import *
+from numpy import prod
 import torch.nn.functional as F
 from ..Utilities import *
-if TYPE_CHECKING:   # Avoid circular dependency
-    from .FunnelTransformer import FunnelConfig
+from .FunnelConfig import FunnelConfig
 
 # A tensor if attention_type == "rel_shift", but a list of tensors if attention_type == "factorized"
 PositionalEncoding = NewType('PositionalEncoding', Union[Tensor, List[Tensor]])
@@ -15,9 +15,9 @@ PositionalEncoding = NewType('PositionalEncoding', Union[Tensor, List[Tensor]])
 @dataclass
 class AttentionState:
     funnel_config: FunnelConfig
-    segment_mask: Tensor = None     # 1 where Q and K are in same segment (e.g. Next Sentence Prediction), 0 otherwise
-    input_mask: Tensor = None       # 1 for positions we should ignore (like padding), 0 otherwise
-    not_cls_mask: Tensor = None     # 0 where position is the [CLS] token, 1 otherwise
+    segment_mask: Optional[Tensor] = None     # 1 where Q and K are in same segment, 0 otherwise
+    input_mask: Optional[Tensor] = None       # 1 for positions we should ignore (like padding), 0 otherwise
+    not_cls_mask: Optional[Tensor] = None     # 0 where position is the [CLS] token, 1 otherwise
 
     # True inside a 'with attention_state.pooled_q_unpooled_k()' block
     pooled_q_unpooled_k_flag: bool = field(init=False, default=False)
@@ -164,7 +164,7 @@ class AttentionState:
         return x
 
     # Used for scaling multiple different kinds of tensors (pos encodings, text representations, etc.)
-    def _scale_tensor(self, x: Tensor, scaling_factor: int, upsample: bool, mode: str = None) -> Tensor:
+    def _scale_tensor(self, x: Tensor, scaling_factor: int, upsample: bool, mode: str = None) -> Optional[Tensor]:
         if x is None:
             return None
 
@@ -241,7 +241,7 @@ class AttentionState:
 
         scaling_factors = copy(config.scaling_factors)
         if config.upsampling:
-            seq_len *= product(scaling_factors)  # What's the sequence length we WILL have at the end?
+            seq_len *= prod(scaling_factors)  # What's the sequence length we WILL have at the end?
             scaling_factors.reverse()  # Create the encodings backwards from the end
         
         # Used by both factorized and rel shift
