@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .Utilities import *
-from .funnel_transformers.FunnelTransformer import FunnelConfig
+from .funnel_transformers.FunnelConfig import FunnelConfig
 
 
 @dataclass

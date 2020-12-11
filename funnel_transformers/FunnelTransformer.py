@@ -24,9 +24,12 @@ class FunnelTransformer(nn.Module):
         else:
             self.output_linear = nn.Linear(config.d_model, config.vocab_size)
 
-        self.blocks = nn.ModuleList([FunnelBlock(config, index) for index in range(len(config.block_sizes))])
+        self.blocks = nn.ModuleList([FunnelBlock(config, size) for size in config.block_sizes])
         for block_index in config.rezero_blocks:
             self.blocks[block_index].activate_rezero()
+
+        if config.num_decoder_layers > 0:
+            self.blocks.append(FunnelBlock(config, config.num_decoder_layers))
 
         self.attention_state = AttentionState(config)
 
@@ -74,22 +77,30 @@ class FunnelTransformer(nn.Module):
 
     # All inputs should be of shape (batch, length)
     def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None, cls_target: Tensor = None):
+        config = self.config
         hidden_states = []
-        if not self.config.upsampling:
+
+        if not config.upsampling:
             x = self.input_layer(x)  # x.shape == (batch, length, d_model)
         
         attn_state = self.attention_state
         attn_state.configure_for_input(x, input_mask, seg_id)
 
         q = kv = x
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             q, kv = block(q, kv, attn_state)
 
-            if self.config.return_block_outputs:
+            # Residual connection when we have a decoder
+            if config.num_decoder_layers > 0 and i == len(self.blocks) - 2:
+                q = q + hidden_states[0]
+
+            # We cache the intermediate hidden state in two cases: 1) the user asked for all hidden states, and
+            # 2) we have a decoder and we need that hidden state to implement the residual connection
+            if config.return_block_outputs or (config.num_decoder_layers > 0 and i == 0):
                 hidden_states.append(kv)
 
         # Non-autoregressively generate a softmax distribution over words
-        if self.config.upsampling:
+        if config.upsampling:
             q = self.output_linear(q)
             q = nn.functional.softmax(q, dim=-1)
 
@@ -111,7 +122,7 @@ class FunnelTransformer(nn.Module):
 
             output += (ret_dict,)
 
-        if self.config.return_attention_state:
+        if config.return_attention_state:
             attn_state.reset(keep_masks=True)
             output += (attn_state,)
         else:
@@ -119,10 +130,10 @@ class FunnelTransformer(nn.Module):
         return output
 
 class FunnelLayer(nn.Module):
-    def __init__(self, config: FunnelConfig, block_index: int):
+    def __init__(self, config: FunnelConfig):
         super().__init__()
 
-        self.attention = RelativePositionalAttention(config, block_index)
+        self.attention = RelativePositionalAttention(config)
         self.feedforward = PositionwiseFFN(config.d_model, config.d_model * 4, config.dropout, config.ffn_dropout)
 
         # A Callable (e.g. a Module) that will be called with the output of this layer. The output of
@@ -142,18 +153,16 @@ class FunnelLayer(nn.Module):
         return x
 
 class FunnelBlock(nn.Module):
-    def __init__(self, config: FunnelConfig, block_index: int):
+    def __init__(self, config: FunnelConfig, num_layers: int):
         super().__init__()
 
-        block_size = config.block_sizes[block_index]
-        self.layers = nn.ModuleList([FunnelLayer(config, block_index) for _ in range(block_size)])
-
+        self.layers = nn.ModuleList([FunnelLayer(config) for _ in range(num_layers)])
         self.rezero_alpha = None
 
     def activate_rezero(self):
         self.rezero_alpha = nn.Parameter(torch.tensor(0))
 
-    def forward(self, q, kv, attention_state: AttentionState) -> Tuple[Tensor, Tensor, List[Any]]:
+    def forward(self, q, kv, attention_state: AttentionState) -> Tuple[Tensor, Tensor]:
         with attention_state.pooled_q_unpooled_k():
             kv = self.layers[0](q, kv, attention_state)
 

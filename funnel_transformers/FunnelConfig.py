@@ -5,7 +5,7 @@ from ..Utilities import *
 class FunnelConfig(SerializableObject):
     block_sizes: Tuple[int, ...]
     d_model: int
-    n_head: int
+    num_heads: int
 
     # **Default values taken from pretrained config files & flags- do not change**
     vocab_size: int = 30522
@@ -31,6 +31,9 @@ class FunnelConfig(SerializableObject):
     use_performer_attention: bool = False
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
+    # 'decoder' in the Funnel-Transformer sense, not the VAE decoder sense. Used for pretraining.
+    num_decoder_layers: int = 0
+
     def __post_init__(self):
         # Turn a single floating point scaling factor x into (x, x, x...) of the appropriate length
         if isinstance(self.scaling_factors, int):
@@ -47,8 +50,8 @@ class FunnelConfig(SerializableObject):
             "vocab_size": self.vocab_size,
             "d_embed": self.d_model,
             "d_model": self.d_model,
-            "n_head": self.n_head,
-            "d_head": self.d_model // self.n_head,
+            "n_head": self.num_heads,
+            "d_head": self.d_model // self.num_heads,
             "d_inner": self.d_model * 4,
             "dropout": self.dropout,
             "dropatt": self.attention_dropout,

@@ -135,15 +135,14 @@ class PositionwiseFFN(nn.Module):
 
 
 class RelativePositionalAttention(nn.Module):
-    def __init__(self, net_config: FunnelConfig, block_index):
+    def __init__(self, net_config: FunnelConfig):
         super(RelativePositionalAttention, self).__init__()
 
-        d_model, n_head = net_config.d_model, net_config.n_head
+        d_model, n_head = net_config.d_model, net_config.num_heads
         d_head = d_model // n_head
 
         self.net_config = net_config
         self.attn_type = net_config.attention_type
-        self.block_index = block_index
 
         self.dropout = net_config.dropout
         self.dropatt = net_config.attention_dropout
@@ -281,7 +280,7 @@ class RelativePositionalAttention(nn.Module):
 
             seg_bias = torch.einsum("...ind,snd->...nis", q_head + r_s_bias, seg_embed)
             tgt_shape = list(seg_mat.size())
-            tgt_shape.insert(-2, self.net_config.n_head)
+            tgt_shape.insert(-2, self.net_config.num_heads)
             seg_mat = torch.unsqueeze(seg_mat, -3).expand(tgt_shape)
             _diff, _same = torch.split(seg_bias, 1, dim=-1)
             _diff = _diff.expand(tgt_shape)

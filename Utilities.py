@@ -4,13 +4,10 @@ import json
 import logging
 import os
 import sys
-from typing import Optional, Any, Callable, Union
 
 import torch
 from torch import Tensor
-from torch._C import device, dtype
 
-Tensor: Callable[[Any, Optional[dtype], Union[device, str, None], bool], Tensor] = NewType('Tensor', torch.tensor)
 DataType = NewType('DataType', torch.dtype)
 Device = NewType('Device', torch.device)
 

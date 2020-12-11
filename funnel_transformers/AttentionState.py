@@ -130,37 +130,52 @@ class AttentionState:
         if not keep_masks:
             self._mask_stack.clear()
 
-    # Either pool or upsample the tensor, whichever is appropriate for the current block.
+    # Either downsample or upsample the tensor, whichever is appropriate for the current block.
     def scale_input(self, x: Tensor) -> Tensor:
         config = self.funnel_config
         factors = config.scaling_factors
 
-        # Sanity check
-        assert self._current_block < len(factors), \
-            "We ran out of scaling factors to use. Did you forget to call AttentionState.reset()?"
+        # Special case for when we're using a traditional Funnel Transformer decoder with all-at-once upsampling
+        if config.num_decoder_layers > 0 and self._current_block == len(factors):
+            upsampling = True
+            scaling_factor = prod(factors)  # Upsample all at once to the scale we started with
+            mask_stack_index = 0            # We'll want the very first set of masks
 
-        scaling_factor = factors[self._current_block]
-        if scaling_factor != 1:
-            x = self._scale_tensor(x, scaling_factor, config.upsampling)
+        # Usual case
+        else:
+            upsampling = config.upsampling
+            scaling_factor = factors[self._current_block]
+            mask_stack_index = -1
 
-            if config.upsampling:
-                # We have cached masks from a previous downsampling operation, so use them
-                if len(self._mask_stack) > 0:
-                    self.input_mask, self.not_cls_mask, self.segment_mask = self._mask_stack.pop()
+            # Sanity check
+            assert self._current_block < len(factors), \
+                "We ran out of scaling factors to use. Did you forget to call AttentionState.reset()?"
 
-                # We don't have cached masks, so just nearest-neighbor upsample our current ones (not ideal)
-                else:
-                    self.input_mask = self._scale_tensor(self.input_mask, scaling_factor, True)
-                    self.not_cls_mask = self._scale_tensor(self.not_cls_mask, scaling_factor, True)
-                    self.segment_mask = self._scale_tensor(self.segment_mask, scaling_factor, True)
-            else:
-                self.input_mask = self._scale_tensor(self.input_mask, scaling_factor, config.upsampling, mode="min")
-
-                if self.cache_masks:
-                    self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
-
-        # Increment our _current_block counter
+        # We assume that scale_input() will only be called once at the end of each block
         self._current_block += 1
+
+        # Don't actually do anything if we don't have to
+        if scaling_factor == 1:
+            return x
+
+        # Okay, we actually have to scale
+        x = self._scale_tensor(x, scaling_factor, upsampling)
+        if upsampling:
+            # We have cached masks from a previous downsampling operation, so use them
+            if len(self._mask_stack) > 0:
+                self.input_mask, self.not_cls_mask, self.segment_mask = self._mask_stack.pop(mask_stack_index)
+
+            # We don't have cached masks, so just nearest-neighbor upsample our current ones (not ideal)
+            else:
+                self.input_mask = self._scale_tensor(self.input_mask, scaling_factor, True)
+                self.not_cls_mask = self._scale_tensor(self.not_cls_mask, scaling_factor, True)
+                self.segment_mask = self._scale_tensor(self.segment_mask, scaling_factor, True)
+        else:
+            self.input_mask = self._scale_tensor(self.input_mask, scaling_factor, upsampling, mode="min")
+
+            if self.cache_masks:
+                self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
+
         return x
 
     # Used for scaling multiple different kinds of tensors (pos encodings, text representations, etc.)

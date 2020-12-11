@@ -1,4 +1,3 @@
-import torch
 from torch import nn
 from typing import *
 from .AutoencoderConfig import AutoencoderConfig
@@ -8,8 +7,10 @@ from .PretrainedModelManager import PretrainedModelManager
 
 
 class Autoencoder(nn.Module):
-    def __init__(self, config: AutoencoderConfig):
+    def __init__(self, config: Optional[AutoencoderConfig] = None):
         super().__init__()
+
+        config = config or AutoencoderConfig.default()  # Just use default values if we aren't given a config object
 
         # If copy_encoder_weights_to_decoder == True, we should load the weights once here and then hand it
         # off to both the encoder and the decoder
@@ -23,24 +24,3 @@ class Autoencoder(nn.Module):
             self.encoder_funnel = FunnelTransformer(config.get_funnel_config())
 
         self.decoder = Decoder(config, funnel_to_use = decoder_funnel)
-
-        #num_cells = len(scale_factors) if not tie_weights else 1
-        #self.combiner_cells = [CombinerCell(768, 12) for _ in range(num_cells)]
-
-    def sample_latent(self, mu, logvar):
-        # Apparently the whole stochasticity thing is just a training regularization
-        if self.training:
-            std = logvar.mul(0.5).exp_() # Convert from the log variance to the stddev in-place
-            epsilon = torch.empty_like(mu).normal_()
-
-            # Reparameterization trick
-            return epsilon.mul(std).add_(mu)
-        else:
-            return mu
-
-    # def forward(self, x):
-    #    activations = self.encoder_funnel(x)
-        # x = self.sample_latent(mu, logvar)
-        # x = self.decoder(x)
-
-        # return x, mu, logvar
