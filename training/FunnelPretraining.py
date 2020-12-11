@@ -13,7 +13,7 @@
 # copies or substantial portions of the Software.
 
 
-"""Perform pretraining."""
+"""Perform training."""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -119,7 +119,7 @@ flags.DEFINE_integer("num_predict", default=None,
 
 ##### Loss related
 flags.DEFINE_string("loss_type", default="mlm",
-                    help="Which pretraining loss to use.")
+                    help="Which training loss to use.")
 # electra specific
 flags.DEFINE_float("width_shrink", default=0.25,
                    help="Generator width / discriminator width.")
@@ -181,7 +181,7 @@ def mlm_loss_func(
 
 
 def mlm(features, mode):
-    """MLM pretraining."""
+    """MLM training."""
     #### Build Model
     if FLAGS.model_config:
         net_config = FunnelTransformer.FunnelConfig.from_json(FLAGS.model_config)
@@ -303,7 +303,7 @@ def get_generator_config(net_config):
 
 
 def electra(features, mode):
-    """ELECTRA pretraining."""
+    """ELECTRA training."""
     #### Build Model
     if FLAGS.model_config:
         net_config = FunnelTransformer.FunnelConfig.from_json(FLAGS.model_config)

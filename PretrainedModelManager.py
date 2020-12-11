@@ -131,7 +131,7 @@ class PretrainedModelManager:
 
         model = FunnelTransformer(model_config)
 
-        # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the pretraining
+        # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the training
         # files will have the form 'attn_layers.2.v_head.bias'. We need to convert here.
         state_dict = torch.load(str(path))
         noninitialized_keys = []

@@ -31,7 +31,7 @@ class FunnelConfig(SerializableObject):
     use_performer_attention: bool = False
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
-    # 'decoder' in the Funnel-Transformer sense, not the VAE decoder sense. Used for pretraining.
+    # 'decoder' in the Funnel-Transformer sense, not the VAE decoder sense. Used for training.
     num_decoder_layers: int = 0
 
     def __post_init__(self):

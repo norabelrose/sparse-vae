@@ -78,7 +78,7 @@ class AttentionState:
             self.not_cls_mask = F.pad(mask, (1, 0, 1, 0))
 
         # Compute the segment matrix. It's 1 where Q and K are in the same segment, 0 where they
-        # are in different segments. This is used for the Next Sentence Prediction pretraining task.
+        # are in different segments. This is used for the Next Sentence Prediction training task.
         if seg_id is not None:
             # [CLS] has a 'third' segment of its own- seg_id_cls, which is 2 by default
             mask = torch.eq(seg_id, self.funnel_config.seg_id_cls)          # 1 where position is [CLS], 0 otherwise

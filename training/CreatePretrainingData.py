@@ -12,7 +12,7 @@
 # The above copyright notice and this permission notice shall be included in all
 # copies or substantial portions of the Software.
 
-"""Create tfrecord for pretraining."""
+"""Create tfrecord for training."""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -184,7 +184,7 @@ def create_pretrain_data(input_paths, tokenizer: FunnelTokenizerFast):
 
 
 def main(_):
-  """create pretraining data (tfrecords)."""
+  """create training data (tfrecords)."""
   # Load tokenizer
   tokenizer = tokenizers.get_tokenizer()
   data_utils.setup_special_ids(tokenizer)
