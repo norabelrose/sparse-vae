@@ -6,7 +6,7 @@ from .funnel_transformers.FunnelConfig import FunnelConfig
 
 
 @dataclass
-class AutoencoderConfig(SerializableObject):
+class AutoencoderConfig(Serializable):
     # The number of layers in each block in the encoder; sequence is reversed for the decoder
     block_sizes: Tuple[int, ...]
 

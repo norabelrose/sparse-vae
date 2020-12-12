@@ -344,8 +344,8 @@ class AttentionState:
 
                 #### pos_enc_1 == Attn(pooled-q, unpooled-kv) and pos_enc_2 == Attn(pooled-q, pooled-kv)
                 pos_enc_2 = self._pos_ids_to_encoding(q_ids=pooled_pos_id, q_stride=q_stride, k_ids=pos_id,
-                                                      k_stride=k_stride, gather_source=pos_enc, zero_offset=zero_offset,
-                                                      d_model=d_model)
+                                                      k_stride=k_stride, gather_source=pos_enc,
+                                                      zero_offset=zero_offset, d_model=d_model)
                 pos_id = pooled_pos_id
                 k_stride = q_stride
                 
@@ -373,5 +373,5 @@ class AttentionState:
 
         # gather relative positional encoding
         rel_ids = rel_ids.unsqueeze(-1) + zero_offset
-        rel_ids = rel_ids.expand(rel_ids.size(0), d_model)  # Broadcast the relative positions across the embedding dim
+        rel_ids = rel_ids.expand(rel_ids.size(0), d_model)  # Broadcast the rel positions across the embedding dim
         return torch.gather(gather_source, 0, rel_ids)

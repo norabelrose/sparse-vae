@@ -1,8 +1,9 @@
 from dataclasses import *
 from ..Utilities import *
+from ..Serializable import *
 
 @dataclass
-class FunnelConfig(SerializableObject):
+class FunnelConfig(Serializable):
     block_sizes: Tuple[int, ...]
     d_model: int
     num_heads: int
@@ -67,7 +68,7 @@ class FunnelConfig(SerializableObject):
 
     # For the "args" parameter in the old FunnelTFM.__init__()
     def get_backward_compatible_args(self) -> Dict:
-        return DynamicDict(
+        return DynamicDict(     # can use DynamicDict.my_key syntax
             pad_id=self.pad_id,
             num_class=self.num_classes,
             seg_id_cls=self.seg_id_cls,

@@ -3,7 +3,7 @@ from Utilities import *
 
 
 @dataclass
-class PerformerAttentionConfig(SerializableObject):
+class PerformerAttentionConfig(Serializable):
     r"""
     This is the configuration class to store the configuration of a :class:`~transformers.PerformerAttention` module. It is used
     to define the behavior of a Performer/FAVOR+ attention module when it is initialized.
