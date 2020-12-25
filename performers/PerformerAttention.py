@@ -3,6 +3,7 @@ from torch import nn
 import logging
 import math
 import random
+import torch
 import torch.nn.functional as F
 
 from PerformerAttentionConfig import *
