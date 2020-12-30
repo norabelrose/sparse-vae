@@ -45,8 +45,8 @@ class TestFunnelTransformer(unittest.TestCase):
             new_model.eval()
             
             new_config = new_model.config
-            old_config_dict = new_config.get_backward_compatible_dict()
-            old_model_args = new_config.get_backward_compatible_args()
+            old_config_dict = new_model.get_backward_compatible_dict()
+            old_model_args = new_model.get_backward_compatible_args()
     
             checkpoint_path = PretrainedModelManager.path_to_cached_model_for_block_layout((4, 4, 4))
             old_config = eval('ModelConfig(**old_config_dict)')

@@ -2,10 +2,9 @@ from __future__ import annotations
 
 # import fast_transformers
 from torch import nn
-from dataclasses import *
+from dataclasses import dataclass, field
 from .funnel_transformers import FunnelTransformer
 from .Utilities import *
-from .AutoencoderConfig import AutoencoderConfig
 
 
 @dataclass
@@ -55,8 +54,9 @@ class DecoderCell(nn.Module):
 
         return x
 
+
 class Decoder(nn.Module):
-    def __init__(self, config: AutoencoderConfig, funnel_to_use: FunnelTransformer = None):
+    def __init__(self, config, funnel_to_use: FunnelTransformer = None):
         super().__init__()
 
         self.funnel_transformer = funnel_to_use or FunnelTransformer(config.get_funnel_config())

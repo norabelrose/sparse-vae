@@ -4,8 +4,7 @@ import numpy as np
 import torch.nn.init as init
 from torch import nn
 from .AttentionState import *
-if TYPE_CHECKING:   # Avoid circular dependency
-    from .FunnelTransformer import FunnelConfig
+from ..performers import PerformerAttention, PerformerAttentionConfig
 
 INF = 1e6
 
@@ -117,6 +116,7 @@ class Dense(nn.Module):
 
         return output
 
+
 class PositionwiseFFN(nn.Module):
     def __init__(self, d_model, d_inner, dropout, dropact):
         super(PositionwiseFFN, self).__init__()
@@ -135,7 +135,7 @@ class PositionwiseFFN(nn.Module):
 
 
 class RelativePositionalAttention(nn.Module):
-    def __init__(self, net_config: FunnelConfig):
+    def __init__(self, net_config):
         super(RelativePositionalAttention, self).__init__()
 
         d_model, n_head = net_config.d_model, net_config.num_heads
@@ -164,6 +164,13 @@ class RelativePositionalAttention(nn.Module):
         self.layer_norm = LayerNorm(d_model)
         self.normalizer = 1. / np.sqrt(d_head)
         self.reset_parameters()
+
+        if net_config.use_performer_attention:
+            performer_config = PerformerAttentionConfig(d_model=d_model, num_heads=n_head, use_linear_layers=False)
+
+            self.content_performer_attention = PerformerAttention(performer_config)
+            self.position_performer_attention1 = PerformerAttention(performer_config)
+            self.position_performer_attention2 = PerformerAttention(performer_config)
 
     def reset_parameters(self):
         nn.init.uniform_(self.r_w_bias, b=0.1)

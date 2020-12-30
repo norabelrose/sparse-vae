@@ -4,9 +4,9 @@ from contextlib import contextmanager
 from copy import copy
 from dataclasses import *
 from numpy import prod
+from pytorch_lightning.utilities import AttributeDict
 import torch.nn.functional as F
 from ..Utilities import *
-from .FunnelConfig import FunnelConfig
 
 # A tensor if attention_type == "rel_shift", but a list of tensors if attention_type == "factorized"
 PositionalEncoding = NewType('PositionalEncoding', Union[Tensor, List[Tensor]])
@@ -14,7 +14,7 @@ PositionalEncoding = NewType('PositionalEncoding', Union[Tensor, List[Tensor]])
 
 @dataclass
 class AttentionState:
-    funnel_config: FunnelConfig
+    hparams: AttributeDict
     segment_mask: Optional[Tensor] = None     # 1 where Q and K are in same segment, 0 otherwise
     input_mask: Optional[Tensor] = None       # 1 for positions we should ignore (like padding), 0 otherwise
     not_cls_mask: Optional[Tensor] = None     # 0 where position is the [CLS] token, 1 otherwise
@@ -29,8 +29,8 @@ class AttentionState:
     # Private variables
     _current_block: int = field(init=False, default=0)
     _last_seq_len: int = field(init=False, default=None)
-    _last_dtype: DataType = field(init=False, default=None)
-    _last_device: Device = field(init=False, default=None)
+    _last_dtype: torch.dtype = field(init=False, default=None)
+    _last_device: torch.device = field(init=False, default=None)
     _mask_stack: List[Tuple[Tensor, Tensor, Tensor]] = field(init=False, default_factory=list)
     _pos_encodings: List[List[PositionalEncoding]] = field(init=False, default_factory=list)
 
@@ -66,13 +66,13 @@ class AttentionState:
             return
 
         # By default, mask out all the padding tokens
-        pad_id = self.funnel_config.pad_id
+        pad_id = self.hparams.pad_id
         if input_mask is None and pad_id is not None:
             input_mask = (x == pad_id).float()
 
         self.input_mask = input_mask
 
-        if self.funnel_config.separate_cls:
+        if self.hparams.separate_cls:
             # Mask which is 0 where a position is [CLS], 1 otherwise
             mask = torch.ones([new_seq_len - 1, new_seq_len - 1], dtype=new_dtype, device=new_device)
             self.not_cls_mask = F.pad(mask, (1, 0, 1, 0))
@@ -81,7 +81,7 @@ class AttentionState:
         # are in different segments. This is used for the Next Sentence Prediction training task.
         if seg_id is not None:
             # [CLS] has a 'third' segment of its own- seg_id_cls, which is 2 by default
-            mask = torch.eq(seg_id, self.funnel_config.seg_id_cls)          # 1 where position is [CLS], 0 otherwise
+            mask = torch.eq(seg_id, self.hparams.seg_id_cls)          # 1 where position is [CLS], 0 otherwise
             cls_mat = torch.unsqueeze(mask, -1) | torch.unsqueeze(mask, -2)
 
             seg_mat = torch.eq(torch.unsqueeze(seg_id, -1), torch.unsqueeze(seg_id, -2))
@@ -100,7 +100,7 @@ class AttentionState:
         # We're entering a pooled_q_unpooled_k block
         if self._current_block > 0:
             self.pooled_q_unpooled_k_flag = True
-            scaling_factor = self.funnel_config.scaling_factors[self._current_block - 1]
+            scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
 
             # Downsample the Q portion of these masks
             self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
@@ -111,7 +111,7 @@ class AttentionState:
         # We're exiting a pooled_q_unpooled_k block
         if self._current_block > 0:
             self.pooled_q_unpooled_k_flag = False
-            scaling_factor = self.funnel_config.scaling_factors[self._current_block - 1]
+            scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
 
             # Downsample the K portion of these masks
             self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -1, scaling_factor)
@@ -132,11 +132,11 @@ class AttentionState:
 
     # Either downsample or upsample the tensor, whichever is appropriate for the current block.
     def scale_input(self, x: Tensor) -> Tensor:
-        config = self.funnel_config
+        config = self.hparams
         factors = config.scaling_factors
 
         # Special case for when we're using a traditional Funnel Transformer decoder with all-at-once upsampling
-        if config.num_decoder_layers > 0 and self._current_block == len(factors):
+        if config.has_decoder_block and self._current_block == len(factors):
             upsampling = True
             scaling_factor = prod(factors)  # Upsample all at once to the scale we started with
             mask_stack_index = 0            # We'll want the very first set of masks
@@ -183,7 +183,7 @@ class AttentionState:
         if x is None:
             return None
 
-        config = self.funnel_config
+        config = self.hparams
         mode = mode or config.pooling_type
 
         # Remove [CLS] temporarily to protect it from the scaling
@@ -231,7 +231,7 @@ class AttentionState:
         if x is None:
             return None
 
-        config = self.funnel_config
+        config = self.hparams
         stop = -scaling_factor if config.separate_cls and config.truncate_seq else None
         strided = slice_tensors(x, axis, stop=stop, step=scaling_factor)
 
@@ -249,8 +249,8 @@ class AttentionState:
     # for block N - 1. This actually *is* true for the factorized encodings, and the original implementation
     # generated those just-in-time while caching rel shift encodings ahead of time. This made the code
     # unnecessarily complicated, however, so we just cache both types of encodings.
-    def _generate_pos_encodings(self, seq_len: int, dtype: DataType, device: Device):
-        config = self.funnel_config
+    def _generate_pos_encodings(self, seq_len: int, dtype: torch.dtype, device: torch.device):
+        config = self.hparams
         attn_type = config.attention_type
         self._pos_encodings.clear()
 

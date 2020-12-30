@@ -3,9 +3,6 @@ from typing import *
 import torch
 from torch import Tensor
 
-DataType = NewType('DataType', torch.dtype)
-Device = NewType('Device', torch.device)
-
 
 # Get a new dictionary inverting the keys and values from a source dictionary
 def invert(source: dict) -> dict:
@@ -31,6 +28,7 @@ def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor) -> Tensor:
 
 T = TypeVar('T', bound=Union[List[Tensor], Tensor])
 
+
 def slice_tensors(x: T, axis: int, start: int = None, stop: int = None, step: int = None) -> T:
     rank = x.dim() if torch.is_tensor(x) else x[0].dim()
     assert axis < rank
@@ -45,14 +43,3 @@ def slice_tensors(x: T, axis: int, start: int = None, stop: int = None, step: in
             indices.append(slice(None))  # Include all elements along this axis; equivalent to : in x[:, 5]
 
     return x[indices] if torch.is_tensor(x) else [tensor[indices] for tensor in x]
-
-# Used to make 'args' objects for the old FunnelTFM model
-class DynamicDict(dict):
-    def __getattr__(self, item):
-        return self[item]
-
-    def __setattr__(self, key, value):
-        try:
-            self[key] = value
-        except KeyError:
-            super().__setattr__(key, value)

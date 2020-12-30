@@ -26,7 +26,7 @@ class PerformerAttention(nn.Module):
 
         # kwargs take precedence over the default values that might be stored in the config object
         for k, v in kwargs.items():
-            assert hasattr(config, k), "'{k}' is an invalid config parameter"
+            assert hasattr(config, k), f"'{k}' is an invalid config parameter"
             setattr(config, k, v)
 
         self.__dict__.update(config.__dict__)

@@ -1,4 +1,4 @@
-<pad>
+[PAD]
 <unused0>
 <unused1>
 <unused2>
@@ -98,10 +98,10 @@
 </s>
 <eod>
 <eop>
-<unk>
-<cls>
-<sep>
-<mask>
+[UNK]
+[CLS]
+[SEP]
+[MASK]
 <unused99>
 <unused100>
 <unused101>
