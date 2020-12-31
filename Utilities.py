@@ -4,13 +4,14 @@ import torch
 from torch import Tensor
 
 
-# Get a new dictionary inverting the keys and values from a source dictionary
-def invert(source: dict) -> dict:
-    return dict((value, key) for key, value in source.items())
+# Get a new dictionary with a subset of keys from the old dictionary. If you want a key name to stay the same,
+# put it in `args`. To rename a key, use **kwargs. Inspired by the R `dplyr` package.
+def transmute(big_dict: dict, *args: str, **kwargs: str) -> dict:
+    return {**{k: big_dict[k] for k in args}, **{new_k: big_dict[old_k] for new_k, old_k in kwargs}}
 
 
-# Performs a series of replace operations on a string defined by a list of tuples of strings
-def replace_all(string: str, mappings: List[Tuple[str, str]]) -> str:
+# Performs a series of replace operations on a string defined by a dictionary.
+def replace_all(string: str, mappings: Dict[str, str]) -> str:
     for old, new in mappings:
         string = string.replace(old, new)
 

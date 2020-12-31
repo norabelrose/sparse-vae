@@ -1,3 +1,4 @@
+from einops import rearrange
 from itertools import count
 from torch import nn
 import logging
@@ -86,8 +87,7 @@ class PerformerAttention(nn.Module):
             weights: torch.tensor(bs, num_heads, seq_length, seq_length) Attention weights context: torch.tensor(bs,
             seq_length, dim) Contextualized layer. Optional: only if `output_attentions=True`
         """
-        bs, q_length, dim = q.shape
-        dim_per_head = self.d_model // self.num_heads
+        bs, q_length, _ = q.shape
 
         assert not output_attentions, "Can't output attention maps when using Performer attention."
         if self.use_recurrent_decoding:
@@ -96,8 +96,8 @@ class PerformerAttention(nn.Module):
         if self.use_qkv_linear_layers:
             q, k, v = (linear(x) for linear, x in zip(self.qkv_linear_layers, (q, k, v)))
 
-        # Add the head dimension: (bs, num_heads, q_length, dim_per_head)
-        q, k, v = (x.view(bs, -1, self.num_heads, dim_per_head).transpose(1, 2) for x in (q, k, v))
+        # Add the head dimension
+        q, k, v = (rearrange(x, "b l (h d) -> b h l d", h=self.num_heads) for x in (q, k, v))
 
         self._redraw_features_if_needed(bs, q.device)
 
@@ -149,13 +149,13 @@ class PerformerAttention(nn.Module):
     def compute_attention_with_projected_queries_and_keys(self, q_prime, k_prime, v, mask=None, head_mask=None):
         # Apply the padding mask to K'. Also applying it to Q' would be redundant.
         if mask is not None:
-            k_prime *= mask.unsqueeze(1).unsqueeze(-1).expand_as(k_prime)
+            k_prime *= rearrange(mask, 'b l -> b () l ()').expand_as(k_prime)
 
         k_prime_t = k_prime.transpose(-2, -1)
         output = self._numerator_for_projected_queries_and_keys(q_prime, k_prime_t, v)
 
         if self.normalize_output:
-            output /= self._denominator_for_projected_queries_and_keys(q_prime, k_prime_t)
+            output /= self.denominator_for_projected_queries_and_keys(q_prime, k_prime_t)
 
         return self._finalize_attention_output(output, head_mask)
 
@@ -174,7 +174,7 @@ class PerformerAttention(nn.Module):
 
         return q_prime @ self.s
 
-    def _denominator_for_projected_queries_and_keys(self, q_prime, k_prime_t):
+    def denominator_for_projected_queries_and_keys(self, q_prime, k_prime_t):
         # Noncausal
         if not self.causal:
             denom = q_prime @ k_prime_t.sum(dim=-1, keepdim=True)   # Sum over positions
@@ -194,14 +194,12 @@ class PerformerAttention(nn.Module):
         return denom + 2 * self.normalization_stabilizer * (torch.abs(denom) <= self.normalization_stabilizer)
 
     def _finalize_attention_output(self, context, head_mask=None, att_map_to_output=None):
-        def unshape(x):
-            return x.transpose(1, 2).reshape(x.shape[0], -1, x.shape[1] * x.shape[-1])
-
         # Mask heads if we want to
         if head_mask is not None:
             context *= head_mask
 
-        context = unshape(context)  # (bs, q_length, dim)
+        # Coalesce attention heads
+        context = rearrange(context, "b h l d -> b l (h d)")
         context = self.output_linear(context)  # (bs, q_length, dim)
 
         if att_map_to_output:
@@ -324,16 +322,15 @@ def _get_kacs_random_walk_chain(batch, num_rows, device=None):
 
         # Group the matrix into random, non-overlapping pairs of rows. Because these pairs are non-overlapping, we can
         # perform each set of rotations in parallel.
-        shuffled_rows = _batch_randperm(batch, num_rows, device=device).view(batch, -1, 1, 1)
-        random_row_pairs = block.gather(1, shuffled_rows.expand_as(block)).view(batch, -1, 2, num_rows)
+        shuffled_rows = rearrange(_batch_randperm(batch, num_rows, device=device), 'b r -> b r 1 1')
+        random_row_pairs = rearrange(block.gather(1, shuffled_rows.expand_as(block)), 'b (r p) c -> b r p c', p=2)
 
         rows1, rows2 = random_row_pairs[:, :, 0], random_row_pairs[:, :, 1]
         new_rows1 = cosines * rows1 + sines * rows2
         new_rows2 = -sines * rows1 + cosines * rows2
 
         random_row_pairs[:, :, 0], random_row_pairs[:, :, 1] = new_rows1, new_rows2
-
-        block = random_row_pairs.view(batch, -1, 1, num_rows)  # Ungroup all the rows again
+        block = rearrange(random_row_pairs, 'b r p c -> b (r p) c')  # Ungroup the row pairs again
 
         # Only yield the block after we've completed 2 log(n) burn-in iterations
         if n >= burnin_steps:

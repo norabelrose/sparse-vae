@@ -24,14 +24,14 @@ class TestFunnelTransformer(unittest.TestCase):
                   f" the PATH_TO_FUNNEL_TRANSFORMER_DIR constant in {__file__}. Skipping test for now.")
             return
 
-        # Load the ops.py file- it doesn't import any other Funnel-Transformer file and modeling.py needs it
-        ops_file = os.path.join(directory, 'ops.py')
+        # Load the RelativePositionalAttention.py file- it doesn't import any other Funnel-Transformer file and modeling.py needs it
+        ops_file = os.path.join(directory, 'RelativePositionalAttention.py')
         with open(ops_file, 'r') as f:
             exec(f.read(), globals())
 
         # Now load the modeling.py file, but do surgery on it to remove the 'from ops import...' statements.
         # These cause runtime errors because 'ops' doesn't exist as a module from our perspective. They're also
-        # unnecessary because we just directly loaded all the classes and functions from ops.py into global scope.
+        # unnecessary because we just directly loaded all the classes and functions from RelativePositionalAttention.py into global scope.
         modeling_file = os.path.join(directory, 'modeling.py')
         with open(modeling_file, 'r') as f:
             file_text = f.read()

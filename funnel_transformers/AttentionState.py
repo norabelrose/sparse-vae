@@ -227,7 +227,7 @@ class AttentionState:
         return x
 
     # Downsample by stride slicing the tensor along the given axis.
-    def _stride_downsample(self, x: T, axis: int, scaling_factor: int) -> T:
+    def _stride_downsample(self, x: T, axis: int, scaling_factor: int) -> Optional[T]:
         if x is None:
             return None
 
@@ -238,9 +238,9 @@ class AttentionState:
         if config.separate_cls:
             cls_token = slice_tensors(x, axis, stop=1)
             if torch.is_tensor(x):
-                strided = torch.cat([cls_token, strided], axis=axis)
+                strided = torch.cat([cls_token, strided], dim=axis)
             else:
-                strided = [torch.cat([x, y], axis=axis) for x, y in zip(cls_token, strided)]
+                strided = [torch.cat([x, y], dim=axis) for x, y in zip(cls_token, strided)]
 
         return strided
 
@@ -269,8 +269,8 @@ class AttentionState:
             pos_seq = torch.arange(seq_len, dtype=dtype, device=device)
             pos_seq_q, pos_seq_k = pos_seq, pos_seq
             
-            sinusoid_q = torch.einsum("...i,d->...id", pos_seq_q, inv_freq)  # Outer product
-            sinusoid_k = torch.einsum("...i,d->...id", pos_seq_k, inv_freq)
+            sinusoid_q = torch.einsum("i,d->id", pos_seq_q, inv_freq)  # Outer product
+            sinusoid_k = torch.einsum("i,d->id", pos_seq_k, inv_freq)
             sin_enc_q = torch.sin(sinusoid_q)
             cos_enc_q = torch.cos(sinusoid_q)
             sin_enc_k = torch.sin(sinusoid_k)
@@ -305,7 +305,7 @@ class AttentionState:
             rel_pos_id = torch.arange(-seq_len * 2, seq_len * 2, 1.0, dtype=dtype, device=device)
             zero_offset = seq_len * 2
 
-            sinusoid = torch.einsum("...i,d->...id", rel_pos_id, inv_freq)  # Outer product
+            sinusoid = torch.einsum("i,d->id", rel_pos_id, inv_freq)  # Outer product
             sin_enc = torch.sin(sinusoid)
             cos_enc = torch.cos(sinusoid)
             pos_enc = torch.cat([sin_enc, cos_enc], dim=-1)

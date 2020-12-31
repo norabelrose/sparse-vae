@@ -4,8 +4,9 @@ from pyarrow.csv import ConvertOptions
 from tokenizers import BertWordPieceTokenizer
 from torch import Tensor
 from torch.utils.data import DataLoader
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 import datasets
+import multiprocessing
 import os
 import pytorch_lightning as pl
 import torch
@@ -15,12 +16,16 @@ import torch
 class TextVaeDataModule(pl.LightningDataModule):
     dataset_name = 'dataset'  # Should be overridden by subclasses
 
-    def __init__(self, batch_size: int = 10, max_sample_length: int = 512):
+    def __init__(self, batch_size: int = 10, max_sample_length: int = 512, chunk_long_samples: bool = True):
         super().__init__()
 
         self.batch_size = batch_size
+        self.chunk_long_samples = chunk_long_samples
         self.max_sample_length = max_sample_length
-        self.dataset = None     # HuggingFace Dataset object with both train and test splits
+        self.dataset = None     # HuggingFace Dataset object, possibly with both train and test splits
+
+        vocab_path = os.path.join(os.path.dirname(__file__), 'resources', 'pretrained-vocab.txt')
+        self.tokenizer = BertWordPieceTokenizer.from_file(vocab_path, lowercase=True)
 
         # Get path to store the processed dataset
         cache_dir = Path(os.getenv('XDG_CACHE_HOME', '~/.cache'))
@@ -29,7 +34,7 @@ class TextVaeDataModule(pl.LightningDataModule):
 
     # Subclass hook
     def create_dataset(self):
-        pass
+        self.dataset = datasets.load_dataset(self.dataset_name)
 
     def prepare_data(self, *args, **kwargs):
         # Check if we already have the dataset
@@ -41,35 +46,30 @@ class TextVaeDataModule(pl.LightningDataModule):
         self.create_dataset()   # Download or load a big file from disk
         assert self.dataset
 
-        vocab_path = Path(__file__).parent.parent / 'resources' / 'pretrained-vocab.txt'
-        tokenizer = BertWordPieceTokenizer.from_file(vocab_path, lowercase=True)
-        tokenizer.enable_padding()
-        tokenizer.enable_truncation(max_length=self.max_sample_length)
+        def tokenize_and_chunk(batch: Dict[str, list]) -> Dict[str, list]:
+            encodings = self.tokenizer.encode_batch(batch['text'])                       # Tokenize
+            id_iterator = chain.from_iterable([encoding.ids for encoding in encodings])  # Chain all samples together
+            chunk_iterator = iter(lambda: list(islice(id_iterator, self.max_sample_length)), [])  # Break into chunks
 
-        def tokenize_batch(batch: List[dict]) -> List[dict]:
-            text_samples = [sample['text'] for sample in batch]
-            encodings = tokenizer.encode_batch(text_samples)
+            return {'text': list(chunk_iterator)}
 
-            return [{'text': encoding.ids} for encoding in encodings]
+        nontext_cols = self.dataset.column_names
+        nontext_cols.remove('text')
 
-        def chunk_batch(batch: List[dict]) -> List[dict]:
-            id_iterator = chain.from_iterable(sample['text'] for sample in batch)  # Chain all the samples together
-            chunks = list(iter(lambda: list(islice(id_iterator, self.max_sample_length)), []))  # Break into chunks
-
-            return [{'text': chunk for chunk in chunks}]
-
-        # Tokenize, chunk, shuffle, split, and save
-        self.dataset = self.dataset.map(tokenize_batch, batched=True)
-        self.dataset = self.dataset.map(chunk_batch, batched=True)
-        self.dataset = self.dataset.train_test_split(test_size=0.05, shuffle=True)
-        self.dataset.set_format('torch')
+        # Tokenize, chunk, and save
+        size = max(multiprocessing.cpu_count(), 10)
+        print(f"Tokenizing and chunking '{self.dataset_name}'...")
+        self.dataset = self.dataset.map(tokenize_and_chunk, batched=True, batch_size=size, remove_columns=nontext_cols)
+        print(f"Saving '{self.dataset_name}'...")
         self.dataset.save_to_disk(self.dataset_dir / self.dataset_name)
 
     def setup(self, stage: Optional[str] = None):
-        pass
+        self.dataset = self.dataset.train_test_split(test_size=0.05, shuffle=True)
+        self.dataset.set_format('torch')
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
-        return DataLoader(self.dataset['train'], batch_size=self.batch_size, shuffle=True)
+        return DataLoader(self.dataset['train'], batch_size=self.batch_size, shuffle=True,
+                          num_workers=multiprocessing.cpu_count(), pin_memory=True)
 
     def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return DataLoader(self.dataset['test'], batch_size=self.batch_size)
@@ -81,14 +81,8 @@ class TextVaeDataModule(pl.LightningDataModule):
         return batch.to(device)
 
 
-class FunnelPreTrainingDataModule(TextVaeDataModule):
-    dataset_name = 'funnel_pretraining'
-
-    def create_dataset(self):
-        wikipedia = datasets.load_dataset('wikipedia', '20200501.en', split='train')
-        bookcorpus = datasets.load_dataset('bookcorpusopen', split='train')
-        openwebtext = datasets.load_dataset('openwebtext', split='train')
-        self.dataset = datasets.concatenate_datasets([wikipedia, bookcorpus, openwebtext])
+class ProjectGutenbergDataModule(TextVaeDataModule):
+    dataset_name = 'pg19'
 
 
 class AllTheNewsDataModule(TextVaeDataModule):

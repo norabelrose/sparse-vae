@@ -3,19 +3,30 @@ from Utilities import *
 from copy import deepcopy
 from itertools import chain
 import pytorch_lightning as pl
-from pytorch_lightning.utilities import AttributeDict
+import torch.nn.functional as F
 
 
 # Funnel Transformer with a decoder block at the end for ELECTRA pretraining
 class FunnelForPreTraining(pl.LightningModule):
-    def __init__(self,
-                 discriminator_hparams: AttributeDict,
-                 generator_hparams: Optional[AttributeDict] = None,
-                 train_generator: bool = False,
-                 pretrained_path: Optional[str] = None,
-                 strict: bool = False
-                 ):
+    default_hparams = dict(
+        discriminator_hparams=FunnelTransformer.default_hparams,
+        generator_hparams=FunnelTransformer.default_hparams,
+        train_generator=False,
+        pretrained_path="",
+        strict=False,
+
+        # See Funnel Transformer paper, page 15
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        adam_eps=1e-6
+    )
+
+    def __init__(self, **kwargs):
         super(FunnelForPreTraining, self).__init__()
+
+        kwargs = {**self.default_hparams, **kwargs}
+        self.save_hyperparameters(kwargs)
+
         discriminator_hparams.has_decoder_block = True
         discriminator_hparams.return_block_outputs = [0]  # We just need the first hidden state for the res connection
 
@@ -37,7 +48,7 @@ class FunnelForPreTraining(pl.LightningModule):
             self._load_weights_from_tf_ckpt(pretrained_path, strict)
 
     # Returns the loss
-    def training_step(self, batch: Tensor, batch_index: int, optimizer_index: int) -> Tensor:
+    def training_step(self, batch: Dict[str, Tensor], batch_index: int, optimizer_index: int) -> Tensor:
         # Either generator or discriminator forward pass
         def _encoder_decoder_forward(inputs: Tensor, model_index: int) -> Tensor:
             encoder, decoder = self.encoders[model_index], self.decoders[model_index]
@@ -52,19 +63,22 @@ class FunnelForPreTraining(pl.LightningModule):
 
         # Train discriminator
         else:
-            generator_output = _encoder_decoder_forward(batch, 0)
+            masked_text, labels = batch['text'], batch['labels']
+
+            generator_output = _encoder_decoder_forward(masked_text, 0)
             discriminator_output = _encoder_decoder_forward(generator_output, 1)
 
+            loss = F.binary_cross_entropy_with_logits(discriminator_output, labels)
 
     def configure_optimizers(self):
         # See Funnel Transformer paper, page 15
-        hyperparams = dict(lr=1e-4, weight_decay=0.01, eps=1e-6)
+        hparams = transmute(self.hparams, 'weight_decay', lr='learning_rate', eps='adam_eps')
         discriminator_params = chain(self.discriminator.parameters(), self.discriminator_decoder.parameters())
-        discriminator_opt = torch.optim.AdamW(**hyperparams, params=discriminator_params)
+        discriminator_opt = torch.optim.AdamW(**hparams, params=discriminator_params)
 
         if self.train_generator:
             generator_params = chain(self.generator.parameters(), self.generator_decoder.parameters())
-            generator_opt = torch.optim.AdamW(**hyperparams, params=generator_params)
+            generator_opt = torch.optim.AdamW(**hparams, params=generator_params)
             return [generator_opt, discriminator_opt], []
         else:
             return discriminator_opt
@@ -81,26 +95,26 @@ class FunnelForPreTraining(pl.LightningModule):
 
                 # 'feedforward.pffn.0.bias' -> 'feedforward.layer_1.bias'
                 # 'feedforward.layer_norm.weight' -> 'feedforward.layer_norm.gamma'
-                key_string = replace_all(key_string, [
-                    ('layer_norm.weight', 'layer_norm.gamma'),
-                    ('layer_norm.bias', 'layer_norm.beta'),
-                    ('pffn.0', 'layer_1'),
-                    ('pffn.3', 'layer_2'),
-                    ('r_kernel', 'r.kernel'),  # r_kernel is a parameter of a separate Dense layer in TF
-                    ('weight', 'kernel')
-                ])
+                key_string = replace_all(key_string, {
+                    'layer_norm.weight': 'layer_norm.gamma',
+                    'layer_norm.bias': 'layer_norm.beta',
+                    'pffn.0': 'layer_1',
+                    'pffn.3': 'layer_2',
+                    'r_kernel': 'r.kernel',  # r_kernel is a parameter of a separate Dense layer in TF
+                    'weight': 'kernel'
+                })
 
                 keys = key_string.split('.')
                 keys.insert(0, "layer_" + str(abs_index))
 
-                keys[1] = replace_all(keys[1], [  # 'layer_17.feedforward.layer_1.bias' -> 'layer_17.ff.layer_1.bias'
-                    ('attention', 'rel_attn'),
-                    ('feedforward', 'ff')
-                ])
-                keys[2] = replace_all(keys[2], [  # 'layer_17.rel_attn.v_head.bias' -> 'layer_17.rel_attn.v.bias'
-                    ('_head', ''),
-                    ('post_proj', 'o')
-                ])
+                keys[1] = replace_all(keys[1], {  # 'layer_17.feedforward.layer_1.bias' -> 'layer_17.ff.layer_1.bias'
+                    'attention': 'rel_attn',
+                    'feedforward': 'ff'
+                })
+                keys[2] = replace_all(keys[2], {  # 'layer_17.rel_attn.v_head.bias' -> 'layer_17.rel_attn.v.bias'
+                    '_head': '',
+                    'post_proj': 'o'
+                })
 
                 # 'layer_17.rel_attn.v.bias' -> 'model/encoder/layer_17/rel_attn/v/bias'
                 tf_name = prefix + '/'.join(keys)

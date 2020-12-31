@@ -3,11 +3,11 @@ from __future__ import annotations
 from .AttentionState import AttentionState
 from ..Utilities import *
 from copy import deepcopy
-from .ops import LayerNorm
-from .ops import EmbeddingLookup
-from .ops import RelativePositionalAttention
-from .ops import PositionwiseFFN
-from .ops import Dense
+from .RelativePositionalAttention import LayerNorm
+from .RelativePositionalAttention import EmbeddingLookup
+from .RelativePositionalAttention import RelativePositionalAttention
+from .RelativePositionalAttention import PositionwiseFFN
+from .RelativePositionalAttention import Dense
 from ..RemoteModels import load_remote_model
 from pytorch_lightning.utilities import AttributeDict
 import logging
@@ -16,7 +16,7 @@ import torch.nn as nn
 
 class FunnelTransformer(nn.Module):
     default_hparams = dict(
-        # **Default values taken from pretrained config files & flags- do not change**
+        # **Default values taken from pretrained config files & flags**
         vocab_size=30522,
         attention_dropout=0.1,
         dropout=0.1,
@@ -29,9 +29,7 @@ class FunnelTransformer(nn.Module):
         seg_id_cls=2,  # Segment ID of the [CLS] token
         pad_id=None,
         num_classes=0,
-        use_classification_head=False,
-                                
-        # Fine to change these
+
         attention_type='rel_shift',
         rezero_blocks=(),  # Blocks for which to use ReZero
         max_position_embeddings=512,
@@ -42,10 +40,9 @@ class FunnelTransformer(nn.Module):
         return_block_outputs=False,
         use_performer_attention=False,
         upsampling=False,  # True for the "reverse" funnel transformer; e.g. a VAE decoder
-    
-        # 'decoder' in the Funnel-Transformer sense, not the VAE decoder sense. Set to True by FunnelForPreTraining
-        # and used by AttentionState.
-        has_decoder_block=False
+
+        has_decoder_block=False,        # Set to True by FunnelForPreTraining and used by AttentionState.
+        use_mlm_head=False
     )
     
     def __init__(self, **kwargs):
@@ -66,7 +63,7 @@ class FunnelTransformer(nn.Module):
 
         if not hparams.upsampling:
             self.input_layer = nn.Sequential(
-                EmbeddingLookup(hparams.vocab_size, hparams.d_model),
+                nn.Embedding(hparams.vocab_size, hparams.d_model),
                 LayerNorm(hparams.d_model),
                 nn.Dropout(hparams.dropout))
         else:
@@ -214,23 +211,30 @@ class FunnelTransformer(nn.Module):
 
         # Don't forget about the embeddings
         self.input_layer.load_state_dict({
-            '0.lookup_table': state_dict['input_layer.0.lookup_table'],
+            '0.weight': state_dict['input_layer.0.lookup_table'],
             '1.weight': state_dict['input_layer.1.weight'],
             '1.bias': state_dict['input_layer.1.bias']
         }, strict=True)
 
         for var_name, param, absolute_index in self.enumerate_parameters_by_layer():
             keys = var_name.split('.')
-            keys[0] = replace_all(keys[0], [  # attention.v_head.bias -> attn_layers.v_head.bias
-                ('attention', 'attn_layers'),
-                ('feedforward', 'pffn_layers')
-            ])
+            keys[0] = replace_all(keys[0], {  # attention.v_head.bias -> attn_layers.v_head.bias
+                'attention': 'attn_layers',
+                'feedforward': 'pffn_layers'
+            })
 
             keys.insert(1, str(absolute_index))  # attn_layers.v_head.bias -> attn_layers.2.v_head.bias
             old_name = '.'.join(keys)
 
             try:
-                param.data = state_dict[old_name]
+                old_weights: Tensor = state_dict[old_name]
+
+                # The old Funnel-Transformer had custom Dense layers that reshaped the input and therefore had
+                # 3D kernel tensors- in this project we're more conventional so we're using standard nn.Linear modules
+                if old_weights.shape != param.data.shape:
+                    old_weights = old_weights.reshape(*param.data.shape)
+
+                param.data = old_weights
             except KeyError:
                 noninitialized_keys.append({'new_name': var_name, 'old_name': old_name})
 
