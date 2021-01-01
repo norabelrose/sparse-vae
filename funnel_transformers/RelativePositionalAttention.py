@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
-import torch.nn.init as init
 from einops import rearrange
 from torch import nn
 from .AttentionState import *
-from ..performers import PerformerAttention, PerformerAttentionConfig
+from performers import PerformerAttentionConfig, PerformerAttention
 
 BIG_CONST = 1e6
 

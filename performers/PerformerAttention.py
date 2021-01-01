@@ -7,7 +7,7 @@ import random
 import torch
 import torch.nn.functional as F
 
-from PerformerAttentionConfig import *
+from .PerformerAttentionConfig import *
 
 KERNEL_CALLABLES = {
     'cosh': lambda x, h: torch.cat((torch.exp(h + x), torch.exp(h - x)), dim=-1),

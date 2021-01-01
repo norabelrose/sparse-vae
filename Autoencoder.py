@@ -8,7 +8,7 @@ import torch
 
 class Autoencoder(pl.LightningModule):
     default_hparams = dict(
-        block_sizes=(3, 3, 3, 2, 2),            # Number of layers in each encoder block; reversed for the decoder
+        block_sizes=(4, 4, 4, 2, 2),            # Number of layers in each encoder block; reversed for the decoder
         scaling_factors=(2, 2, 4, 4),           # How much the hidden state is downsampled between each encoder block
         d_model=768,                            # Embedding dimension
         latent_depth=16,                        # Depth of the latent tensors (dimensionality per token)
@@ -40,7 +40,7 @@ class Autoencoder(pl.LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
 
-        # Stores the kwargs in self.hparams and ensures the hyperparameters are saved to disk during training.
+        # save_hyperparameters() stores the kwargs in self.hparams and ensures they are saved to disk during training.
         kwargs = {**self.default_hparams, **kwargs}
         self.save_hyperparameters(kwargs)
 

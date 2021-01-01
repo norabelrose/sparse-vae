@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 from .AttentionState import AttentionState
-from ..Utilities import *
 from copy import deepcopy
 from .RelativePositionalAttention import LayerNorm
-from .RelativePositionalAttention import EmbeddingLookup
 from .RelativePositionalAttention import RelativePositionalAttention
 from .RelativePositionalAttention import PositionwiseFFN
-from .RelativePositionalAttention import Dense
-from ..RemoteModels import load_remote_model
+from .RemoteModels import *
 from pytorch_lightning.utilities import AttributeDict
+from torch import Tensor
+from typing import *
 import logging
+import torch
 import torch.nn as nn
 
 
 class FunnelTransformer(nn.Module):
     default_hparams = dict(
+        block_sizes=(4, 4, 4),
+        d_model=768,
+        num_heads=12,
+
         # **Default values taken from pretrained config files & flags**
         vocab_size=30522,
         attention_dropout=0.1,
@@ -29,6 +33,7 @@ class FunnelTransformer(nn.Module):
         seg_id_cls=2,  # Segment ID of the [CLS] token
         pad_id=None,
         num_classes=0,
+        use_classification_head=False,
 
         attention_type='rel_shift',
         rezero_blocks=(),  # Blocks for which to use ReZero
@@ -77,10 +82,10 @@ class FunnelTransformer(nn.Module):
 
         if hparams.use_classification_head:
             self.cls_head = nn.Sequential(
-                Dense(hparams.d_model, hparams.d_model),
+                nn.Linear(hparams.d_model, hparams.d_model),
                 nn.Tanh(),
                 nn.Dropout(hparams.dropout),
-                Dense(hparams.d_model, self.hparams.num_classes))
+                nn.Linear(hparams.d_model, self.hparams.num_classes))
             self.cls_loss = nn.CrossEntropyLoss()
 
     # Returns a copy of the transformer whose upsampling parameter is flipped
@@ -178,7 +183,7 @@ class FunnelTransformer(nn.Module):
             for var_name, param in layer.named_parameters():
                 yield var_name, param, index
 
-    def load_pretrained_weights(self):
+    def path_to_pretrained_checkpoint(self) -> Path:
         block_size_to_name = {
             (4, 4, 4): "B4-4-4H768-ELEC",
             (6, 6, 6): "B6-6-6H768-ELEC",
@@ -201,8 +206,11 @@ class FunnelTransformer(nn.Module):
             f"Pretrained model {block_size_to_name[beginning_blocks]} requires d_model == {pretrained_d_model}"
 
         name = block_size_to_name[beginning_blocks]
-        url = f"http://storage.googleapis.com/funnel-transformer/funnel_ckpts_all/{name}.tar.gz"
-        model_path = load_remote_model(url)
+        url = f"http://storage.googleapis.com/funnel-transformer/funnel_ckpts_all/{name}-PT.tar.gz"
+        return load_remote_model(url)
+
+    def load_pretrained_weights(self):
+        model_path = self.path_to_pretrained_checkpoint()
 
         # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the training
         # files will have the form 'attn_layers.2.v_head.bias'. We need to convert here.

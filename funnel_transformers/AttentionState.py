@@ -1,12 +1,12 @@
-from __future__ import annotations
-
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import *
 from numpy import prod
 from pytorch_lightning.utilities import AttributeDict
+from torch import Tensor
+from typing import *
+import torch
 import torch.nn.functional as F
-from ..Utilities import *
 
 # A tensor if attention_type == "rel_shift", but a list of tensors if attention_type == "factorized"
 PositionalEncoding = NewType('PositionalEncoding', Union[Tensor, List[Tensor]])
@@ -227,9 +227,26 @@ class AttentionState:
         return x
 
     # Downsample by stride slicing the tensor along the given axis.
+    T = TypeVar('T', bound=Union[List[Tensor], Tensor])
+
     def _stride_downsample(self, x: T, axis: int, scaling_factor: int) -> Optional[T]:
         if x is None:
             return None
+
+        def slice_tensors(x, axis: int, start: int = None, stop: int = None, step: int = None):
+            rank = x.dim() if torch.is_tensor(x) else x[0].dim()
+            assert axis < rank
+            axis = axis % rank  # for negative indices
+
+            indices = []
+            for i in range(rank):
+                if i == axis:
+                    indices.append(slice(start, stop, step))
+                    break
+                else:
+                    indices.append(slice(None))  # Include all elements along this axis; equivalent to : in x[:, 5]
+
+            return x[indices] if torch.is_tensor(x) else [tensor[indices] for tensor in x]
 
         config = self.hparams
         stop = -scaling_factor if config.separate_cls and config.truncate_seq else None

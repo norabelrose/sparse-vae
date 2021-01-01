@@ -9,11 +9,9 @@ import torch.nn.functional as F
 # Funnel Transformer with a decoder block at the end for ELECTRA pretraining
 class FunnelForPreTraining(pl.LightningModule):
     default_hparams = dict(
-        discriminator_hparams=FunnelTransformer.default_hparams,
-        generator_hparams=FunnelTransformer.default_hparams,
+        funnel_hparams=FunnelTransformer.default_hparams,   # Discriminator and generator hparams copied from this
         train_generator=False,
         pretrained_path="",
-        strict=False,
 
         # See Funnel Transformer paper, page 15
         learning_rate=1e-4,
@@ -27,25 +25,22 @@ class FunnelForPreTraining(pl.LightningModule):
         kwargs = {**self.default_hparams, **kwargs}
         self.save_hyperparameters(kwargs)
 
-        discriminator_hparams.has_decoder_block = True
-        discriminator_hparams.return_block_outputs = [0]  # We just need the first hidden state for the res connection
-
-        generator_hparams = generator_hparams or deepcopy(discriminator_hparams)
-        generator_hparams.d_model /= 4
-        generator_hparams.num_heads /= 4
+        discriminator_hparams = mutate(self.hparams.funnel_hparams, has_decoder_block=True, return_block_outputs=[0])
+        generator_hparams = deepcopy(discriminator_hparams)
+        generator_hparams['d_model'] /= 4
+        generator_hparams['num_heads'] /= 4
 
         # Generator at index 0, discriminator at index 1
-        self.encoders = [FunnelTransformer(generator_hparams), FunnelTransformer(discriminator_hparams)]
+        self.encoders = [FunnelTransformer(**generator_hparams), FunnelTransformer(**discriminator_hparams)]
         self.decoders = [FunnelBlock(generator_hparams, 3), FunnelBlock(discriminator_hparams, 3)]
 
         # Freeze the generator weights if indicated
-        self.train_generator = train_generator
-        if not train_generator:
+        if not self.hparams.train_generator:
             for param in chain(self.encoders[0].parameters(), self.decoders[0].parameters()):
                 param.requires_grad = False
 
-        if pretrained_path:
-            self._load_weights_from_tf_ckpt(pretrained_path, strict)
+        if self.hparams.pretrained_path:
+            self._load_weights_from_tf_ckpt(self.hparams.pretrained_path, True)
 
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, optimizer_index: int) -> Tensor:
@@ -72,13 +67,13 @@ class FunnelForPreTraining(pl.LightningModule):
 
     def configure_optimizers(self):
         # See Funnel Transformer paper, page 15
-        hparams = transmute(self.hparams, 'weight_decay', lr='learning_rate', eps='adam_eps')
+        adam_hparams = transmute(self.hparams, 'weight_decay', lr='learning_rate', eps='adam_eps')
         discriminator_params = chain(self.discriminator.parameters(), self.discriminator_decoder.parameters())
-        discriminator_opt = torch.optim.AdamW(**hparams, params=discriminator_params)
+        discriminator_opt = torch.optim.AdamW(**adam_hparams, params=discriminator_params)
 
         if self.train_generator:
             generator_params = chain(self.generator.parameters(), self.generator_decoder.parameters())
-            generator_opt = torch.optim.AdamW(**hparams, params=generator_params)
+            generator_opt = torch.optim.AdamW(**adam_hparams, params=generator_params)
             return [generator_opt, discriminator_opt], []
         else:
             return discriminator_opt

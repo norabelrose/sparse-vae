@@ -2,12 +2,12 @@ import re
 import os
 import torch
 import unittest
+from contextlib import nullcontext
 from tqdm.auto import tqdm
-from ..funnel_transformers.FunnelTransformer import FunnelConfig, FunnelTransformer
-from ..PretrainedModelManager import PretrainedModelManager
+from funnel_transformers.FunnelTransformer import FunnelTransformer
 
 # This should be set to wherever the 'pytorch' directory of original Funnel-Transformer package is on your system
-PATH_TO_FUNNEL_TRANSFORMER_DIR = '~/Funnel-Transformer/pytorch/'
+PATH_TO_FUNNEL_TRANSFORMER_DIR = '~/Code/Python/Funnel-Transformer/pytorch/'
 BACKWARD_COMPAT_ERROR_TOLERANCE = 5e-4
 BACKWARD_COMPAT_NUM_TRIALS = 25
 
@@ -24,14 +24,16 @@ class TestFunnelTransformer(unittest.TestCase):
                   f" the PATH_TO_FUNNEL_TRANSFORMER_DIR constant in {__file__}. Skipping test for now.")
             return
 
-        # Load the RelativePositionalAttention.py file- it doesn't import any other Funnel-Transformer file and modeling.py needs it
-        ops_file = os.path.join(directory, 'RelativePositionalAttention.py')
+        # Load the ops.py file- it doesn't import any other Funnel-Transformer file and
+        # modeling.py needs it
+        ops_file = os.path.join(directory, 'ops.py')
         with open(ops_file, 'r') as f:
             exec(f.read(), globals())
 
         # Now load the modeling.py file, but do surgery on it to remove the 'from ops import...' statements.
         # These cause runtime errors because 'ops' doesn't exist as a module from our perspective. They're also
-        # unnecessary because we just directly loaded all the classes and functions from RelativePositionalAttention.py into global scope.
+        # unnecessary because we just directly loaded all the classes and functions from RelativePositionalAttention.py
+        # into global scope.
         modeling_file = os.path.join(directory, 'modeling.py')
         with open(modeling_file, 'r') as f:
             file_text = f.read()
@@ -40,15 +42,16 @@ class TestFunnelTransformer(unittest.TestCase):
             file_text = re.sub(r'from ops import [a-zA-Z]+\n', '', file_text)
             exec(file_text, globals())  # Load everything
         
-        with torch.cuda.device(0):
-            new_model = PretrainedModelManager.get_model((4, 4, 4))
+        with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext():
+            new_model = FunnelTransformer()
+            new_model.load_pretrained_weights()
             new_model.eval()
             
             new_config = new_model.config
             old_config_dict = new_model.get_backward_compatible_dict()
             old_model_args = new_model.get_backward_compatible_args()
     
-            checkpoint_path = PretrainedModelManager.path_to_cached_model_for_block_layout((4, 4, 4))
+            checkpoint_path = new_model.path_to_pretrained_checkpoint()
             old_config = eval('ModelConfig(**old_config_dict)')
             old_model: torch.nn.Module = eval('FunnelTFM(old_config, old_model_args, cls_target=False)')
             old_model.eval()  # Turn off dropout
