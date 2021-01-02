@@ -4,7 +4,7 @@ import numpy as np
 from einops import rearrange
 from torch import nn
 from .AttentionState import *
-from performers import PerformerAttentionConfig, PerformerAttention
+from ..performers import PerformerAttentionConfig, PerformerAttention
 
 BIG_CONST = 1e6
 
@@ -84,7 +84,7 @@ class RelativePositionalAttention(nn.Module):
         # These parameters are applied *headwise*, hence they have a extra head dimension
         self.r_w_bias = nn.Parameter(torch.zeros(n_head, d_head))
         self.r_r_bias = nn.Parameter(torch.zeros(n_head, d_head))
-        self.r_kernel = nn.Parameter(torch.zeros(n_head, d_head, d_model))
+        self.r_kernel = nn.Parameter(torch.zeros(n_head, d_model, d_head))
         self.r_s_bias = nn.Parameter(torch.zeros(n_head, d_head))
         self.seg_embed = nn.Parameter(torch.zeros(2, n_head, d_head))
 
@@ -147,9 +147,10 @@ class RelativePositionalAttention(nn.Module):
 
         else:
             # content based attention score
-            content_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * self.normalizer
+            r_w = rearrange(self.r_w_bias, 'h d -> () h () d')
+            content_score = (q + r_w) @ k.transpose(-2, -1) * self.normalizer
 
-            pos_bias = self._attn_pos_term(q, k.size(1), attn_state)
+            pos_bias = self._attn_pos_term(q, k.size(-2), attn_state)
             seg_bias = self._attn_seg_term(attn_state.segment_mask, q, attn_state)
 
             # merge attention scores
@@ -169,13 +170,14 @@ class RelativePositionalAttention(nn.Module):
             attn_dist = attn_dist.type(dtype)
             attn_dist = self.att_drop(attn_dist)
             output = attn_dist @ v
+        
+        # Coalesce attention heads
+        output = rearrange(output, "b h l d -> b l (h d)")
+        q = rearrange(q, "b h l d -> b l (h d)")
 
         # attention output
         attn_out = self.post_proj(output)
         attn_out = self.hid_drop(attn_out)
-
-        # Coalesce attention heads
-        q, k, v = (rearrange(x, "b h l d -> b l (h d)") for x in (q, k, v))
 
         output = self.layer_norm(q + attn_out)  # Residual connection
         return output
@@ -227,7 +229,13 @@ class RelativePositionalAttention(nn.Module):
             shift = 1 + attn_state.pooled_q_unpooled_k_flag
 
             # Funnel Transformer paper, page 13
-            bd = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
+            r_r = rearrange(self.r_r_bias, 'h d -> () h () d')  # Broadcast across tokens and the batch dim
+            # r_k = rearrange(self.r_kernel, 'h d e -> () h d e')
+            
+            r_head = torch.einsum("td,ndh->tnh", pos_enc, self.r_kernel)
+            bd = torch.einsum("bnfh,tnh->bnft", q, r_head)
+            
+            #bd = (q + r_r) @ (pos_enc @ r_k).transpose(-2, -1) * self.normalizer
             bd = self._rel_shift(bd, -2, k_len, shift)
         else:
             raise NotImplementedError

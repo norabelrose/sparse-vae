@@ -1,6 +1,5 @@
 import os
 import requests
-import sys
 import tarfile
 
 from pathlib import Path
@@ -18,7 +17,8 @@ def load_remote_model(url: str) -> Path:
 
     # Check if we've already downloaded it
     model_name = os.path.basename(url)
-    local_path = models_dir / model_name
+    local_path = models_dir / model_name.replace(".tar.gz", "")
+    
     if local_path.exists():
         return local_path
 
@@ -36,27 +36,27 @@ def load_remote_model(url: str) -> Path:
     pbar = tqdm(desc="Downloading model", total=content_length, unit='iB', unit_scale=True)
 
     try:
-        with local_path.open(mode='wb') as f:
+        archive_path = models_dir / model_name
+        with archive_path.open(mode='wb') as f:
             for chunk in iterator:
                 f.write(chunk)
                 pbar.update(len(chunk))
+            pbar.close()
 
         print("Done. Now unzipping...")
-        with tarfile.open(local_path, 'r:gz') as f:
+        with tarfile.open(archive_path, 'r:gz') as f:
             f.extractall(path=models_dir)
     except KeyboardInterrupt:
         raise
     finally:
-        os.remove(local_path)
-        pbar.close()
+        os.remove(archive_path)
 
-    # The name of the tarfile but without the .tar.gz
-    return models_dir / os.path.splitext(model_name)[0]
+    return local_path
 
 
 # Performs a series of replace operations on a string defined by a dictionary.
 def replace_all(string: str, mappings: Dict[str, str]) -> str:
-    for old, new in mappings:
+    for old, new in mappings.items():
         string = string.replace(old, new)
 
     return string

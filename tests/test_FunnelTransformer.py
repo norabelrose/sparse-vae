@@ -4,10 +4,10 @@ import torch
 import unittest
 from contextlib import nullcontext
 from tqdm.auto import tqdm
-from funnel_transformers.FunnelTransformer import FunnelTransformer
+from ..funnel_transformers.FunnelTransformer import FunnelTransformer
 
 # This should be set to wherever the 'pytorch' directory of original Funnel-Transformer package is on your system
-PATH_TO_FUNNEL_TRANSFORMER_DIR = '~/Code/Python/Funnel-Transformer/pytorch/'
+TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS = os.getenv("TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS", None)
 BACKWARD_COMPAT_ERROR_TOLERANCE = 5e-4
 BACKWARD_COMPAT_NUM_TRIALS = 25
 
@@ -15,13 +15,13 @@ BACKWARD_COMPAT_NUM_TRIALS = 25
 class TestFunnelTransformer(unittest.TestCase):
     # Test whether FunnelTransformer produces the same results as the original Funnel-Transformer
     # implementation (within a small error tolerance) if initialized from a pretrained checkpoint.
-    @unittest.skipIf(not PATH_TO_FUNNEL_TRANSFORMER_DIR, "")
+    @unittest.skipIf(not TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS, "Path to Funnel-Transformers env variable not set")
     def test_backward_compatibility(self):
-        directory = os.path.expanduser(PATH_TO_FUNNEL_TRANSFORMER_DIR)
+        directory = os.path.expanduser(TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS)
         if not os.path.isdir(directory):
             print(f"test_backward_compatibility: Can't find the Funnel-Transformer package on your system. Make sure"
-                  f" you've downloaded it (see https://github.com/laiguokun/Funnel-Transformer) and then update "
-                  f" the PATH_TO_FUNNEL_TRANSFORMER_DIR constant in {__file__}. Skipping test for now.")
+                  f" you've downloaded it (see https://github.com/laiguokun/Funnel-Transformer) and then set the "
+                  f" TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS environment variable appropriately. Skipping test for now.")
             return
 
         # Load the ops.py file- it doesn't import any other Funnel-Transformer file and
@@ -47,11 +47,11 @@ class TestFunnelTransformer(unittest.TestCase):
             new_model.load_pretrained_weights()
             new_model.eval()
             
-            new_config = new_model.config
+            new_config = new_model.hparams
             old_config_dict = new_model.get_backward_compatible_dict()
             old_model_args = new_model.get_backward_compatible_args()
     
-            checkpoint_path = new_model.path_to_pretrained_checkpoint()
+            checkpoint_path = new_model.path_to_pretrained_checkpoint() / "model.pt"
             old_config = eval('ModelConfig(**old_config_dict)')
             old_model: torch.nn.Module = eval('FunnelTFM(old_config, old_model_args, cls_target=False)')
             old_model.eval()  # Turn off dropout

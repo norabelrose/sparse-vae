@@ -6,6 +6,7 @@ from .RelativePositionalAttention import LayerNorm
 from .RelativePositionalAttention import RelativePositionalAttention
 from .RelativePositionalAttention import PositionwiseFFN
 from .RemoteModels import *
+from ..Utilities import *
 from pytorch_lightning.utilities import AttributeDict
 from torch import Tensor
 from typing import *
@@ -126,7 +127,8 @@ class FunnelTransformer(nn.Module):
 
             # Cache intermediate hidden states if indicated
             return_blocks = config.return_block_outputs
-            if (type(return_blocks) == bool and return_blocks) or i in return_blocks:
+            return_blocks = return_blocks if type(return_blocks) == bool else i in return_blocks
+            if return_blocks:
                 hidden_states.append(kv)
 
         # Non-autoregressively generate a softmax distribution over words
@@ -214,7 +216,7 @@ class FunnelTransformer(nn.Module):
 
         # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the training
         # files will have the form 'attn_layers.2.v_head.bias'. We need to convert here.
-        state_dict = torch.load(str(model_path))
+        state_dict = torch.load(str(model_path / "model.pt"))
         noninitialized_keys = []
 
         # Don't forget about the embeddings
@@ -252,34 +254,26 @@ class FunnelTransformer(nn.Module):
 
     # For the "args" parameter in the old FunnelTFM.__init__()
     def get_backward_compatible_args(self) -> AttributeDict:
-        return AttributeDict(  # can use DynamicDict.my_key syntax
-            pad_id=self.pad_id,
-            num_class=self.num_classes,
-            seg_id_cls=self.seg_id_cls,
-            truncate_seq=self.truncate_seq,
-            attn_type=self.attention_type
-        )
-
+        return transmute(self.hparams,
+                         'pad_id', 'seg_id_cls', 'truncate_seq',
+                         attn_type='attention_type', num_class='num_classes')
+    
     # Get a dictionary compatible with the old ModelConfig class from Funnel-Transformers
     def get_backward_compatible_dict(self) -> Dict:
-        return {
-            "vocab_size": self.vocab_size,
-            "d_embed": self.d_model,
-            "d_model": self.d_model,
-            "n_head": self.num_heads,
-            "d_head": self.d_model // self.num_heads,
-            "d_inner": self.d_model * 4,
-            "dropout": self.dropout,
-            "dropatt": self.attention_dropout,
-            "dropact": self.ffn_dropout,
-            "block_size": '_'.join([str(x) for x in self.block_sizes]),
-            "pooling_type": self.pooling_type,
-
+        return transmute(
+            self.hparams,
+            'vocab_size', 'd_model', 'dropout', 'pooling_type', 'separate_cls', 'pool_q_only',
+            d_embed='d_model',
+            n_head='num_heads',
+            d_head='d_model // num_heads',
+            d_inner='d_model * 4',
+            dropatt='attention_dropout',
+            dropact='ffn_dropout',
+            block_size="'_'.join([str(x) for x in block_sizes])",
+            
             # We lose info here since Funnel-Transformers doesn't support different scaling factors for each block
-            "pooling_size": self.scaling_factors[0],
-            "separate_cls": self.separate_cls,
-            "pool_q_only": self.pool_q_only
-        }
+            pooling_size='scaling_factors[0]'
+        )
 
 
 class FunnelLayer(nn.Module):

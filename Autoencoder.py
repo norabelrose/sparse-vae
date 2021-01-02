@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 from torch import nn
-from Utilities import *
+from .Utilities import *
 from .funnel_transformers.FunnelTransformer import FunnelTransformer
 import pytorch_lightning as pl
 import torch
@@ -44,12 +44,13 @@ class Autoencoder(pl.LightningModule):
         kwargs = {**self.default_hparams, **kwargs}
         self.save_hyperparameters(kwargs)
 
-        funnel_hparams = dict(
-            attention_type="factorized" if self.use_performer_attention else "rel_shift",
-            block_sizes=self.block_sizes[0:3],
-            max_position_embeddings=self.max_sequence_length,
-            return_block_outputs=True,
-            use_performer_attention=self.use_performer_attention
+        funnel_hparams = transmute(
+            self.hparams,
+            'use_performer_attention',
+            attention_type="'factorized' if use_performer_attention else 'rel_shift'",
+            block_sizes='block_sizes[0:3]',
+            max_position_embeddings='max_sequence_length',
+            return_block_outputs=True
         )
         self.encoder_funnel = FunnelTransformer(**funnel_hparams)
         self.decoder_funnel = FunnelTransformer(**funnel_hparams)
