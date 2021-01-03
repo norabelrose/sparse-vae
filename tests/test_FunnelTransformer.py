@@ -8,8 +8,6 @@ from ..funnel_transformers.FunnelTransformer import FunnelTransformer
 
 # This should be set to wherever the 'pytorch' directory of original Funnel-Transformer package is on your system
 TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS = os.getenv("TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS", None)
-BACKWARD_COMPAT_ERROR_TOLERANCE = 5e-4
-BACKWARD_COMPAT_NUM_TRIALS = 25
 
 
 class TestFunnelTransformer(unittest.TestCase):
@@ -42,36 +40,34 @@ class TestFunnelTransformer(unittest.TestCase):
             file_text = re.sub(r'from ops import [a-zA-Z]+\n', '', file_text)
             exec(file_text, globals())  # Load everything
         
-        with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext():
-            new_model = FunnelTransformer()
-            new_model.load_pretrained_weights()
-            new_model.eval()
-            
-            new_config = new_model.hparams
-            old_config_dict = new_model.get_backward_compatible_dict()
-            old_model_args = new_model.get_backward_compatible_args()
-    
-            checkpoint_path = new_model.path_to_pretrained_checkpoint() / "model.pt"
-            old_config = eval('ModelConfig(**old_config_dict)')
-            old_model: torch.nn.Module = eval('FunnelTFM(old_config, old_model_args, cls_target=False)')
-            old_model.eval()  # Turn off dropout
-    
-            with open(checkpoint_path, 'rb') as f:
-                old_model.load_state_dict(torch.load(f))
-    
-            print(f'Running {BACKWARD_COMPAT_NUM_TRIALS} forward passes of both models...')
-    
-            total_mse = 0.0
-            for i in tqdm(range(BACKWARD_COMPAT_NUM_TRIALS), unit='pass'):
+        with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext(), torch.no_grad():
+            for attn_type in ("factorized", "rel_shift"):
+                new_model = FunnelTransformer(return_block_outputs=True, attention_type=attn_type)
+                new_model.load_pretrained_weights()
+                new_model.eval()
+                
+                new_config = new_model.hparams
+                old_config_dict = new_model.get_backward_compatible_dict()
+                old_model_args = new_model.get_backward_compatible_args()
+        
+                checkpoint_path = new_model.path_to_pretrained_checkpoint() / "model.pt"
+                old_config = eval('ModelConfig(**old_config_dict)')
+                old_model: torch.nn.Module = eval('FunnelTFM(old_config, old_model_args, cls_target=False)')
+                old_model.eval()  # Turn off dropout
+        
+                with open(checkpoint_path, 'rb') as f:
+                    old_model.load_state_dict(torch.load(f))
+        
+                print(f'Running forward pass of both models...')
+        
                 # Tokens below 999 are either unused or are special tokens like [CLS] and [MASK]
                 inputs = torch.randint(low=999, high=new_config.vocab_size, size=(1, 512))
                 
-                with torch.no_grad():
-                    output_old = old_model(inputs)[0][-1]
-                    output_new = new_model(inputs)[0]
-                    total_mse += torch.mean((output_old - output_new) ** 2)
-
-        loss = total_mse / BACKWARD_COMPAT_NUM_TRIALS
-        print('MSE: ', loss.item())
+                output_old = old_model(inputs)
+                output_new = new_model(inputs)
+                mean_err = torch.mean(abs(output_old[0][-1] - output_new[-1]))
         
-        self.assertTrue(loss.item() < BACKWARD_COMPAT_ERROR_TOLERANCE)
+                print('Mean absolute error: ', mean_err.item())
+                print('Old output: ', output_old[0][4::4])
+                print('New output: ', output_new)
+                self.assertTrue(mean_err < 1e-4)

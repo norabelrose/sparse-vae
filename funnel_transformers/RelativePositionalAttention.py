@@ -34,6 +34,35 @@ except ImportError as e:
             return output
 
 
+class EinsumLayer(nn.Module):
+    def __init__(self, einsum_formula: str, input_shape: List[int], output_shape: List[int], bias: bool=True):
+        super().__init__()
+        
+        self.weight = nn.Parameter(torch.empty(input_shape + output_shape))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(output_shape))
+        else:
+            self.register_parameter("bias", None)
+        
+        self.einsum_formula = einsum_formula
+        
+        # Initialize weights
+        fan_in = np.prod(input_shape)
+        fan_out = np.prod(output_shape)
+        std = np.sqrt(1.0 / float(fan_in + fan_out))
+
+        nn.init.normal_(self.weight, std=std)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, 0.)
+    
+    def forward(self, inputs):
+        output = torch.einsum(self.einsum_formula, inputs, self.weight)
+        if self.bias is not None:
+            output = output + self.bias
+        
+        return output
+
+
 # All these custom module classes are probably unnecessary, but we keep them them here in order
 # to maintain full backward compatibility with the original pretrained Funnel Transformer checkpoints.
 class GELU(nn.Module):
@@ -47,10 +76,10 @@ class PositionwiseFFN(nn.Module):
     def __init__(self, d_model, d_inner, dropout, dropact):
         super(PositionwiseFFN, self).__init__()
         self.pffn = nn.Sequential(
-            nn.Linear(d_model, d_inner),
+            EinsumLayer("...a,ab->...b", [d_model], [d_inner]),
             GELU(),
             nn.Dropout(dropact),
-            nn.Linear(d_inner, d_model),
+            EinsumLayer("...b,ba->...a", [d_inner], [d_model]),
             nn.Dropout(dropout))
         self.layer_norm = LayerNorm(d_model)
 
@@ -77,18 +106,18 @@ class RelativePositionalAttention(nn.Module):
         self.hid_drop = nn.Dropout(self.dropout)
 
         # The asymmetry (Q proj has no bias, but K and V do) is for backward comp. with Funnel-Transformers checkpoints
-        self.q_head = nn.Linear(d_model, d_model, bias=False)
-        self.k_head = nn.Linear(d_model, d_model)
-        self.v_head = nn.Linear(d_model, d_model)
+        self.q_head = EinsumLayer("...d,dnh->...nh", [d_model], [n_head, d_head], bias=False)
+        self.k_head = EinsumLayer("...d,dnh->...nh", [d_model], [n_head, d_head])
+        self.v_head = EinsumLayer("...d,dnh->...nh", [d_model], [n_head, d_head])
 
         # These parameters are applied *headwise*, hence they have a extra head dimension
-        self.r_w_bias = nn.Parameter(torch.zeros(n_head, d_head))
-        self.r_r_bias = nn.Parameter(torch.zeros(n_head, d_head))
+        self.r_w_bias = nn.Parameter(torch.zeros(n_head, 1, d_head))
+        self.r_r_bias = nn.Parameter(torch.zeros(n_head, 1, d_head))
         self.r_kernel = nn.Parameter(torch.zeros(n_head, d_model, d_head))
         self.r_s_bias = nn.Parameter(torch.zeros(n_head, d_head))
         self.seg_embed = nn.Parameter(torch.zeros(2, n_head, d_head))
 
-        self.post_proj = nn.Linear(d_model, d_model)
+        self.post_proj = EinsumLayer("blnh,nhd->bld", [n_head, d_head], [d_model])
         self.layer_norm = LayerNorm(d_model)
         self.normalizer = 1. / np.sqrt(d_head)
         self.reset_parameters()
@@ -109,12 +138,12 @@ class RelativePositionalAttention(nn.Module):
         nn.init.uniform_(self.seg_embed, b=0.1)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState) -> Tensor:
+        input_q = q  # Save for residual connection
         q = self.q_head(q)
         k = self.k_head(k)
         v = self.v_head(v)
 
-        # Add attention head dimension
-        q, k, v = (rearrange(x, "b l (h d) -> b h l d", h=self.hparams.num_heads) for x in (q, k, v))
+        q, k, v = (rearrange(x, 'b l h d -> b h l d') for x in (q, k, v))
 
         if self.hparams.use_performer_attention:
             # "Funnel Transformers" page 13, formula 8 and page 14, final formula of section A.2
@@ -147,9 +176,8 @@ class RelativePositionalAttention(nn.Module):
 
         else:
             # content based attention score
-            r_w = rearrange(self.r_w_bias, 'h d -> () h () d')
-            content_score = (q + r_w) @ k.transpose(-2, -1) * self.normalizer
-
+            content_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * self.normalizer
+            
             pos_bias = self._attn_pos_term(q, k.size(-2), attn_state)
             seg_bias = self._attn_seg_term(attn_state.segment_mask, q, attn_state)
 
@@ -171,15 +199,13 @@ class RelativePositionalAttention(nn.Module):
             attn_dist = self.att_drop(attn_dist)
             output = attn_dist @ v
         
-        # Coalesce attention heads
-        output = rearrange(output, "b h l d -> b l (h d)")
-        q = rearrange(q, "b h l d -> b l (h d)")
+        output = rearrange(output, "b h l d -> b l h d")
 
         # attention output
         attn_out = self.post_proj(output)
         attn_out = self.hid_drop(attn_out)
 
-        output = self.layer_norm(q + attn_out)  # Residual connection
+        output = self.layer_norm(input_q + attn_out)  # Residual connection
         return output
 
     @staticmethod
@@ -226,22 +252,17 @@ class RelativePositionalAttention(nn.Module):
             bd = q_r_1 @ enc_k_1.transpose(-2, -1) + q_r_2 @ enc_k_2.transpose(-2, -1)
 
         elif self.attn_type == "rel_shift":
-            shift = 1 + attn_state.pooled_q_unpooled_k_flag
+            shift = 1 + attn_state.block_begin_flag
 
             # Funnel Transformer paper, page 13
-            r_r = rearrange(self.r_r_bias, 'h d -> () h () d')  # Broadcast across tokens and the batch dim
-            # r_k = rearrange(self.r_kernel, 'h d e -> () h d e')
-            
-            r_head = torch.einsum("td,ndh->tnh", pos_enc, self.r_kernel)
-            bd = torch.einsum("bnfh,tnh->bnft", q, r_head)
-            
-            #bd = (q + r_r) @ (pos_enc @ r_k).transpose(-2, -1) * self.normalizer
+            bd = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
             bd = self._rel_shift(bd, -2, k_len, shift)
         else:
             raise NotImplementedError
 
         if attn_state.not_cls_mask is not None:
             bd *= attn_state.not_cls_mask
+        
         return bd
 
     def _attn_seg_term(self, seg_mat, q_head, attn_state: AttentionState):

@@ -19,8 +19,8 @@ class AttentionState:
     input_mask: Optional[Tensor] = None       # 1 for positions we should ignore (like padding), 0 otherwise
     not_cls_mask: Optional[Tensor] = None     # 0 where position is the [CLS] token, 1 otherwise
 
-    # True inside a 'with attention_state.pooled_q_unpooled_k()' block
-    pooled_q_unpooled_k_flag: bool = field(init=False, default=False)
+    # True inside a 'with attention_state.begin_block()' block
+    block_begin_flag: bool = field(init=False, default=False)
 
     # When True, AttentionState will cache a list of all the mask tensors it computes for each block of the model.
     # These masks can then be reused, e.g. by a VAE decoder.
@@ -47,7 +47,7 @@ class AttentionState:
             self._generate_pos_encodings(self._last_seq_len, self._last_dtype, self._last_device)
 
         # The pooled Q, unpooled K encodings are at index 1
-        return self._pos_encodings[self._current_block][int(self.pooled_q_unpooled_k_flag)]
+        return self._pos_encodings[self._current_block][int(self.block_begin_flag)]
 
     # This method should be called before any AttentionState properties are queried in a forward pass
     def configure_for_input(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None):
@@ -96,21 +96,21 @@ class AttentionState:
     # We use with-statements to keep track of whether we need to yield tensors that are appropriate
     # for when q.shape[1] < k.shape[1]; that is, right after a downsampling operation.
     @contextmanager
-    def pooled_q_unpooled_k(self):  # with attention_state.pooled_q_unpooled_k(): ...
-        # We're entering a pooled_q_unpooled_k block
+    def begin_block(self):  # with attention_state.begin_block(): ...
+        # We're entering the first layer of a new funnel block
         if self._current_block > 0:
-            self.pooled_q_unpooled_k_flag = True
+            self.block_begin_flag = True
             scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
 
             # Downsample the Q portion of these masks
             self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
             self.segment_mask = self._stride_downsample(self.segment_mask, -2, scaling_factor)
-
+        
         yield   # Compute attention and stuff...
-
-        # We're exiting a pooled_q_unpooled_k block
+        
+        # We're exiting the first layer of the new block
         if self._current_block > 0:
-            self.pooled_q_unpooled_k_flag = False
+            self.block_begin_flag = False
             scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
 
             # Downsample the K portion of these masks
@@ -228,7 +228,6 @@ class AttentionState:
 
     # Downsample by stride slicing the tensor along the given axis.
     T = TypeVar('T', bound=Union[List[Tensor], Tensor])
-
     def _stride_downsample(self, x: T, axis: int, scaling_factor: int) -> Optional[T]:
         if x is None:
             return None
@@ -301,18 +300,16 @@ class AttentionState:
             self._pos_encodings.append(encoding_block)
 
             # Now create all the scaled down ones
-            q_stride = 1
             for scaling_factor in scaling_factors:
                 if scaling_factor == 1:  # Ignore the placeholder 1 at the end of the list
                     break
 
-                last_encoding = encoding_block[-1]
-                q_stride *= scaling_factor
+                last_encoding = self._pos_encodings[-1][0]
 
-                q_pooled = self._stride_downsample(last_encoding[:2], 1, q_stride)
-                k_pooled = self._stride_downsample(last_encoding[2:], 1, q_stride)
+                q_pooled = self._stride_downsample(last_encoding[:2], 0, scaling_factor)
+                k_pooled = self._stride_downsample(last_encoding[2:], 0, scaling_factor)
 
-                encoding_block = [q_pooled + last_encoding[2:], q_pooled + k_pooled]
+                encoding_block = [q_pooled + k_pooled, q_pooled + last_encoding[2:]]
                 self._pos_encodings.append(encoding_block)
 
             return [[enc_q_1, enc_q_2, enc_k_1, enc_k_2]]

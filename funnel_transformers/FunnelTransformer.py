@@ -54,7 +54,7 @@ class FunnelTransformer(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
         
-        hparams = AttributeDict(**self.default_hparams, **kwargs)
+        hparams = AttributeDict(**{**self.default_hparams, **kwargs})
 
         # Turn a single floating point scaling factor x into (x, x, x...) of the appropriate length
         if isinstance(hparams.scaling_factors, int):
@@ -139,7 +139,7 @@ class FunnelTransformer(nn.Module):
         # We're returning all hidden states as a list
         output = []
         if len(hidden_states) == len(self.blocks):
-            output.append(hidden_states)
+            output.extend(hidden_states)
 
         # We're returning the last hidden state, and a subset of the intermediate states
         elif len(hidden_states) > 0:
@@ -169,7 +169,7 @@ class FunnelTransformer(nn.Module):
             output.append(attn_state)
         else:
             attn_state.reset()
-
+        
         return output
     
     def enumerate_layers(self) -> Iterator[int, FunnelLayer]:
@@ -242,7 +242,10 @@ class FunnelTransformer(nn.Module):
                 # The old Funnel-Transformer had custom Dense layers that reshaped the input and therefore had
                 # 3D kernel tensors- in this project we're more conventional so we're using standard nn.Linear modules
                 if old_weights.shape != param.data.shape:
-                    old_weights = old_weights.reshape(*param.data.shape)
+                    if "r_kernel" in var_name:
+                        old_weights = old_weights.permute(1, 0, 2)
+                    else:
+                        old_weights = old_weights.reshape(*param.data.shape)
 
                 param.data = old_weights
             except KeyError:
@@ -311,7 +314,7 @@ class FunnelBlock(nn.Module):
         self.rezero_alpha = nn.Parameter(torch.tensor(0))
 
     def forward(self, q, kv, attention_state: AttentionState) -> Tuple[Tensor, Tensor]:
-        with attention_state.pooled_q_unpooled_k():
+        with attention_state.begin_block():
             kv = self.layers[0](q, kv, attention_state)
 
         for layer in self.layers[1:]:
