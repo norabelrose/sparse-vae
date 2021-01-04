@@ -13,7 +13,7 @@ def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor) -> Tensor:
 
 
 class Autoencoder(pl.LightningModule):
-    default_hparams = dict(
+    default_hparams = AttributeDict(
         block_sizes=(4, 4, 4, 2, 2),            # Number of layers in each encoder block; reversed for the decoder
         scaling_factors=(2, 2, 4, 4),           # How much the hidden state is downsampled between each encoder block
         d_model=768,                            # Embedding dimension
@@ -35,31 +35,30 @@ class Autoencoder(pl.LightningModule):
         super().__init__()
 
         # save_hyperparameters() stores the kwargs in self.hparams and ensures they are saved to disk during training.
-        hparams = {**self.default_hparams, **hparams}
+        hparams = merge(self.default_hparams, hparams)
         self.save_hyperparameters(hparams)
 
-        funnel_hparams = transmute(
-            self.hparams,
-            'use_performer_attention',
-            attention_type="'factorized' if use_performer_attention else 'rel_shift'",
-            block_sizes='block_sizes[0:3]',
-            max_position_embeddings='max_sequence_length',
-            return_block_outputs='True'
+        funnel_hparams = AttributeDict(
+            use_performer_attention=hparams.use_performer_attention,
+            attention_type='factorized' if hparams.use_performer_attention else 'rel_shift',
+            block_sizes=hparams.block_sizes[0:3],
+            max_position_embeddings=hparams.max_sequence_length,
+            return_block_outputs=True
         )
         self.encoder_funnel = FunnelTransformer(funnel_hparams)
         self.decoder_funnel = FunnelTransformer(funnel_hparams)
 
-        if self.hparams.use_pretrained_encoder:
+        if hparams.use_pretrained_encoder:
             self.encoder_funnel.load_pretrained_weights()
 
-            if self.hparams.copy_encoder_weights_to_decoder:
-                blocks_to_reset = range(3, len(self.hparams.block_sizes) - 3)
+            if hparams.copy_encoder_weights_to_decoder:
+                blocks_to_reset = range(3, len(hparams.block_sizes) - 3)
                 decoder_funnel = self.encoder_funnel.inverted_copy(reinitialize_blocks=blocks_to_reset)
 
         self.decoder_cells: List[DecoderCell] = []
 
-        latent_depth = self.hparams.latent_depth
-        overt_depth = self.hparams.overt_depth
+        latent_depth = hparams.latent_depth
+        overt_depth = hparams.overt_depth
 
         for index, layer in self.funnel_transformer.enumerate_layers():
             new_cell = DecoderCell(latent_depth=latent_depth, overt_depth=overt_depth)

@@ -27,10 +27,10 @@ class FunnelForPreTraining(pl.LightningModule):
     def __init__(self, hparams: Mapping[str, Any]):
         super(FunnelForPreTraining, self).__init__()
 
-        hparams = mutate(self.default_hparams, **hparams)
+        hparams = merge(self.default_hparams, hparams)
         self.save_hyperparameters(hparams)
 
-        discriminator_hparams = mutate(hparams.funnel_hparams, has_decoder_block=True, return_block_outputs=[0])
+        discriminator_hparams = merge(hparams.funnel_hparams, dict(has_decoder_block=True, return_block_outputs=[0]))
         generator_hparams = deepcopy(discriminator_hparams)
         generator_hparams.d_model /= 4
         generator_hparams.num_heads /= 4

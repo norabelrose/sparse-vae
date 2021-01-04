@@ -1,4 +1,5 @@
 from copy import copy
+from pytorch_lightning.utilities import AttributeDict
 from typing import *
 
 
@@ -9,11 +10,11 @@ def select(source_dict: T, *keys: str) -> T:
     return dict_cls(**{k: source_dict[k] for k in keys})
 
 
-# Copy a dictionary and set (possibly new) key value pairs from kwargs. Inspired by the R `dplyr` package.
+# Merge two dictionaries; any conflicts are resolved by picking the value from the second dictionary.
 T = TypeVar('T', bound=Mapping)
-def mutate(old_dict: T, **kwargs: Any) -> T:
-    new_dict = copy(old_dict)
-    new_dict.update(**kwargs)
+def merge(dict1: T, dict2: Mapping) -> T:
+    new_dict = copy(dict1)
+    new_dict.update(dict2)
     return new_dict
 
 

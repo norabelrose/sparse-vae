@@ -54,7 +54,7 @@ class FunnelTransformer(nn.Module):
     def __init__(self, hparams: Mapping[str, Any]):
         super().__init__()
         
-        hparams = mutate(self.default_hparams, **hparams)
+        hparams = merge(self.default_hparams, hparams)
 
         # Turn a single floating point scaling factor x into (x, x, x...) of the appropriate length
         if isinstance(hparams.scaling_factors, int):
