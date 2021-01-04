@@ -1,9 +1,15 @@
-from argparse import ArgumentParser
 from torch import nn
-from .Utilities import *
+from torch import Tensor
+from .HparamUtils import *
 from .funnel_transformers.FunnelTransformer import FunnelTransformer
+import math
 import pytorch_lightning as pl
 import torch
+
+
+def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor) -> Tensor:
+    eps = torch.empty_like(mu).normal_(0., 1.)
+    return torch.exp(logsigma) * eps + mu
 
 
 class Autoencoder(pl.LightningModule):
@@ -20,29 +26,17 @@ class Autoencoder(pl.LightningModule):
         max_sequence_length=512,
         attention_dropout=0.1,
 
-        learning_rate=1e-4,
+        lr=1e-4,
+        warmup_steps=100,
         weight_decay=0.01
     )
 
-    # For the command line interface
-    @classmethod
-    def add_model_specific_args(cls, parent_parser) -> ArgumentParser:
-        parser = ArgumentParser(parents=[parent_parser], add_help=False)
-        for param, default in cls.default_hparams:
-            # For block_sizes and scaling_factors
-            if isinstance(default, Sequence):
-                parser.add_argument("--" + param, nargs='+', type=type(default[0]))
-            else:
-                parser.add_argument("--" + param, type=type(default), default=default)
-
-        return parser
-
-    def __init__(self, **kwargs):
+    def __init__(self, hparams: Mapping[str, Any]):
         super().__init__()
 
         # save_hyperparameters() stores the kwargs in self.hparams and ensures they are saved to disk during training.
-        kwargs = {**self.default_hparams, **kwargs}
-        self.save_hyperparameters(kwargs)
+        hparams = {**self.default_hparams, **hparams}
+        self.save_hyperparameters(hparams)
 
         funnel_hparams = transmute(
             self.hparams,
@@ -50,10 +44,10 @@ class Autoencoder(pl.LightningModule):
             attention_type="'factorized' if use_performer_attention else 'rel_shift'",
             block_sizes='block_sizes[0:3]',
             max_position_embeddings='max_sequence_length',
-            return_block_outputs=True
+            return_block_outputs='True'
         )
-        self.encoder_funnel = FunnelTransformer(**funnel_hparams)
-        self.decoder_funnel = FunnelTransformer(**funnel_hparams)
+        self.encoder_funnel = FunnelTransformer(funnel_hparams)
+        self.decoder_funnel = FunnelTransformer(funnel_hparams)
 
         if self.hparams.use_pretrained_encoder:
             self.encoder_funnel.load_pretrained_weights()
@@ -74,9 +68,22 @@ class Autoencoder(pl.LightningModule):
             self.decoder_cells.append(new_cell)
 
     def configure_optimizers(self):
-        # TODO: Add LR decay
-        return torch.optim.AdamW(**transmute(self.hparams, 'weight_decay', lr='learning_rate'),
-                                 params=self.parameters())
+        adam = torch.optim.AdamW(**select(self.hparams, 'weight_decay', 'lr'), params=self.parameters())
+
+        # Cosine decay learning rate schedule with warmup steps
+        def cosine_with_warmup(current_step, num_cycles=1):
+            warmups = self.hparams.warmup_steps
+            if current_step < warmups:
+                return float(current_step) / float(max(1, warmups))
+
+            total_steps = self.trainer.max_steps
+            assert total_steps, "Max training steps must be known to use lr decay."
+
+            progress = float(current_step - warmups) / float(max(1, total_steps - warmups))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(adam, cosine_with_warmup)
+        return [adam], [scheduler]
 
     # Returns hidden states of the encoder
     def forward(self, batch: Tensor) -> List[Tensor]:

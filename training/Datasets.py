@@ -1,10 +1,11 @@
+from dataclasses import dataclass
 from itertools import chain, islice
 from pathlib import Path
 from pyarrow.csv import ConvertOptions
 from tokenizers import BertWordPieceTokenizer
 from torch import Tensor
 from torch.utils.data import DataLoader
-from typing import Dict, List, Optional, Union
+from typing import ClassVar, Dict, List, Optional, Union
 import datasets
 import multiprocessing
 import os
@@ -13,15 +14,15 @@ import torch
 
 
 # Base class for Text VAE data modules- takes care of boilerplate
+@dataclass
 class TextVaeDataModule(pl.LightningDataModule):
-    dataset_name = 'dataset'  # Should be overridden by subclasses
+    dataset_name: ClassVar[str] = 'dataset'  # Should be overridden by subclasses
 
-    def __init__(self, batch_size: int = 10, max_sample_length: int = 512, chunk_long_samples: bool = True):
-        super().__init__()
+    batch_size: int = 10
+    max_sample_length: int = 512
+    chunk_long_samples: bool = True
 
-        self.batch_size = batch_size
-        self.chunk_long_samples = chunk_long_samples
-        self.max_sample_length = max_sample_length
+    def __post_init__(self):
         self.dataset = None     # HuggingFace Dataset object, possibly with both train and test splits
 
         vocab_path = os.path.join(os.path.dirname(__file__), 'resources', 'pretrained-vocab.txt')
@@ -82,11 +83,11 @@ class TextVaeDataModule(pl.LightningDataModule):
 
 
 class ProjectGutenbergDataModule(TextVaeDataModule):
-    dataset_name = 'pg19'
+    dataset_name: ClassVar[str] = 'pg19'
 
 
 class AllTheNewsDataModule(TextVaeDataModule):
-    dataset_name = 'all-the-news'
+    dataset_name: ClassVar[str] = 'all-the-news'
 
     def create_dataset(self):
         manager = datasets.DownloadManager('all-the-news', download_config=datasets.DownloadConfig())

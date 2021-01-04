@@ -4,10 +4,36 @@ import tarfile
 
 from pathlib import Path
 from tqdm.auto import tqdm
+from pytorch_lightning.utilities import AttributeDict
 from typing import Dict
 
 DOWNLOAD_CHUNK_SIZE = 5242880  # 5 MB
 
+
+def remote_model_url_for_hparams(hparams: AttributeDict, suffix: str="") -> str:
+    block_size_to_name = {
+        (4, 4, 4): "B4-4-4H768-ELEC",
+        (6, 6, 6): "B6-6-6H768-ELEC",
+        (8, 8, 8): "B8-8-8H1024-ELEC",
+        (10, 10, 10): "B10-10-10H1024-ELEC"
+    }
+    block_size_to_dims = {
+        (4, 4, 4): (768, 12),  # d_model and num_heads
+        (6, 6, 6): (768, 12),
+        (8, 8, 8): (1024, 16),
+        (10, 10, 10): (1024, 16)
+    }
+
+    # Sanity checks
+    beginning_blocks = hparams.block_sizes[0:3]
+    pretrained_d_model = block_size_to_dims[beginning_blocks][0]
+    assert len(hparams.block_sizes) >= 3
+    assert beginning_blocks in block_size_to_name, f"No pretrained model with block layout {beginning_blocks}"
+    assert hparams.d_model == pretrained_d_model, \
+        f"Pretrained model {block_size_to_name[beginning_blocks]} requires d_model == {pretrained_d_model}"
+
+    name = block_size_to_name[beginning_blocks] + suffix
+    return f"http://storage.googleapis.com/funnel-transformer/funnel_ckpts_all/{name}.tar.gz"
 
 # Returns the path to the local file once downloaded
 def load_remote_model(url: str) -> Path:

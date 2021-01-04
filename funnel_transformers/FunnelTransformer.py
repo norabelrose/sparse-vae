@@ -6,7 +6,7 @@ from .RelativePositionalAttention import LayerNorm
 from .RelativePositionalAttention import RelativePositionalAttention
 from .RelativePositionalAttention import PositionwiseFFN
 from .RemoteModels import *
-from ..Utilities import *
+from ..HparamUtils import *
 from pytorch_lightning.utilities import AttributeDict
 from torch import Tensor
 from typing import *
@@ -16,7 +16,7 @@ import torch.nn as nn
 
 
 class FunnelTransformer(nn.Module):
-    default_hparams = dict(
+    default_hparams = AttributeDict(
         block_sizes=(4, 4, 4),
         d_model=768,
         num_heads=12,
@@ -51,10 +51,10 @@ class FunnelTransformer(nn.Module):
         use_mlm_head=False
     )
     
-    def __init__(self, **kwargs):
+    def __init__(self, hparams: Mapping[str, Any]):
         super().__init__()
         
-        hparams = AttributeDict(**{**self.default_hparams, **kwargs})
+        hparams = mutate(self.default_hparams, **hparams)
 
         # Turn a single floating point scaling factor x into (x, x, x...) of the appropriate length
         if isinstance(hparams.scaling_factors, int):
@@ -186,29 +186,7 @@ class FunnelTransformer(nn.Module):
                 yield var_name, param, index
 
     def path_to_pretrained_checkpoint(self) -> Path:
-        block_size_to_name = {
-            (4, 4, 4): "B4-4-4H768-ELEC",
-            (6, 6, 6): "B6-6-6H768-ELEC",
-            (8, 8, 8): "B8-8-8H1024-ELEC",
-            (10, 10, 10): "B10-10-10H1024-ELEC"
-        }
-        block_size_to_dims = {
-            (4, 4, 4): (768, 12),  # d_model and num_heads
-            (6, 6, 6): (768, 12),
-            (8, 8, 8): (1024, 16),
-            (10, 10, 10): (1024, 16)
-        }
-
-        # Sanity checks
-        beginning_blocks = self.hparams.block_sizes[0:3]
-        pretrained_d_model = block_size_to_dims[beginning_blocks][0]
-        assert len(self.hparams.block_sizes) >= 3
-        assert beginning_blocks in block_size_to_name, f"No pretrained model with block layout {beginning_blocks}"
-        assert self.hparams.d_model == pretrained_d_model, \
-            f"Pretrained model {block_size_to_name[beginning_blocks]} requires d_model == {pretrained_d_model}"
-
-        name = block_size_to_name[beginning_blocks]
-        url = f"http://storage.googleapis.com/funnel-transformer/funnel_ckpts_all/{name}-PT.tar.gz"
+        url = remote_model_url_for_hparams(self.hparams, suffix="-PT")
         return load_remote_model(url)
 
     def load_pretrained_weights(self):

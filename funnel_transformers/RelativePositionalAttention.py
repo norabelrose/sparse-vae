@@ -63,7 +63,7 @@ class EinsumLayer(nn.Module):
         return output
 
 
-# All these custom module classes are probably unnecessary, but we keep them them here in order
+# These custom module classes are probably unnecessary, but we keep them them here in order
 # to maintain full backward compatibility with the original pretrained Funnel Transformer checkpoints.
 class GELU(nn.Module):
     def forward(self, x):
