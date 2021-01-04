@@ -180,6 +180,7 @@ class FunnelForPreTraining(pl.LightningModule):
         def copy_params_with_mapping(module: nn.Module, mapping: Dict[str, str], prefix=""):
             for name, param in module.named_parameters():
                 if tf_name := mapping.get(name):
+                    # noinspection PyTypeChecker
                     param.data = get_tf_param(prefix + tf_name, param)
 
         # Store the Adam optimizer state in a temporary attribute until configure_optimizers() is called
@@ -205,18 +206,15 @@ class FunnelForPreTraining(pl.LightningModule):
             '2.weight': 'binary_loss/weight',
         })
 
-        copy_tf_params_with_prefix(self.encoders[1].enumerate_parameters_by_layer(), 'model/encoder/')
-        copy_tf_params_with_prefix(self.encoders[0].enumerate_parameters_by_layer(), 'generator/encoder/')
-        copy_tf_params_with_prefix(enumerate_decoder_layers(self.decoders[1]), 'model/decoder/')
-        copy_tf_params_with_prefix(enumerate_decoder_layers(self.decoders[0], 'generator/decoder/')
-
-        num_encoder_layers = sum(discriminator_hparams.block_sizes)
+        num_encoder_layers = sum(self.hparams.funnel_hparams.block_sizes)
         def decoder_param_iterator(decoder: FunnelBlock):
             for i, layer in enumerate(decoder.layers):
                 for var_name, param in layer.named_parameters():
                     yield var_name, param, i + num_encoder_layers
 
-        copy_tf_params_with_prefix(decoder_param_iterator(self.discriminator_decoder), 'model/decoder/')
-        copy_tf_params_with_prefix(decoder_param_iterator(self.generator_decoder), 'generator/decoder/')
+        copy_tf_params_with_prefix(self.encoders[1].enumerate_parameters_by_layer(), 'model/encoder/')
+        copy_tf_params_with_prefix(self.encoders[0].enumerate_parameters_by_layer(), 'generator/encoder/')
+        copy_tf_params_with_prefix(decoder_param_iterator(self.decoders[1]), 'model/decoder/')
+        copy_tf_params_with_prefix(decoder_param_iterator(self.decoders[0]), 'generator/decoder/')
 
         print("Finished.")

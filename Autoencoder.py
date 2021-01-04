@@ -106,8 +106,8 @@ class Autoencoder(pl.LightningModule):
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         return self.training_step(batch, batch_index)
 
-    def validation_epoch_end(self, losses: List[Tensor]):
-        self.log('val_loss', torch.mean(torch.stack(losses)))
+    def validation_epoch_end(self, losses: List[Tensor]) -> dict:
+        return {'log': {'val_loss': torch.mean(torch.stack(losses))}}
 
 
 class DecoderCell(nn.Module):
