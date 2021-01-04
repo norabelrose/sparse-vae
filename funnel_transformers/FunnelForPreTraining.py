@@ -1,6 +1,6 @@
-from FunnelTransformer import FunnelTransformer, FunnelBlock
-from RemoteModels import *
-from HparamUtils import *
+from .FunnelTransformer import FunnelTransformer, FunnelBlock
+from .RemoteModels import *
+from ..HparamUtils import *
 from collections import defaultdict
 from copy import deepcopy
 from itertools import chain
@@ -32,8 +32,8 @@ class FunnelForPreTraining(pl.LightningModule):
 
         discriminator_hparams = merge(hparams.funnel_hparams, dict(has_decoder_block=True, return_block_outputs=[0]))
         generator_hparams = deepcopy(discriminator_hparams)
-        generator_hparams.d_model /= 4
-        generator_hparams.num_heads /= 4
+        generator_hparams.d_model //= 4
+        generator_hparams.num_heads //= 4
 
         # Generator at index 0, discriminator at index 1
         self.encoders = [FunnelTransformer(generator_hparams), FunnelTransformer(discriminator_hparams)]
@@ -54,12 +54,12 @@ class FunnelForPreTraining(pl.LightningModule):
 
         # Freeze the generator weights if indicated
         if not hparams.train_generator:
-            for param in chain(self.encoders[0].parameters(), self.decoders[0].parameters()):
-                param.requires_grad = False
+            self.encoders[0].requires_grad_(False)
+            self.decoders[0].requires_grad_(False)
 
         if hparams.use_pretrained_weights:
-            url = remote_model_url_for_hparams(hparams, suffix="-FULL-TF")
-            self._load_weights_from_tf_ckpt(str(load_remote_model(url)), True)
+            url = remote_model_url_for_hparams(discriminator_hparams, suffix="-FULL-TF")
+            self._load_weights_from_tf_ckpt(str(load_remote_model(url) / "model.ckpt"), True)
 
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, optimizer_index: int) -> Tensor:
@@ -131,25 +131,31 @@ class FunnelForPreTraining(pl.LightningModule):
                 'pffn.0': 'layer_1',
                 'pffn.3': 'layer_2',
                 'r_kernel': 'r.kernel',  # r_kernel is a parameter of a separate Dense layer in TF
-                'weight': 'kernel'
+                'lm_loss.weight': 'lm_loss/weight',
+                '.weight': '.kernel'
             })
 
             keys = key_string.split('.')
             if layer_index is not None:
                 keys.insert(0, "layer_" + str(layer_index))
 
-            keys[1] = replace_all(keys[1], {  # 'layer_17.feedforward.layer_1.bias' -> 'layer_17.ff.layer_1.bias'
-                'attention': 'rel_attn',
-                'feedforward': 'ff'
-            })
-            keys[2] = replace_all(keys[2], {  # 'layer_17.rel_attn.v_head.bias' -> 'layer_17.rel_attn.v.bias'
-                '_head': '',
-                'post_proj': 'o'
-            })
+            if len(keys) > 1:
+                keys[1] = replace_all(keys[1], {  # 'layer_17.feedforward.layer_1.bias' -> 'layer_17.ff.layer_1.bias'
+                    'attention': 'rel_attn',
+                    'feedforward': 'ff'
+                })
+
+            if len(keys) > 2:
+                keys[2] = replace_all(keys[2], {  # 'layer_17.rel_attn.v_head.bias' -> 'layer_17.rel_attn.v.bias'
+                    '_head': '',
+                    'post_proj': 'o'
+                })
 
             # 'layer_17.rel_attn.v.bias' -> 'model/encoder/layer_17/rel_attn/v/bias'
             tf_name = prefix + '/'.join(keys)
+            param.data = get_tf_param(tf_name, param)
 
+        def get_tf_param(tf_name: str, param: nn.Parameter):
             weights = reader.get_tensor(tf_name)
             if weights is None and strict:
                 return None
@@ -165,35 +171,50 @@ class FunnelForPreTraining(pl.LightningModule):
             if 'kernel' in tf_name:
                 weights = weights.T
 
-            param.data = torch.from_numpy(weights)
+            return torch.from_numpy(weights)
 
         def copy_tf_params_with_prefix(param_iterator: Iterator[Tuple[str, torch.nn.Parameter, int]], prefix: str):
             for key_string, param, abs_index in param_iterator:
                 copy_tf_param(key_string, param, abs_index, prefix)
 
-        def copy_sequential(layer: nn.Sequential, component_names: Dict[int, str], prefix=""):
-            for index, name in component_names.items():
-                sublayer = layer[index]
-                for key_string, param in sublayer.named_parameters():
-                    copy_tf_param(key_string, param, prefix=prefix + name)
+        def copy_params_with_mapping(module: nn.Module, mapping: Dict[str, str], prefix=""):
+            for name, param in module.named_parameters():
+                if tf_name := mapping.get(name):
+                    param.data = get_tf_param(prefix + tf_name, param)
 
         # Store the Adam optimizer state in a temporary attribute until configure_optimizers() is called
         if self.hparams.use_pretrained_adam_state:
             self.optimizer_state = defaultdict(dict)
 
-        copy_sequential(self.mlm_head, prefix='generator/', component_names={
-            0: 'lm_proj/dense', 2: 'lm_proj/layer_norm', 3: 'lm_loss/'
+        copy_params_with_mapping(self.encoders[1].input_layer, prefix='model/input/', mapping={
+            '0.weight': 'word_embedding/lookup_table',
+            '1.bias': 'layer_norm/beta',
+            '1.weight': 'layer_norm/gamma'
         })
-        copy_sequential(self.discriminator_head, prefix='model/', component_names={
-            0: 'binary_proj/dense', 2: 'binary_loss/'
+        copy_params_with_mapping(self.mlm_head, prefix='generator/', mapping={
+            '0.bias': 'lm_proj/dense/bias',
+            '0.weight': 'lm_proj/dense/kernel',
+            '2.bias': 'lm_proj/layer_norm/beta',
+            '2.weight': 'lm_proj/layer_norm/gamma',
+            '3.bias': 'lm_loss/bias'
         })
-        copy_tf_params_with_prefix(self.discriminator.enumerate_parameters_by_layer(), 'model/encoder/')
-        copy_tf_params_with_prefix(self.generator.enumerate_parameters_by_layer(), 'generator/encoder/')
+        copy_params_with_mapping(self.discriminator_head, prefix='model/', mapping={
+            '0.bias': 'binary_proj/dense/bias',
+            '0.weight': 'binary_proj/dense/kernel', 
+            '2.bias': 'binary_loss/bias',
+            '2.weight': 'binary_loss/weight',
+        })
 
+        copy_tf_params_with_prefix(self.encoders[1].enumerate_parameters_by_layer(), 'model/encoder/')
+        copy_tf_params_with_prefix(self.encoders[0].enumerate_parameters_by_layer(), 'generator/encoder/')
+        copy_tf_params_with_prefix(enumerate_decoder_layers(self.decoders[1]), 'model/decoder/')
+        copy_tf_params_with_prefix(enumerate_decoder_layers(self.decoders[0], 'generator/decoder/')
+
+        num_encoder_layers = sum(discriminator_hparams.block_sizes)
         def decoder_param_iterator(decoder: FunnelBlock):
             for i, layer in enumerate(decoder.layers):
                 for var_name, param in layer.named_parameters():
-                    yield var_name, param, i
+                    yield var_name, param, i + num_encoder_layers
 
         copy_tf_params_with_prefix(decoder_param_iterator(self.discriminator_decoder), 'model/decoder/')
         copy_tf_params_with_prefix(decoder_param_iterator(self.generator_decoder), 'generator/decoder/')

@@ -24,9 +24,9 @@ class TextVaeDataModule(pl.LightningDataModule):
 
     def __post_init__(self):
         self.dataset = None     # HuggingFace Dataset object, possibly with both train and test splits
-
-        vocab_path = os.path.join(os.path.dirname(__file__), 'resources', 'pretrained-vocab.txt')
-        self.tokenizer = BertWordPieceTokenizer.from_file(vocab_path, lowercase=True)
+        
+        vocab_path = Path(__file__).parent.parent / 'resources' / 'pretrained-vocab.txt'
+        self.tokenizer = BertWordPieceTokenizer.from_file(str(vocab_path), lowercase=True)
 
         # Get path to store the processed dataset
         cache_dir = Path(os.getenv('XDG_CACHE_HOME', '~/.cache'))

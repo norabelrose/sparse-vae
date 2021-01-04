@@ -8,7 +8,7 @@ from .training.FunnelPreTrainingDataModule import FunnelPreTrainingDataModule
 
 
 def add_args_from_hparam_defaults(argparser: ArgumentParser, defaults: dict):
-    for param, default in defaults:
+    for param, default in defaults.items():
         # For, i.e. Autoencoder.block_sizes
         if isinstance(default, Sequence):
             argparser.add_argument("--" + param, nargs='+', type=type(default[0]))
