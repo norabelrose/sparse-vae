@@ -35,7 +35,7 @@ class FunnelTransformer(nn.Module):
         num_classes=0,
 
         attention_type='rel_shift',
-        rezero_blocks=(),  # Blocks for which to use ReZero
+        rezero_nonpretrained_blocks=False,
     
         # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of
         # selected blocks will be returned.
@@ -76,9 +76,6 @@ class FunnelTransformer(nn.Module):
             )
 
         self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
-        for block_index in hparams.rezero_blocks:
-            self.blocks[block_index].activate_rezero()
-
         self.attention_state = shared_attention_state or AttentionState(hparams)
 
     def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None) -> Dict[str, Any]:
