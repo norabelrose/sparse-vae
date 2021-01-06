@@ -82,12 +82,12 @@ class FunnelForPreTraining(pl.LightningModule):
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, optimizer_index: int) -> Tensor:
         # Either generator or discriminator forward pass
-        def _encoder_decoder_forward(inputs: Tensor, model_index: int, mask: Tensor) -> Tensor:
+        def _encoder_decoder_forward(inputs: Tensor, model_index: int) -> Tensor:
             encoder, decoder = self.encoders[model_index], self.decoders[model_index]
 
-            encoder_output, hidden_states = encoder(inputs, mask=mask)
+            encoder_output, hidden_states = encoder(inputs)
             decoder_input = encoder_output + hidden_states[0]  # Residual connection
-            return decoder(decoder_input, mask=mask)
+            return decoder(decoder_input)
 
         # Train generator
         if optimizer_index == 0 and self.hparams.train_generator:
@@ -98,7 +98,7 @@ class FunnelForPreTraining(pl.LightningModule):
             masked_text, labels = batch['token_ids'], batch['labels']
 
             # Probability distribution over tokens: (batch, seq_len, vocab_size)
-            generator_logits = _encoder_decoder_forward(masked_text, 0, mask=torch.ne(masked_text, 0))['logits']
+            generator_logits = _encoder_decoder_forward(masked_text, 0)['logits']
 
             # Sample from the distribution (Gumbel softmax). Greedy sampling, plus some noise.
             noise = torch.rand_like(generator_logits)
@@ -109,11 +109,11 @@ class FunnelForPreTraining(pl.LightningModule):
             # a word was masked out and the generator correctly predicted the original token. The discriminator
             # is only asked to find the generator's mistakes.
             is_groundtruth = torch.eq(samples, labels)
-            nonpadding_mask = torch.ne(samples, 0)
 
             # For each token, the probability that matches the ground truth input.
-            discriminator_logits = _encoder_decoder_forward(samples, 1, mask=nonpadding_mask)['logits']
-            return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=nonpadding_mask)
+            discriminator_logits = _encoder_decoder_forward(samples, 1)['logits']
+            padding_mask = self.encoders[1].attention_state.input_mask
+            return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=~padding_mask)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         return self.training_step(batch, batch_index, optimizer_index=0)
@@ -178,7 +178,7 @@ class FunnelForPreTraining(pl.LightningModule):
             if 'kernel' in tf_name:
                 weights = weights.T
 
-            return torch.from_numpy(weights)
+            return torch.from_numpy(weights.numpy())
 
         def copy_tf_params_with_prefix(param_iterator: Iterator[Tuple[str, torch.nn.Parameter, int]], prefix: str):
             for key_string, param, abs_index in param_iterator:

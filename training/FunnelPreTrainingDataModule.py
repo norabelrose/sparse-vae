@@ -20,7 +20,8 @@ class FunnelPreTrainingDataModule(TextVaeDataModule):
                           num_workers=multiprocessing.cpu_count(), collate_fn=self.collate_and_mask_tokens)
 
     def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
-        return DataLoader(self.dataset['test'], batch_size=self.batch_size, collate_fn=self.collate_and_mask_tokens)
+        return DataLoader(self.dataset['test'], batch_size=self.batch_size, pin_memory=True,
+                          num_workers=multiprocessing.cpu_count(), collate_fn=self.collate_and_mask_tokens)
 
     # Create MLM batches for the generator. Adapted from DataCollatorForLanguageModeling from huggingface/transformers
     def collate_and_mask_tokens(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:

@@ -128,8 +128,8 @@ class Autoencoder(pl.LightningModule):
 
     def sample(self, max_length: int, count: int = 1, temperature: Union[float, Mapping[int, float]] = 1.0,
                top_k: int = 1) -> Tensor:
-        # The temperature parameter can either be a Mapping that assigns different temperatures to different layers,
-        # or a single float for all layers
+        # The temperature parameter can either be a Mapping that assigns different temperatures to different layer
+        # indices, or a single float for all layers
         if isinstance(temperature, Mapping):
             self.temperatures.update(temperature)
         elif isinstance(temperature, float):
