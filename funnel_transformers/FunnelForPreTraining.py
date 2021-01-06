@@ -178,7 +178,9 @@ class FunnelForPreTraining(pl.LightningModule):
             if 'kernel' in tf_name:
                 weights = weights.T
 
-            return torch.from_numpy(weights.numpy())
+            # If we don't copy the weights we get a "The given NumPy array is not writeable, and PyTorch does not
+            # support non-writeable tensors" warning
+            return torch.from_numpy(deepcopy(weights))
 
         def copy_tf_params_with_prefix(param_iterator: Iterator[Tuple[str, torch.nn.Parameter, int]], prefix: str):
             for key_string, param, abs_index in param_iterator:
