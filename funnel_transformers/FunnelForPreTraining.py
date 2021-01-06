@@ -72,7 +72,7 @@ class FunnelForPreTraining(pl.LightningModule):
             discriminator_opt.state = self.optimizer_state
             del self.optimizer_state
 
-        if self.train_generator:
+        if self.hparams.train_generator:
             generator_params = chain(self.encoders[0].parameters(), self.decoders[0].parameters())
             generator_opt = torch.optim.AdamW(**adam_hparams, params=generator_params)
             return [generator_opt, discriminator_opt], []

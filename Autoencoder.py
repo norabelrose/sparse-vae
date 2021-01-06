@@ -1,3 +1,4 @@
+from collections import defaultdict
 from functools import partial
 from numpy import prod
 from torch import nn
@@ -73,18 +74,15 @@ class Autoencoder(pl.LightningModule):
             ))
             for _ in sum(encoder_hparams.block_sizes)
         )
-
-        # We'll initialize these with Tensors on a forward pass when we know what device to use
-        self.encoder_states = None
-        self.total_kl_divergence = None
-        self.total_nonpadding_positions = None
+        self.reset_forward_pass_state()
 
         # After each layer in the decoder, call decoder_forward with the layer's output and the corresponding
         # ModuleDict with the corresponding Conv1d modules
-        cell_iter = iter(self.decoder_cells)
+        absolute_idx = 0
         for block_idx, block in enumerate(self.decoder_funnel.blocks):
             for layer in block.layers:
-                layer.output_transform = partial(self.decoder_layer_forward, next(cell_iter), block_idx)
+                layer.output_transform = partial(self.decoder_layer_forward, absolute_idx, block_idx)
+                absolute_idx += 1
 
         # Load pretrained weights
         if hparams.use_pretrained_encoder:
@@ -120,7 +118,23 @@ class Autoencoder(pl.LightningModule):
     def forward(self, batch: Tensor) -> List[Tensor]:
         return self.encoder_funnel(batch)
 
-    def sample(self, max_length: int, count: int = 1, temperature: float = 1.0, top_k: int = 1) -> Tensor:
+    def reset_forward_pass_state(self):
+        self.encoder_states = None
+        self.temperatures = defaultdict(lambda: 1.0)    # Multiplier for the standard deviation of latent variables
+
+        # We'll initialize these with Tensors on a forward pass when we know what device to use
+        self.total_kl_divergence = None
+        self.total_nonpadding_positions = None
+
+    def sample(self, max_length: int, count: int = 1, temperature: Union[float, Mapping[int, float]] = 1.0,
+               top_k: int = 1) -> Tensor:
+        # The temperature parameter can either be a Mapping that assigns different temperatures to different layers,
+        # or a single float for all layers
+        if isinstance(temperature, Mapping):
+            self.temperatures.update(temperature)
+        elif isinstance(temperature, float):
+            self.temperatures = defaultdict(lambda: temperature)
+
         # Find the sequence length dimension that the seed should have in order to generate the desired output length
         funnel_hparams = self.hparams.encoder_hparams
         total_scaling = prod(funnel_hparams.scaling_factors)
@@ -133,7 +147,8 @@ class Autoencoder(pl.LightningModule):
         return output_ids
 
     # Called once for each Transformer layer in the decoder
-    def decoder_layer_forward(self, cell: nn.ModuleDict, block_index: int, layer_output: Tensor) -> Tensor:
+    def decoder_layer_forward(self, layer_index: int, block_index: int, layer_output: Tensor) -> Tensor:
+        cell = self.decoder_cells[layer_index]
         encoder_state = self.encoder_states[block_index] if self.encoder_states else None
         prior_output = cell['prior'](layer_output)
 
@@ -151,16 +166,20 @@ class Autoencoder(pl.LightningModule):
             return term1 + term2
 
         @torch.jit.script
-        def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor) -> Tensor:
+        def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor, temperature: float) -> Tensor:
             noise = torch.empty_like(mu).normal_(0., 1.)    # Reparameterization trick
-            return torch.exp(logsigma) * noise + mu
+            stddev = torch.exp(logsigma)
+            if temperature != 1.0:
+                stddev *= temperature
+
+            return stddev * noise + mu
 
         # Sample conditioned on the encoder state (used during training)
         if encoder_state is not None:
             q_input = torch.cat([layer_output, encoder_state], dim=-1)
             q_mu, q_logsigma = cell['q_of_z_given_x'](q_input).chunk(2, dim=-1)
 
-            z = sample_diagonal_gaussian_variable(q_mu, q_logsigma)
+            z = sample_diagonal_gaussian_variable(q_mu, q_logsigma, self.temperatures[layer_index])
             kl_tensor = gaussian_kl_divergence(q_mu, p_mu, q_logsigma, p_logsigma)
 
             # Gives us the appropriately scaled mask for the current block
@@ -177,7 +196,7 @@ class Autoencoder(pl.LightningModule):
 
         # Sample unconditionally (used during evaluation/generation)
         else:
-            z = sample_diagonal_gaussian_variable(p_mu, p_logsigma)
+            z = sample_diagonal_gaussian_variable(p_mu, p_logsigma, self.temperatures[layer_index])
 
         layer_output += cell['z_upsample'](z)
         return layer_output
@@ -197,9 +216,7 @@ class Autoencoder(pl.LightningModule):
         negative_log_likelihood = F.nll_loss(output_logits, target=input_tokens, weight=nonpadding_mask)
         negative_elbo = kl_divergence + negative_log_likelihood
 
-        self.encoder_states = None
-        self.total_kl_divergence.zero_()
-        self.total_nonpadding_positions.zero_()
+        self.reset_forward_pass_state()
 
         return {'loss': negative_elbo, 'log': {'kl': kl_divergence, 'nll': negative_log_likelihood}}
 

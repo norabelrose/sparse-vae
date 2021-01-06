@@ -22,7 +22,7 @@ class TextVaeDataModule(pl.LightningDataModule):
         self.chunk_long_samples = chunk_long_samples
         self.max_sample_length = max_sample_length
         self.dataset = None     # HuggingFace Dataset object, possibly with both train and test splits
-        
+
         vocab_path = Path(__file__).parent.parent / 'resources' / 'pretrained-vocab.txt'
         self.tokenizer = BertWordPieceTokenizer.from_file(str(vocab_path), lowercase=True)
 
