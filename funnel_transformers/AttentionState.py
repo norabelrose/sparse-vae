@@ -36,7 +36,7 @@ class AttentionState:
 
     @property
     def attention_mask(self) -> Tensor:
-        return None if self.input_mask is None else self.input_mask[:, None, None, :]
+        return None if self.input_mask is None else self.input_mask[:, None, None, :].float()
 
     @property
     def positional_encoding(self) -> PositionalEncoding:
@@ -68,7 +68,7 @@ class AttentionState:
         # By default, mask out all the padding tokens
         pad_id = self.hparams.pad_id
         if input_mask is None and pad_id is not None:
-            input_mask = torch.eq(x, pad_id).float()
+            input_mask = torch.eq(x, pad_id)
 
         self.input_mask = input_mask
 

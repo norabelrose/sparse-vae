@@ -74,9 +74,10 @@ class Autoencoder(pl.LightningModule):
             for _ in sum(encoder_hparams.block_sizes)
         )
 
-        # Helpful for saving state during a forward pass
-        self.encoder_states = []
-        self.kl_divergences = []
+        # We'll initialize these with Tensors on a forward pass when we know what device to use
+        self.encoder_states = None
+        self.total_kl_divergence = None
+        self.total_nonpadding_positions = None
 
         # After each layer in the decoder, call decoder_forward with the layer's output and the corresponding
         # ModuleDict with the corresponding Conv1d modules
@@ -160,12 +161,19 @@ class Autoencoder(pl.LightningModule):
             q_mu, q_logsigma = cell['q_of_z_given_x'](q_input).chunk(2, dim=-1)
 
             z = sample_diagonal_gaussian_variable(q_mu, q_logsigma)
-            kl = gaussian_kl_divergence(q_mu, p_mu, q_logsigma, p_logsigma)
+            kl_tensor = gaussian_kl_divergence(q_mu, p_mu, q_logsigma, p_logsigma)
 
             # Gives us the appropriately scaled mask for the current block
             padding_mask = self.decoder_funnel.attention_state.input_mask
-            kl[padding_mask] = 0.0       # Ignore KL divergences for padding positions
-            self.kl_divergences.append(kl)
+            kl_tensor.masked_fill_(padding_mask, 0.0)       # Ignore KL divergences for padding positions
+
+            if self.total_kl_divergence is None:
+                # Now we know the device to use
+                self.total_kl_divergence = torch.tensor(0.0, device=kl_tensor.device)
+                self.total_nonpadding_positions = torch.tensor(0, device=padding_mask.device)
+
+            self.total_kl_divergence += kl_tensor.sum()
+            self.total_nonpadding_positions += (~padding_mask).sum()
 
         # Sample unconditionally (used during evaluation/generation)
         else:
@@ -183,17 +191,15 @@ class Autoencoder(pl.LightningModule):
         seed = self.decoder_seed.expand_as(self.encoder_states[-1])
         output_logits: Tensor = self.decoder_funnel(seed)['logits']    # (batch, seq_len, vocab_size)
 
-        # We have to be careful to exclude padding positions from our KL divergence calculation- elements in the
-        # KL divergence tensors which are exactly 0.0 should be padding
-        kl_denom = sum(kl.count_nonzero() for kl in self.kl_divergences)
-        kl_numer = sum(kl.sum() for kl in self.kl_divergences)
-        kl_divergence = kl_numer / kl_denom
+        # We have to be careful to exclude padding positions from our KL divergence calculation
+        kl_divergence = self.total_kl_divergence / (self.total_nonpadding_positions * self.hparams.latent_depth)
 
         negative_log_likelihood = F.nll_loss(output_logits, target=input_tokens, weight=nonpadding_mask)
         negative_elbo = kl_divergence + negative_log_likelihood
 
-        self.kl_divergences.clear()
         self.encoder_states = None
+        self.total_kl_divergence.zero_()
+        self.total_nonpadding_positions.zero_()
 
         return {'loss': negative_elbo, 'log': {'kl': kl_divergence, 'nll': negative_log_likelihood}}
 

@@ -38,7 +38,7 @@ def get_hparam_dict_from_args(args: Namespace, defaults: MutableMapping):
             return False
 
     for argname, value in vars(args).items():
-        assert search_for_key(argname, defaults), f"Couldn't find hyperparameter matching '{argname}'"
+        search_for_key(argname, defaults)
 
     return hparams
 
