@@ -12,6 +12,7 @@ import torch
 
 
 # Base class for Text VAE data modules- takes care of boilerplate
+# noinspection PyAbstractClass
 class TextVaeDataModule(pl.LightningDataModule):
     dataset_name: ClassVar[str] = 'dataset'  # Should be overridden by subclasses
 
@@ -76,9 +77,7 @@ class TextVaeDataModule(pl.LightningDataModule):
     def collate(inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         # Combine into a single batched tensor
         inputs = torch.cat([x['token_ids'].unsqueeze(0) for x in inputs], dim=0)
-        nonpadding_mask = torch.ne(inputs, 0)   # 1 where tokens are NOT padding, 0 where they are
-
-        return {'token_ids': inputs, 'nonpadding_mask': nonpadding_mask}
+        return {'token_ids': inputs}
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
         return DataLoader(self.dataset['train'], batch_size=self.batch_size, shuffle=True, collate_fn=self.collate,
@@ -90,9 +89,7 @@ class TextVaeDataModule(pl.LightningDataModule):
     def test_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return self.val_dataloader()
 
-    def transfer_batch_to_device(self, batch: Dict[str, Tensor], device: torch.device) -> Dict[str, Tensor]:
-        return {k: v.to(device) for k, v in batch.items()}
 
-
+# noinspection PyAbstractClass
 class ProjectGutenbergDataModule(TextVaeDataModule):
     dataset_name: ClassVar[str] = 'pg19'

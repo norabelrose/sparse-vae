@@ -204,7 +204,7 @@ class Autoencoder(pl.LightningModule):
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Any]:
         input_tokens = batch['token_ids']
-        nonpadding_mask = batch['nonpadding_mask']    # 1 where tokens are NOT padding, 0 where they are
+        padding_mask = self.decoder_funnel.attention_state.input_mask
         self.encoder_states = self(input_tokens)
 
         seed = self.decoder_seed.expand_as(self.encoder_states[-1])
@@ -213,7 +213,7 @@ class Autoencoder(pl.LightningModule):
         # We have to be careful to exclude padding positions from our KL divergence calculation
         kl_divergence = self.total_kl_divergence / (self.total_nonpadding_positions * self.hparams.latent_depth)
 
-        negative_log_likelihood = F.nll_loss(output_logits, target=input_tokens, weight=nonpadding_mask)
+        negative_log_likelihood = F.nll_loss(output_logits, target=input_tokens, weight=~padding_mask)
         negative_elbo = kl_divergence + negative_log_likelihood
 
         self.reset_forward_pass_state()

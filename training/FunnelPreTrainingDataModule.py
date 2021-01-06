@@ -11,20 +11,11 @@ class FunnelPreTrainingDataModule(TextVaeDataModule):
         wikipedia.remove_columns_('title')
         bookcorpus.remove_columns_('title')
 
-        print("Combining and shuffling datasets...")
         combined = datasets.concatenate_datasets([wikipedia, bookcorpus, openwebtext])
         self.dataset = combined.shuffle()   # This is just to make the tqdm ETA not be totally off when tokenizing
 
-    def train_dataloader(self, *args, **kwargs) -> DataLoader:
-        return DataLoader(self.dataset['train'], batch_size=self.batch_size, shuffle=True, pin_memory=True,
-                          num_workers=multiprocessing.cpu_count(), collate_fn=self.collate_and_mask_tokens)
-
-    def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
-        return DataLoader(self.dataset['test'], batch_size=self.batch_size, pin_memory=True,
-                          num_workers=multiprocessing.cpu_count(), collate_fn=self.collate_and_mask_tokens)
-
     # Create MLM batches for the generator. Adapted from DataCollatorForLanguageModeling from huggingface/transformers
-    def collate_and_mask_tokens(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+    def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         # Combine into a single batched tensor
         inputs = torch.cat([x['token_ids'].unsqueeze(0) for x in inputs], dim=0)
         labels = inputs.clone()
