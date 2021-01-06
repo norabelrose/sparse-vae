@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .AttentionState import AttentionState
-from copy import deepcopy
 from .RelativePositionalAttention import LayerNorm
 from .RelativePositionalAttention import RelativePositionalAttention
 from .RelativePositionalAttention import PositionwiseFFN
@@ -20,6 +19,7 @@ class FunnelTransformer(nn.Module):
         block_sizes=(4, 4, 4),
         d_model=768,
         num_heads=12,
+        scaling_factors=(2, 2),
 
         # **Default values taken from pretrained config files & flags**
         vocab_size=30522,
@@ -27,18 +27,15 @@ class FunnelTransformer(nn.Module):
         dropout=0.1,
         ffn_dropout=0.0,
         pooling_type='mean',
-        scaling_factors=2,
         separate_cls=True,
         pool_q_only=True,
         truncate_seq=True,
         seg_id_cls=2,  # Segment ID of the [CLS] token
         pad_id=None,
         num_classes=0,
-        use_classification_head=False,
 
         attention_type='rel_shift',
         rezero_blocks=(),  # Blocks for which to use ReZero
-        max_position_embeddings=512,
         return_attention_state=False,  # Useful for a VAE encoder; can reuse the state in the decoder
     
         # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of
@@ -51,15 +48,15 @@ class FunnelTransformer(nn.Module):
         use_mlm_head=False
     )
     
-    def __init__(self, hparams: Mapping[str, Any]):
+    def __init__(self, hparams: MutableMapping[str, Any]):
         super().__init__()
+
+        if hparams['use_performer_attention']:
+            assert 'attention_type' not in hparams or hparams['attention_type'] == 'factorized',\
+                "Performer attention is not compatible with the relative shift method of relative positional attention."
+            hparams['attention_type'] = 'factorized'
         
         hparams = merge(self.default_hparams, hparams)
-
-        # Turn a single floating point scaling factor x into (x, x, x...) of the appropriate length
-        if isinstance(hparams.scaling_factors, int):
-            factor = hparams.scaling_factors
-            hparams.scaling_factors = tuple(factor for _ in range(len(hparams.block_sizes) - 1))
 
         # Make it so scaling_factors and block_sizes are equal length; last scaling factor is 1 (no scaling)
         if len(hparams.scaling_factors) < len(hparams.block_sizes):
@@ -71,9 +68,13 @@ class FunnelTransformer(nn.Module):
             self.input_layer = nn.Sequential(
                 nn.Embedding(hparams.vocab_size, hparams.d_model),
                 LayerNorm(hparams.d_model),
-                nn.Dropout(hparams.dropout))
+                nn.Dropout(hparams.dropout)
+            )
         else:
-            self.output_linear = nn.Linear(hparams.d_model, hparams.vocab_size)
+            self.output_layer = nn.Sequential(
+                nn.Linear(hparams.d_model, hparams.vocab_size),
+                nn.LogSoftmax(dim=-1)
+            )
 
         self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
         for block_index in hparams.rezero_blocks:
@@ -81,37 +82,7 @@ class FunnelTransformer(nn.Module):
 
         self.attention_state = AttentionState(hparams)
 
-        if hparams.use_classification_head:
-            self.cls_head = nn.Sequential(
-                nn.Linear(hparams.d_model, hparams.d_model),
-                nn.Tanh(),
-                nn.Dropout(hparams.dropout),
-                nn.Linear(hparams.d_model, self.hparams.num_classes))
-            self.cls_loss = nn.CrossEntropyLoss()
-
-    # Returns a copy of the transformer whose upsampling parameter is flipped
-    def inverted_copy(self, reverse_layer_order: bool = True, reinitialize_blocks=()):
-        new_funnel: FunnelTransformer = deepcopy(self)
-        new_funnel.config.upsampling = not self.hparams.upsampling
-
-        for block in reinitialize_blocks:
-            for param in block.parameters():
-                # Glorot uniform initialization
-                dim = min(param.data.dim() - 1, 1)
-                stdv = 1. / param.data.size(dim) ** 0.5
-
-                param.data.uniform_(-stdv, stdv)
-
-        if reverse_layer_order:
-            for block in new_funnel.blocks:
-                block.layers.reverse()
-
-            new_funnel.blocks.reverse()
-
-        return new_funnel
-
-    # All inputs should be of shape (batch, length)
-    def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None, cls_target: Tensor = None):
+    def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None) -> Dict[str, Any]:
         config = self.hparams
         hidden_states = []
 
@@ -131,42 +102,19 @@ class FunnelTransformer(nn.Module):
             if return_blocks:
                 hidden_states.append(kv)
 
-        # Non-autoregressively generate a softmax distribution over words
+        output = {}
         if config.upsampling:
-            q = self.output_linear(q)
-            q = nn.functional.softmax(q, dim=-1)
-
-        # We're returning all hidden states as a list
-        output = []
-        if len(hidden_states) == len(self.blocks):
-            output.extend(hidden_states)
-
-        # We're returning the last hidden state, and a subset of the intermediate states
-        elif len(hidden_states) > 0:
-            output.extend([q, hidden_states])
-
-        # We're only returning the last hidden state
+            # Non-autoregressively generate a softmax distribution over words
+            output['logits'] = self.output_layer(q)
         else:
-            output.append(q)
+            output['output'] = q
 
-        if cls_target is not None:
-            ret_dict = {}
-
-            last_hidden = q[-1][:, 0]
-            cls_logits = self.cls_head(last_hidden)
-            prediction = torch.argmax(cls_logits, -1)
-            ret_dict["cls_pred"] = prediction
-            cls_loss = self.cls_loss(cls_logits, cls_target)
-            ret_dict["cls_loss"] = cls_loss
-            cls_correct = prediction == cls_target
-            cls_correct = cls_correct.type(torch.float32).sum()
-            ret_dict["cls_corr"] = cls_correct
-
-            output.append(ret_dict)
+        if len(hidden_states) > 0:
+            output['hidden_states'] = hidden_states
 
         if config.return_attention_state:
             attn_state.reset(keep_masks=True)
-            output.append(attn_state)
+            output['attention_state'] = attn_state
         else:
             attn_state.reset()
         
@@ -235,8 +183,7 @@ class FunnelTransformer(nn.Module):
 
     # For the "args" parameter in the old FunnelTFM.__init__()
     def get_backward_compatible_args(self) -> AttributeDict:
-        return transmute(self.hparams,
-                         'pad_id', 'seg_id_cls', 'truncate_seq',
+        return transmute(self.hparams, 'pad_id', 'seg_id_cls', 'truncate_seq',
                          attn_type='attention_type', num_class='num_classes')
     
     # Get a dictionary compatible with the old ModelConfig class from Funnel-Transformers

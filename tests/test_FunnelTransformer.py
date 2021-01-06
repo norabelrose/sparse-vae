@@ -42,7 +42,7 @@ class TestFunnelTransformer(unittest.TestCase):
         
         with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext(), torch.no_grad():
             for attn_type in ("factorized", "rel_shift"):
-                new_model = FunnelTransformer(return_block_outputs=True, attention_type=attn_type)
+                new_model = FunnelTransformer(dict(return_block_outputs=True, attention_type=attn_type))
                 new_model.load_pretrained_weights()
                 new_model.eval()
                 

@@ -10,11 +10,24 @@ def select(source_dict: T, *keys: str) -> T:
     return dict_cls(**{k: source_dict[k] for k in keys})
 
 
-# Merge two dictionaries; any conflicts are resolved by picking the value from the second dictionary.
+# Merge two mappings, possibly recursively. Any conflicts are resolved by picking the value from the second mapping.
 T = TypeVar('T', bound=Mapping)
 def merge(dict1: T, dict2: Mapping) -> T:
     new_dict = copy(dict1)
-    new_dict.update(dict2)
+
+    for key, value2 in dict2.items():
+        if (value1 := dict1.get(key)) and isinstance(value1, Mapping) and isinstance(value2, Mapping):
+            new_dict[key] = merge(value1, value2)
+        else:
+            new_dict[key] = value2
+
+    return new_dict
+
+
+T = TypeVar('T', bound=Mapping)
+def mutate(old_dict: T, **kwargs: Any) -> T:
+    new_dict = copy(old_dict)
+    new_dict.update(kwargs)
     return new_dict
 
 

@@ -5,10 +5,15 @@ class FunnelPreTrainingDataModule(TextVaeDataModule):
     dataset_name: ClassVar[str] = 'funnel_pretraining'
 
     def create_dataset(self):
-        wikipedia = datasets.load_dataset('wikipedia', '20200501.en', split='train')
-        bookcorpus = datasets.load_dataset('bookcorpusopen', split='train')
-        openwebtext = datasets.load_dataset('openwebtext', split='train')
-        self.dataset = datasets.concatenate_datasets([wikipedia, bookcorpus, openwebtext])
+        wikipedia = datasets.load_dataset('wikipedia', '20200501.en', split='train[:5%]')
+        bookcorpus = datasets.load_dataset('bookcorpusopen', split='train[:5%]')
+        openwebtext = datasets.load_dataset('openwebtext', split='train[:5%]')
+        wikipedia.remove_columns_('title')
+        bookcorpus.remove_columns_('title')
+
+        print("Combining and shuffling datasets...")
+        combined = datasets.concatenate_datasets([wikipedia, bookcorpus, openwebtext])
+        self.dataset = combined.shuffle()   # This is just to make the tqdm ETA not be totally off when tokenizing
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
         return DataLoader(self.dataset['train'], batch_size=self.batch_size, shuffle=True, pin_memory=True,
@@ -20,15 +25,16 @@ class FunnelPreTrainingDataModule(TextVaeDataModule):
     # Create MLM batches for the generator. Adapted from DataCollatorForLanguageModeling from huggingface/transformers
     def collate_and_mask_tokens(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         # Combine into a single batched tensor
-        inputs = torch.cat([x['text'].unsqueeze(0) for x in inputs], dim=0)
+        inputs = torch.cat([x['token_ids'].unsqueeze(0) for x in inputs], dim=0)
         labels = inputs.clone()
         vocab = self.tokenizer.get_vocab()
 
         # We sample a few tokens in each sequence for MLM training (with 15% probability)
         probability_matrix = torch.full(labels.shape, 0.15)
-        special_tokens_mask = inputs < 1000     # Token IDs under 1000 are special tokens or unused
+        special_tokens_mask = torch.lt(inputs, 1000)    # Token IDs under 1000 are special tokens or unused
+        padding_mask = torch.eq(inputs, 0)              # Padding token id is 0
 
-        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+        probability_matrix.masked_fill_(special_tokens_mask | padding_mask, value=0.0)
         masked_indices = torch.bernoulli(probability_matrix).bool()
         labels[~masked_indices] = -100  # We only compute loss on masked tokens
 
@@ -41,4 +47,4 @@ class FunnelPreTrainingDataModule(TextVaeDataModule):
         random_words = torch.randint(low=1000, high=len(vocab), size=labels.shape, dtype=torch.long)
         inputs[indices_random] = random_words[indices_random]
 
-        return {'text': inputs, 'labels': labels}
+        return {'token_ids': inputs, 'labels': labels, 'padding_mask': padding_mask}

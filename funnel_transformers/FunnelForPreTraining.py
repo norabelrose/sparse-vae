@@ -13,7 +13,8 @@ import torch
 # Funnel Transformer with a decoder block at the end for ELECTRA pretraining
 class FunnelForPreTraining(pl.LightningModule):
     default_hparams = AttributeDict(
-        funnel_hparams=FunnelTransformer.default_hparams,   # Discriminator and generator hparams copied from this
+        # Discriminator and generator hparams copied from this
+        funnel_hparams=mutate(FunnelTransformer.default_hparams, has_decoder_block=True),
         train_generator=False,
         use_pretrained_adam_state=False,    # Whether to use the saved Adam `m` and `v` from the pretrained checkpoint
         use_pretrained_weights=True,
@@ -30,14 +31,14 @@ class FunnelForPreTraining(pl.LightningModule):
         hparams = merge(self.default_hparams, hparams)
         self.save_hyperparameters(hparams)
 
-        discriminator_hparams = merge(hparams.funnel_hparams, dict(has_decoder_block=True, return_block_outputs=[0]))
+        discriminator_hparams = mutate(hparams.funnel_hparams, return_block_outputs=[0])
         generator_hparams = deepcopy(discriminator_hparams)
         generator_hparams.d_model //= 4
         generator_hparams.num_heads //= 4
 
         # Generator at index 0, discriminator at index 1
         self.encoders = [FunnelTransformer(generator_hparams), FunnelTransformer(discriminator_hparams)]
-        self.decoders = [FunnelBlock(generator_hparams, 3), FunnelBlock(discriminator_hparams, 3)]
+        self.decoders = [FunnelBlock(generator_hparams, 2), FunnelBlock(discriminator_hparams, 2)]
 
         self.mlm_head = nn.Sequential(
             nn.Linear(generator_hparams.d_model, generator_hparams.d_model),
@@ -61,26 +62,43 @@ class FunnelForPreTraining(pl.LightningModule):
             url = remote_model_url_for_hparams(discriminator_hparams, suffix="-FULL-TF")
             self._load_weights_from_tf_ckpt(str(load_remote_model(url) / "model.ckpt"), True)
 
+    def configure_optimizers(self):
+        # See Funnel Transformer paper, page 15
+        adam_hparams = transmute(self.hparams, 'weight_decay', 'lr', eps='adam_eps')
+        discriminator_params = chain(self.encoders[1].parameters(), self.decoders[1].parameters())
+        discriminator_opt = torch.optim.AdamW(**adam_hparams, params=discriminator_params)
+
+        if self.hparams.use_pretrained_adam_state:
+            discriminator_opt.state = self.optimizer_state
+            del self.optimizer_state
+
+        if self.train_generator:
+            generator_params = chain(self.encoders[0].parameters(), self.decoders[0].parameters())
+            generator_opt = torch.optim.AdamW(**adam_hparams, params=generator_params)
+            return [generator_opt, discriminator_opt], []
+        else:
+            return discriminator_opt
+
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, optimizer_index: int) -> Tensor:
         # Either generator or discriminator forward pass
-        def _encoder_decoder_forward(inputs: Tensor, model_index: int) -> Tensor:
+        def _encoder_decoder_forward(inputs: Tensor, model_index: int, mask: Tensor) -> Tensor:
             encoder, decoder = self.encoders[model_index], self.decoders[model_index]
 
-            encoder_output, hidden_states = encoder(inputs)
+            encoder_output, hidden_states = encoder(inputs, mask=mask)
             decoder_input = encoder_output + hidden_states[0]  # Residual connection
-            return decoder(decoder_input)
+            return decoder(decoder_input, mask=mask)
 
         # Train generator
-        if optimizer_index == 0:
+        if optimizer_index == 0 and self.hparams.train_generator:
             raise NotImplementedError
 
         # Train discriminator
         else:
-            masked_text, labels = batch['text'], batch['labels']
+            masked_text, labels = batch['token_ids'], batch['labels']
 
             # Probability distribution over tokens: (batch, seq_len, vocab_size)
-            generator_logits = _encoder_decoder_forward(masked_text, 0)
+            generator_logits = _encoder_decoder_forward(masked_text, 0, mask=torch.ne(masked_text, 0))['logits']
 
             # Sample from the distribution (Gumbel softmax). Greedy sampling, plus some noise.
             noise = torch.rand_like(generator_logits)
@@ -91,28 +109,17 @@ class FunnelForPreTraining(pl.LightningModule):
             # a word was masked out and the generator correctly predicted the original token. The discriminator
             # is only asked to find the generator's mistakes.
             is_groundtruth = torch.eq(samples, labels)
+            nonpadding_mask = torch.ne(samples, 0)
 
             # For each token, the probability that matches the ground truth input.
-            discriminator_logits = _encoder_decoder_forward(samples, 1)  # (batch, seq_len)
-            weights = 1.0 - mask if (mask := batch.get('padding_mask')) else None
-            return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=weights)
+            discriminator_logits = _encoder_decoder_forward(samples, 1, mask=nonpadding_mask)['logits']
+            return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=nonpadding_mask)
 
-    def configure_optimizers(self):
-        # See Funnel Transformer paper, page 15
-        adam_hparams = transmute(self.hparams, 'weight_decay', 'lr', eps='adam_eps')
-        discriminator_params = chain(self.discriminator.parameters(), self.discriminator_decoder.parameters())
-        discriminator_opt = torch.optim.AdamW(**adam_hparams, params=discriminator_params)
+    def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
+        return self.training_step(batch, batch_index, optimizer_index=0)
 
-        if self.hparams.use_pretrained_adam_state:
-            discriminator_opt.state = self.optimizer_state
-            del self.optimizer_state
-
-        if self.train_generator:
-            generator_params = chain(self.generator.parameters(), self.generator_decoder.parameters())
-            generator_opt = torch.optim.AdamW(**adam_hparams, params=generator_params)
-            return [generator_opt, discriminator_opt], []
-        else:
-            return discriminator_opt
+    def validation_epoch_end(self, losses: List[Tensor]) -> dict:
+        return {'log': {'val_loss': torch.mean(torch.stack(losses))}}
 
     def _load_weights_from_tf_ckpt(self, path: str, strict: bool):
         import tensorflow as tf
