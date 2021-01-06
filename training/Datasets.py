@@ -90,8 +90,8 @@ class TextVaeDataModule(pl.LightningDataModule):
     def test_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return self.val_dataloader()
 
-    def transfer_batch_to_device(self, batch: Tensor, device: torch.device) -> Tensor:
-        return batch.to(device)
+    def transfer_batch_to_device(self, batch: Dict[str, Tensor], device: torch.device) -> Dict[str, Tensor]:
+        return {k: v.to(device) for k, v in batch.items()}
 
 
 class ProjectGutenbergDataModule(TextVaeDataModule):
