@@ -30,7 +30,7 @@ class Autoencoder(pl.LightningModule):
     def __init__(self, hparams: MutableMapping[str, Any]):
         super().__init__()
 
-        # save_hyperparameters() stores the kwargs in self.hparams and ensures they are saved to disk during training.
+        # save_hyperparameters() stores the hparams in self.hparams and ensures they are saved to disk during training.
         hparams = merge(self.default_hparams, hparams)
         self.save_hyperparameters(hparams)
 
@@ -43,8 +43,11 @@ class Autoencoder(pl.LightningModule):
         )
         encoder_hparams = mutate(encoder_hparams, return_block_outputs=True)
 
+        # This way, the encoder and decoder Transformers share information about, i.e., the padding mask
         self.encoder_funnel = FunnelTransformer(encoder_hparams)
-        self.decoder_funnel = FunnelTransformer(decoder_hparams)
+        attn_state = self.encoder_funnel.attention_state
+        attn_state.cache_masks = True
+        self.decoder_funnel = FunnelTransformer(decoder_hparams, shared_attention_state=attn_state)
 
         # Initial input into the decoder
         self.decoder_seed = nn.Parameter(torch.zeros(1, 1, hparams.d_model))
@@ -54,7 +57,7 @@ class Autoencoder(pl.LightningModule):
             nn.ModuleDict(dict(
                 prior=nn.Conv1d(
                     in_channels=overt_depth,
-                    out_channels=latent_depth * 2 + overt_depth,
+                    out_channels=latent_depth * 2 + overt_depth,    # mu, log sigma, and bias term
                     kernel_size=1
                 ),
                 q_of_z_given_x=nn.Conv1d(
@@ -148,7 +151,7 @@ class Autoencoder(pl.LightningModule):
 
         @torch.jit.script
         def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor) -> Tensor:
-            noise = torch.empty_like(mu).normal_(0., 1.)
+            noise = torch.empty_like(mu).normal_(0., 1.)    # Reparameterization trick
             return torch.exp(logsigma) * noise + mu
 
         # Sample conditioned on the encoder state (used during training)
@@ -158,6 +161,10 @@ class Autoencoder(pl.LightningModule):
 
             z = sample_diagonal_gaussian_variable(q_mu, q_logsigma)
             kl = gaussian_kl_divergence(q_mu, p_mu, q_logsigma, p_logsigma)
+
+            # Gives us the appropriately scaled mask for the current block
+            padding_mask = self.decoder_funnel.attention_state.input_mask
+            kl[padding_mask] = 0.0       # Ignore KL divergences for padding positions
             self.kl_divergences.append(kl)
 
         # Sample unconditionally (used during evaluation/generation)
@@ -168,7 +175,7 @@ class Autoencoder(pl.LightningModule):
         return layer_output
 
     # Returns the loss
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
+    def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Any]:
         input_tokens = batch['token_ids']
         nonpadding_mask = batch['nonpadding_mask']    # 1 where tokens are NOT padding, 0 where they are
         self.encoder_states = self(input_tokens)
@@ -176,18 +183,21 @@ class Autoencoder(pl.LightningModule):
         seed = self.decoder_seed.expand_as(self.encoder_states[-1])
         output_logits: Tensor = self.decoder_funnel(seed)['logits']    # (batch, seq_len, vocab_size)
 
-        # We have to do it this way because the shapes of the KL div. tensors won't match up between decoder cells.
-        # Also, to ignore the padding tokens we sum the nonpadding mask to get the total sequence length in this batch.
-        kl_sum = sum(kl.sum() for kl in self.kl_divergences)
-        kl_divergence = kl_sum / nonpadding_mask.sum()
+        # We have to be careful to exclude padding positions from our KL divergence calculation- elements in the
+        # KL divergence tensors which are exactly 0.0 should be padding
+        kl_denom = sum(kl.count_nonzero() for kl in self.kl_divergences)
+        kl_numer = sum(kl.sum() for kl in self.kl_divergences)
+        kl_divergence = kl_numer / kl_denom
 
         negative_log_likelihood = F.nll_loss(output_logits, target=input_tokens, weight=nonpadding_mask)
         negative_elbo = kl_divergence + negative_log_likelihood
 
         self.kl_divergences.clear()
-        return negative_elbo
+        self.encoder_states = None
 
-    def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
+        return {'loss': negative_elbo, 'log': {'kl': kl_divergence, 'nll': negative_log_likelihood}}
+
+    def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Any]:
         return self.training_step(batch, batch_index)
 
     def validation_epoch_end(self, losses: List[Tensor]) -> dict:

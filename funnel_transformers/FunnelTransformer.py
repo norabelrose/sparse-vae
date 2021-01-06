@@ -36,7 +36,6 @@ class FunnelTransformer(nn.Module):
 
         attention_type='rel_shift',
         rezero_blocks=(),  # Blocks for which to use ReZero
-        return_attention_state=False,  # Useful for a VAE encoder; can reuse the state in the decoder
     
         # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of
         # selected blocks will be returned.
@@ -48,7 +47,7 @@ class FunnelTransformer(nn.Module):
         use_mlm_head=False
     )
     
-    def __init__(self, hparams: MutableMapping[str, Any]):
+    def __init__(self, hparams: MutableMapping[str, Any], shared_attention_state: Optional[AttentionState] = None):
         super().__init__()
 
         if hparams['use_performer_attention']:
@@ -80,7 +79,7 @@ class FunnelTransformer(nn.Module):
         for block_index in hparams.rezero_blocks:
             self.blocks[block_index].activate_rezero()
 
-        self.attention_state = AttentionState(hparams)
+        self.attention_state = shared_attention_state or AttentionState(hparams)
 
     def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None) -> Dict[str, Any]:
         config = self.hparams
@@ -112,12 +111,7 @@ class FunnelTransformer(nn.Module):
         if len(hidden_states) > 0:
             output['hidden_states'] = hidden_states
 
-        if config.return_attention_state:
-            attn_state.reset(keep_masks=True)
-            output['attention_state'] = attn_state
-        else:
-            attn_state.reset()
-        
+        attn_state.reset()
         return output
     
     def enumerate_layers(self) -> Iterator[int, FunnelLayer]:

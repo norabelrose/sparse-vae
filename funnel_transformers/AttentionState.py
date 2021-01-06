@@ -24,7 +24,7 @@ class AttentionState:
 
     # When True, AttentionState will cache a list of all the mask tensors it computes for each block of the model.
     # These masks can then be reused, e.g. by a VAE decoder.
-    cache_masks: bool = True
+    cache_masks: bool = False
 
     # Private variables
     _current_block: int = field(init=False, default=0)
@@ -68,7 +68,7 @@ class AttentionState:
         # By default, mask out all the padding tokens
         pad_id = self.hparams.pad_id
         if input_mask is None and pad_id is not None:
-            input_mask = (x == pad_id).float()
+            input_mask = torch.eq(x, pad_id).float()
 
         self.input_mask = input_mask
 
@@ -121,13 +121,13 @@ class AttentionState:
                 self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
 
     # This method should be called at the end of a forward pass
-    def reset(self, keep_masks: bool = False):
+    def reset(self):
         self._current_block = 0
         self.input_mask = None
         self.not_cls_mask = None
         self.segment_mask = None
 
-        if not keep_masks:
+        if self.cache_masks:
             self._mask_stack.clear()
 
     # Either downsample or upsample the tensor, whichever is appropriate for the current block.
@@ -327,7 +327,7 @@ class AttentionState:
             # Pre-compute and cache the rel_pos_id for all blocks
             pos_id = torch.arange(seq_len, dtype=dtype, device=device)
 
-            #### Attn(pooled-q, pooled-kv) type
+            # Attn(pooled-q, pooled-kv) type
             pos_enc_2 = self._pos_ids_to_encoding(q_ids=pos_id, q_stride=1, k_ids=pos_id, k_stride=1,
                                                   gather_source=pos_enc, zero_offset=zero_offset, d_model=d_model)
             self._pos_encodings.append([pos_enc_2])
@@ -356,7 +356,7 @@ class AttentionState:
                 else:
                     pooled_pos_id = pos_id[::scaling_factor]
 
-                #### pos_enc_1 == Attn(pooled-q, unpooled-kv) and pos_enc_2 == Attn(pooled-q, pooled-kv)
+                # pos_enc_1 == Attn(pooled-q, unpooled-kv) and pos_enc_2 == Attn(pooled-q, pooled-kv)
                 pos_enc_2 = self._pos_ids_to_encoding(q_ids=pooled_pos_id, q_stride=q_stride, k_ids=pos_id,
                                                       k_stride=k_stride, gather_source=pos_enc,
                                                       zero_offset=zero_offset, d_model=d_model)
