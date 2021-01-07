@@ -1,6 +1,7 @@
 from .Datasets import *
 
 
+# noinspection PyAbstractClass
 class FunnelPreTrainingDataModule(TextVaeDataModule):
     dataset_name: ClassVar[str] = 'funnel_pretraining'
 

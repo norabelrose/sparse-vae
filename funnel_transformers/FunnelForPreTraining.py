@@ -5,6 +5,7 @@ from collections import defaultdict
 from copy import deepcopy
 from itertools import chain
 from torch import nn, Tensor
+import numpy as np
 import pytorch_lightning as pl
 import torch.nn.functional as F
 import torch
@@ -37,8 +38,8 @@ class FunnelForPreTraining(pl.LightningModule):
         generator_hparams.num_heads //= 4
 
         # Generator at index 0, discriminator at index 1
-        self.encoders = [FunnelTransformer(generator_hparams), FunnelTransformer(discriminator_hparams)]
-        self.decoders = [FunnelBlock(generator_hparams, 2), FunnelBlock(discriminator_hparams, 2)]
+        self.encoders = nn.ModuleList([FunnelTransformer(generator_hparams), FunnelTransformer(discriminator_hparams)])
+        self.decoders = nn.ModuleList([FunnelBlock(generator_hparams, 2), FunnelBlock(discriminator_hparams, 2)])
 
         self.mlm_head = nn.Sequential(
             nn.Linear(generator_hparams.d_model, generator_hparams.d_model),
@@ -180,8 +181,8 @@ class FunnelForPreTraining(pl.LightningModule):
 
             # If we don't copy the weights we get a "The given NumPy array is not writeable, and PyTorch does not
             # support non-writeable tensors" warning
-            weights = deepcopy(weights)
-            weights.setflags(write=1)
+            weights = np.copy(weights)
+            weights.setflags(write=True)
             return torch.from_numpy(weights)
 
         def copy_tf_params_with_prefix(param_iterator: Iterator[Tuple[str, torch.nn.Parameter, int]], prefix: str):

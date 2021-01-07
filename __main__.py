@@ -1,5 +1,5 @@
 from argparse import ArgumentParser, Namespace
-from pytorch_lightning import Trainer
+from pytorch_lightning import Trainer, LightningDataModule
 from typing import Mapping, MutableMapping, Sequence
 from .Autoencoder import Autoencoder
 from .funnel_transformers.FunnelForPreTraining import FunnelForPreTraining
@@ -46,6 +46,7 @@ def get_hparam_dict_from_args(args: Namespace, defaults: MutableMapping):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser = Trainer.add_argparse_args(parser)
+    parser = LightningDataModule.add_argparse_args(parser)
 
     subparsers = parser.add_subparsers(dest='command')
     finetune = subparsers.add_parser('finetune-funnel')
@@ -58,11 +59,11 @@ if __name__ == "__main__":
 
     if args.command == 'finetune-funnel':
         print("Finetuning a pretrained Funnel Transformer for Performer attention...")
-        data = FunnelPreTrainingDataModule(batch_size=48)
+        data = FunnelPreTrainingDataModule.from_argparse_args(args, batch_size=48)
         model = FunnelForPreTraining(get_hparam_dict_from_args(args, FunnelForPreTraining.default_hparams))
     elif args.command == 'train':
         print("Training a Text VAE...")
-        data = ProjectGutenbergDataModule()
+        data = ProjectGutenbergDataModule.from_argparse_args(args)
         model = Autoencoder(get_hparam_dict_from_args(args, Autoencoder.default_hparams))
     else:
         raise NotImplementedError
