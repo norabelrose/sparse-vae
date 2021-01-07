@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 from itertools import chain, islice
 from pathlib import Path
 from tokenizers import BertWordPieceTokenizer
@@ -6,7 +7,6 @@ from torch.utils.data import DataLoader
 from typing import ClassVar, Dict, List, Optional, Union
 import datasets
 import multiprocessing
-import os
 import pytorch_lightning as pl
 import torch
 
@@ -15,6 +15,11 @@ import torch
 # noinspection PyAbstractClass
 class TextVaeDataModule(pl.LightningDataModule):
     dataset_name: ClassVar[str] = 'dataset'  # Should be overridden by subclasses
+
+    @classmethod
+    def add_argparse_args(cls, parent_parser: ArgumentParser) -> ArgumentParser:
+        parent_parser = super(TextVaeDataModule, cls).add_argparse_args(parent_parser)
+
 
     def __init__(self, batch_size: int = 10, max_sample_length: int = 512, chunk_long_samples: bool = True,
                  dataset_save_dir: Optional[Path] = None):

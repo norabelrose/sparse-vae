@@ -23,6 +23,8 @@ class Autoencoder(pl.LightningModule):
         copy_encoder_weights_to_decoder=True,
         use_autoregressive_decoding=False,
 
+        grad_clip_threshold=200.0,
+        grad_skip_threshold=400.0,
         lr=1e-4,
         warmup_steps=100,
         weight_decay=0.01
@@ -55,23 +57,23 @@ class Autoencoder(pl.LightningModule):
         overt_depth, latent_depth = hparams.latent_depth, hparams.overt_depth
 
         self.decoder_cells = nn.ModuleList(
-            nn.ModuleDict(dict(
-                prior=nn.Conv1d(
+            nn.ModuleDict({
+                'p(z)': nn.Conv1d(
                     in_channels=overt_depth,
-                    out_channels=latent_depth * 2 + overt_depth,    # mu, log sigma, and bias term
+                    out_channels=latent_depth * 2 + overt_depth,    # Mu & log sigma for p(z), and bias term for p(x)
                     kernel_size=1
                 ),
-                q_of_z_given_x=nn.Conv1d(
+                'q(z|x)': nn.Conv1d(
                     in_channels=overt_depth * 2,    # Because we concatenate the encoder and decoder states depthwise
                     out_channels=latent_depth * 2,  # Because we need both mu and log sigma
                     kernel_size=1
                 ),
-                z_upsample=nn.Conv1d(
+                'p(x|z)': nn.Conv1d(
                     in_channels=latent_depth,
                     out_channels=overt_depth,
                     kernel_size=1
                 ),
-            ))
+            })
             for _ in sum(encoder_hparams.block_sizes)
         )
         self.reset_forward_pass_state()
@@ -118,15 +120,6 @@ class Autoencoder(pl.LightningModule):
     def forward(self, batch: Tensor) -> List[Tensor]:
         return self.encoder_funnel(batch)
 
-    def reset_forward_pass_state(self):
-        self.clamped_latents = {}
-        self.encoder_states = None
-        self.temperatures = defaultdict(lambda: 1.0)    # Multiplier for the standard deviation of latent variables
-
-        # We'll initialize these with Tensors on a forward pass when we know what device to use
-        self.total_kl_divergence = None
-        self.total_nonpadding_positions = None
-
     def sample(self, max_length: int, count: int = 1, top_k: int = 1,
                clamped_latents: Optional[Mapping[int, Tensor]] = None,
                temperature: Union[float, Mapping[int, float]] = 1.0) -> Tensor:
@@ -155,8 +148,7 @@ class Autoencoder(pl.LightningModule):
     # Called once for each Transformer layer in the decoder
     def decoder_layer_forward(self, layer_index: int, block_index: int, layer_output: Tensor) -> Tensor:
         cell = self.decoder_cells[layer_index]
-        encoder_state = self.encoder_states[block_index] if self.encoder_states else None
-        prior_output = cell['prior'](layer_output)
+        prior_output = cell['p(z)'](layer_output)
 
         # Convnet output has 3 components: mu, log standard deviation, and a bias term to add to the input
         overt_depth, latent_depth = self.hparams.latent_depth, self.hparams.overt_depth
@@ -181,9 +173,11 @@ class Autoencoder(pl.LightningModule):
             return stddev * noise + mu
 
         # Sample conditioned on the encoder state (used during training)
-        if encoder_state is not None:
+        if self.encoder_states:
+            encoder_state = self.encoder_states[block_index]
+
             q_input = torch.cat([layer_output, encoder_state], dim=-1)
-            q_mu, q_logsigma = cell['q_of_z_given_x'](q_input).chunk(2, dim=-1)
+            q_mu, q_logsigma = cell['q(z|x)'](q_input).chunk(2, dim=-1)
 
             kl_tensor = gaussian_kl_divergence(q_mu, p_mu, q_logsigma, p_logsigma)
             z = sample_diagonal_gaussian_variable(q_mu, q_logsigma)
@@ -204,7 +198,7 @@ class Autoencoder(pl.LightningModule):
         elif not (z := self.clamped_latents.get(layer_index)):
             z = sample_diagonal_gaussian_variable(p_mu, p_logsigma, self.temperatures[layer_index])
 
-        layer_output += cell['z_upsample'](z)
+        layer_output += cell['p(x|z)'](z)
         return layer_output
 
     # Returns the loss
@@ -225,6 +219,26 @@ class Autoencoder(pl.LightningModule):
         self.reset_forward_pass_state()
 
         return {'loss': negative_elbo, 'log': {'kl': kl_divergence, 'nll': negative_log_likelihood}}
+
+    def reset_forward_pass_state(self):
+        self.clamped_latents = {}
+        self.encoder_states = None
+        self.temperatures = defaultdict(lambda: 1.0)    # Multiplier for the standard deviation of latent variables
+
+        self.total_kl_divergence = None
+        self.total_nonpadding_positions = None
+
+    # Implements gradient skipping to stabilize training as described in 'Very Deep VAEs'
+    def on_after_backward(self):
+        # Don't clip at all if .grad_clip_threshold is falsy
+        if not (clip_threshold := self.hparams.grad_clip_threshold):
+            return
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), clip_threshold)
+        if grad_norm > self.hparams.grad_skip_threshold:
+            self.zero_grad()
+
+        self.log('grad_norm', grad_norm)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Any]:
         return self.training_step(batch, batch_index)
