@@ -147,7 +147,8 @@ class RelativePositionalAttention(nn.Module):
 
         if self.hparams.use_performer_attention:
             # "Funnel Transformers" page 13, formula 8 and page 14, final formula of section A.2
-            q_i = (q + self.r_r_bias) @ self.r_kernel.transpose(-2, -1)
+            r_r = self.r_r_bias
+            q_i = (q + r_r) @ self.r_kernel.transpose(-2, -1)
 
             # See the trigonometric identities in the paper on page 14
             phi_i, pi_i, psi_j, omega_j = attn_state.positional_encoding
@@ -176,7 +177,8 @@ class RelativePositionalAttention(nn.Module):
 
         else:
             # content based attention score
-            content_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * self.normalizer
+            r_w = self.r_w_bias[:, None, :]
+            content_score = (q + r_w) @ k.transpose(-2, -1) * self.normalizer
             
             pos_bias = self._attn_pos_term(q, k.size(-2), attn_state)
             seg_bias = self._attn_seg_term(attn_state.segment_mask, q, attn_state)
@@ -240,10 +242,11 @@ class RelativePositionalAttention(nn.Module):
     # A^{position} in the paper
     def _attn_pos_term(self, q, k_len, attn_state: AttentionState):
         pos_enc = attn_state.positional_encoding
+        r_r = self.r_r_bias[:, None, :]
 
         if self.attn_type == "factorized":
             enc_q_1, enc_q_2, enc_k_1, enc_k_2 = pos_enc    # seq_len, d_model
-            q_r = (q + self.r_r_bias) @ self.r_kernel.transpose(-2, -1) * self.normalizer
+            q_r = (q + r_r) @ self.r_kernel.transpose(-2, -1) * self.normalizer
 
             # Broadcast positional encodings across the batch and head dimensions
             q_r_1 = q_r * enc_q_1
@@ -255,7 +258,7 @@ class RelativePositionalAttention(nn.Module):
             shift = 1 + attn_state.block_begin_flag
 
             # Funnel Transformer paper, page 13
-            bd = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
+            bd = (q + r_r) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
             bd = self._rel_shift(bd, -2, k_len, shift)
         else:
             raise NotImplementedError

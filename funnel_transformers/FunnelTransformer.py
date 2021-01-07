@@ -50,11 +50,11 @@ class FunnelTransformer(nn.Module):
     def __init__(self, hparams: MutableMapping[str, Any], shared_attention_state: Optional[AttentionState] = None):
         super().__init__()
 
-        if hparams['use_performer_attention']:
+        if hparams.get('use_performer_attention'):
             assert 'attention_type' not in hparams or hparams['attention_type'] == 'factorized',\
                 "Performer attention is not compatible with the relative shift method of relative positional attention."
             hparams['attention_type'] = 'factorized'
-        
+
         hparams = merge(self.default_hparams, hparams)
 
         # Make it so scaling_factors and block_sizes are equal length; last scaling factor is 1 (no scaling)

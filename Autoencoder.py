@@ -119,6 +119,7 @@ class Autoencoder(pl.LightningModule):
         return self.encoder_funnel(batch)
 
     def reset_forward_pass_state(self):
+        self.clamped_latents = {}
         self.encoder_states = None
         self.temperatures = defaultdict(lambda: 1.0)    # Multiplier for the standard deviation of latent variables
 
@@ -126,8 +127,13 @@ class Autoencoder(pl.LightningModule):
         self.total_kl_divergence = None
         self.total_nonpadding_positions = None
 
-    def sample(self, max_length: int, count: int = 1, temperature: Union[float, Mapping[int, float]] = 1.0,
-               top_k: int = 1) -> Tensor:
+    def sample(self, max_length: int, count: int = 1, top_k: int = 1,
+               clamped_latents: Optional[Mapping[int, Tensor]] = None,
+               temperature: Union[float, Mapping[int, float]] = 1.0) -> Tensor:
+        # Allow for style transfer-type experiments
+        if clamped_latents:
+            self.clamped_latents = clamped_latents
+
         # The temperature parameter can either be a Mapping that assigns different temperatures to different layer
         # indices, or a single float for all layers
         if isinstance(temperature, Mapping):
@@ -166,9 +172,9 @@ class Autoencoder(pl.LightningModule):
             return term1 + term2
 
         @torch.jit.script
-        def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor, temperature: float) -> Tensor:
+        def sample_diagonal_gaussian_variable(mu: Tensor, logsigma: Tensor, temperature: float = 1.0) -> Tensor:
             noise = torch.empty_like(mu).normal_(0., 1.)    # Reparameterization trick
-            stddev = torch.exp(logsigma)
+            stddev = logsigma.exp()
             if temperature != 1.0:
                 stddev *= temperature
 
@@ -179,8 +185,8 @@ class Autoencoder(pl.LightningModule):
             q_input = torch.cat([layer_output, encoder_state], dim=-1)
             q_mu, q_logsigma = cell['q_of_z_given_x'](q_input).chunk(2, dim=-1)
 
-            z = sample_diagonal_gaussian_variable(q_mu, q_logsigma, self.temperatures[layer_index])
             kl_tensor = gaussian_kl_divergence(q_mu, p_mu, q_logsigma, p_logsigma)
+            z = sample_diagonal_gaussian_variable(q_mu, q_logsigma)
 
             # Gives us the appropriately scaled mask for the current block
             padding_mask = self.decoder_funnel.attention_state.input_mask
@@ -195,7 +201,7 @@ class Autoencoder(pl.LightningModule):
             self.total_nonpadding_positions += (~padding_mask).sum()
 
         # Sample unconditionally (used during evaluation/generation)
-        else:
+        elif not (z := self.clamped_latents.get(layer_index)):
             z = sample_diagonal_gaussian_variable(p_mu, p_logsigma, self.temperatures[layer_index])
 
         layer_output += cell['z_upsample'](z)

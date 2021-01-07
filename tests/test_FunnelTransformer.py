@@ -3,7 +3,6 @@ import os
 import torch
 import unittest
 from contextlib import nullcontext
-from tqdm.auto import tqdm
 from ..funnel_transformers.FunnelTransformer import FunnelTransformer
 
 # This should be set to wherever the 'pytorch' directory of original Funnel-Transformer package is on your system
@@ -42,7 +41,7 @@ class TestFunnelTransformer(unittest.TestCase):
         
         with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext(), torch.no_grad():
             for attn_type in ("factorized", "rel_shift"):
-                new_model = FunnelTransformer(dict(return_block_outputs=True, attention_type=attn_type))
+                new_model = FunnelTransformer(dict(attention_type=attn_type))
                 new_model.load_pretrained_weights()
                 new_model.eval()
                 
@@ -65,7 +64,7 @@ class TestFunnelTransformer(unittest.TestCase):
                 
                 output_old = old_model(inputs)
                 output_new = new_model(inputs)
-                mean_err = torch.mean(abs(output_old[0][-1] - output_new[-1]))
+                mean_err = torch.mean(abs(output_old[0][-1] - output_new['output']))
         
                 print('Mean absolute error: ', mean_err.item())
                 print('Old output: ', output_old[0][4::4])

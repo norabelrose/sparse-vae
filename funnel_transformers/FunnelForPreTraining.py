@@ -58,6 +58,8 @@ class FunnelForPreTraining(pl.LightningModule):
             nn.GELU(),
             nn.Linear(discriminator_hparams.d_model, 1)
         )
+        # Tie the embedding weight matrices
+        self.mlm_head[0].weight = self.encoders['generator'].input_layer[0].weight
 
         # Freeze the generator weights if indicated
         if not hparams.train_generator:
@@ -179,10 +181,6 @@ class FunnelForPreTraining(pl.LightningModule):
 
                 if adam_m is not None and adam_v is not None:
                     self.optimizer_state[param] = dict(exp_avg=adam_m, exp_avg_sq=adam_v, step=1)
-
-            # Don't forget to transpose the Dense layer weight matrices when converting to PyTorch
-            if 'kernel' in tf_name:
-                weights = weights.T
 
             # If we don't copy the weights we get a "The given NumPy array is not writeable, and PyTorch does not
             # support non-writeable tensors" warning

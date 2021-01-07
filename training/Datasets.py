@@ -16,7 +16,8 @@ import torch
 class TextVaeDataModule(pl.LightningDataModule):
     dataset_name: ClassVar[str] = 'dataset'  # Should be overridden by subclasses
 
-    def __init__(self, batch_size: int = 10, max_sample_length: int = 512, chunk_long_samples: bool = True):
+    def __init__(self, batch_size: int = 10, max_sample_length: int = 512, chunk_long_samples: bool = True,
+                 dataset_save_dir: Optional[Path] = None):
         super(TextVaeDataModule, self).__init__()
 
         self.batch_size = batch_size
@@ -28,8 +29,11 @@ class TextVaeDataModule(pl.LightningDataModule):
         self.tokenizer = BertWordPieceTokenizer.from_file(str(vocab_path), lowercase=True)
 
         # Get path to store the processed dataset
-        cache_dir = Path(os.getenv('XDG_CACHE_HOME', '~/.cache'))
-        self.dataset_dir = cache_dir.expanduser() / 'text_vae' / 'datasets'
+        if not dataset_save_dir:
+            self.dataset_dir = Path.cwd() / 'text-vae-datasets'
+        else:
+            self.dataset_dir = dataset_save_dir
+
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
 
     # Subclass hook
