@@ -93,8 +93,8 @@ class FunnelForPreTraining(pl.LightningModule):
         def _encoder_decoder_forward(inputs: Tensor, model_type: str) -> Tensor:
             encoder, decoder = self.encoders[model_type], self.decoders[model_type]
 
-            encoder_output, hidden_states = encoder(inputs)
-            decoder_input = encoder_output + hidden_states[0]  # Residual connection
+            result = encoder(inputs)
+            decoder_input = result['output'] + result['hidden_states'][0]  # Residual connection
             return decoder(decoder_input)
 
         # Train generator

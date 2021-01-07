@@ -56,30 +56,24 @@ class Autoencoder(pl.LightningModule):
         self.decoder_seed = nn.Parameter(torch.zeros(1, 1, hparams.d_model))
         overt_depth, latent_depth = hparams.latent_depth, hparams.overt_depth
 
+        # Construct the decoder cells which generate p(z), q(z|x), and p(x|z) given the output of a Transformer layer
+        def linear_with_gelu(input_dim, output_dim):
+            # Note that we apply the activation function FIRST and then the Linear layer
+            return nn.Sequential(nn.GELU(), nn.Linear(input_dim, output_dim))
+
         self.decoder_cells = nn.ModuleList(
             nn.ModuleDict({
-                'p(z)': nn.Conv1d(
-                    in_channels=overt_depth,
-                    out_channels=latent_depth * 2 + overt_depth,    # Mu & log sigma for p(z), and bias term for p(x)
-                    kernel_size=1
-                ),
-                'q(z|x)': nn.Conv1d(
-                    in_channels=overt_depth * 2,    # Because we concatenate the encoder and decoder states depthwise
-                    out_channels=latent_depth * 2,  # Because we need both mu and log sigma
-                    kernel_size=1
-                ),
-                'p(x|z)': nn.Conv1d(
-                    in_channels=latent_depth,
-                    out_channels=overt_depth,
-                    kernel_size=1
-                ),
+                # Output contains mu & log sigma for p(z), and bias term for p(x)
+                'p(z)': linear_with_gelu(overt_depth, latent_depth * 2 + overt_depth),
+                # Input is the encoder and decoder states concatenated depthwise, output is mu & log sigma for q(z|x)
+                'q(z|x)': linear_with_gelu(overt_depth * 2, latent_depth * 2),
+                'p(x|z)': linear_with_gelu(latent_depth, overt_depth),
             })
             for _ in sum(encoder_hparams.block_sizes)
         )
-        self.reset_forward_pass_state()
 
-        # After each layer in the decoder, call decoder_forward with the layer's output and the corresponding
-        # ModuleDict with the corresponding Conv1d modules
+        # After each layer in the decoder, call decoder_layer_forward with the layer's output and the corresponding
+        # ModuleDict with the corresponding Linear modules
         absolute_idx = 0
         for block_idx, block in enumerate(self.decoder_funnel.blocks):
             for layer in block.layers:
@@ -120,7 +114,7 @@ class Autoencoder(pl.LightningModule):
     def forward(self, batch: Tensor) -> List[Tensor]:
         return self.encoder_funnel(batch)
 
-    def sample(self, max_length: int, count: int = 1, top_k: int = 1,
+    def sample(self, max_length: int, count: int = 1, top_k: int = 1, return_latents: bool = False,
                clamped_latents: Optional[Mapping[int, Tensor]] = None,
                temperature: Union[float, Mapping[int, float]] = 1.0) -> Tensor:
         # Allow for style transfer-type experiments
@@ -130,6 +124,7 @@ class Autoencoder(pl.LightningModule):
         # The temperature parameter can either be a Mapping that assigns different temperatures to different layer
         # indices, or a single float for all layers
         if isinstance(temperature, Mapping):
+            self.temperatures = defaultdict(lambda: 1.0)
             self.temperatures.update(temperature)
         elif isinstance(temperature, float):
             self.temperatures = defaultdict(lambda: temperature)
@@ -143,6 +138,8 @@ class Autoencoder(pl.LightningModule):
         output_logits: Tensor = self.decoder_funnel(seed)['logits']  # (batch, seq_len, vocab_size)
         output_ids = output_logits.topk(top_k, dim=-1)
 
+        self.clamped_latents = {}
+        self.temperatures = defaultdict(lambda: 1.0)
         return output_ids
 
     # Called once for each Transformer layer in the decoder
@@ -186,11 +183,6 @@ class Autoencoder(pl.LightningModule):
             padding_mask = self.decoder_funnel.attention_state.input_mask
             kl_tensor.masked_fill_(padding_mask, 0.0)       # Ignore KL divergences for padding positions
 
-            if self.total_kl_divergence is None:
-                # Now we know the device to use
-                self.total_kl_divergence = torch.tensor(0.0, device=kl_tensor.device)
-                self.total_nonpadding_positions = torch.tensor(0, device=padding_mask.device)
-
             self.total_kl_divergence += kl_tensor.sum()
             self.total_nonpadding_positions += (~padding_mask).sum()
 
@@ -204,29 +196,25 @@ class Autoencoder(pl.LightningModule):
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Any]:
         input_tokens = batch['token_ids']
-        padding_mask = self.decoder_funnel.attention_state.input_mask
         self.encoder_states = self(input_tokens)
+
+        # These attributes will be updated on each pass of decoder_layer_forward()
+        device = input_tokens.device
+        self.total_kl_divergence = torch.tensor(0.0, device=device)
+        self.total_nonpadding_positions = torch.tensor(0, device=device)
 
         seed = self.decoder_seed.expand_as(self.encoder_states[-1])
         output_logits: Tensor = self.decoder_funnel(seed)['logits']    # (batch, seq_len, vocab_size)
+        self.encoder_states = None
 
         # We have to be careful to exclude padding positions from our KL divergence calculation
         kl_divergence = self.total_kl_divergence / (self.total_nonpadding_positions * self.hparams.latent_depth)
 
+        padding_mask = self.decoder_funnel.attention_state.input_mask
         negative_log_likelihood = F.nll_loss(output_logits, target=input_tokens, weight=~padding_mask)
+
         negative_elbo = kl_divergence + negative_log_likelihood
-
-        self.reset_forward_pass_state()
-
         return {'loss': negative_elbo, 'log': {'kl': kl_divergence, 'nll': negative_log_likelihood}}
-
-    def reset_forward_pass_state(self):
-        self.clamped_latents = {}
-        self.encoder_states = None
-        self.temperatures = defaultdict(lambda: 1.0)    # Multiplier for the standard deviation of latent variables
-
-        self.total_kl_divergence = None
-        self.total_nonpadding_positions = None
 
     # Implements gradient skipping to stabilize training as described in 'Very Deep VAEs'
     def on_after_backward(self):
