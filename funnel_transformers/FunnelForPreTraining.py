@@ -37,9 +37,14 @@ class FunnelForPreTraining(pl.LightningModule):
         generator_hparams.d_model //= 4
         generator_hparams.num_heads //= 4
 
-        # Generator at index 0, discriminator at index 1
-        self.encoders = nn.ModuleList([FunnelTransformer(generator_hparams), FunnelTransformer(discriminator_hparams)])
-        self.decoders = nn.ModuleList([FunnelBlock(generator_hparams, 2), FunnelBlock(discriminator_hparams, 2)])
+        self.encoders = nn.ModuleDict({
+            'generator': FunnelTransformer(generator_hparams),
+            'discriminator': FunnelTransformer(discriminator_hparams)
+        })
+        self.decoders = nn.ModuleDict({
+            'generator': FunnelBlock(generator_hparams, 2),
+            'discriminator': FunnelBlock(discriminator_hparams, 2)
+        })
 
         self.mlm_head = nn.Sequential(
             nn.Linear(generator_hparams.d_model, generator_hparams.d_model),
@@ -56,8 +61,8 @@ class FunnelForPreTraining(pl.LightningModule):
 
         # Freeze the generator weights if indicated
         if not hparams.train_generator:
-            self.encoders[0].requires_grad_(False)
-            self.decoders[0].requires_grad_(False)
+            self.encoders['generator'].requires_grad_(False)
+            self.decoders['generator'].requires_grad_(False)
 
         if hparams.use_pretrained_weights:
             url = remote_model_url_for_hparams(discriminator_hparams, suffix="-FULL-TF")
@@ -66,25 +71,25 @@ class FunnelForPreTraining(pl.LightningModule):
     def configure_optimizers(self):
         # See Funnel Transformer paper, page 15
         adam_hparams = transmute(self.hparams, 'weight_decay', 'lr', eps='adam_eps')
-        discriminator_params = chain(self.encoders[1].parameters(), self.decoders[1].parameters())
-        discriminator_opt = torch.optim.AdamW(**adam_hparams, params=discriminator_params)
+        discr_params = chain(self.encoders['discriminator'].parameters(), self.decoders['discriminator'].parameters())
+        discr_opt = torch.optim.AdamW(**adam_hparams, params=discr_params)
 
         if self.hparams.use_pretrained_adam_state:
-            discriminator_opt.state = self.optimizer_state
+            discr_opt.state = self.optimizer_state
             del self.optimizer_state
 
         if self.hparams.train_generator:
-            generator_params = chain(self.encoders[0].parameters(), self.decoders[0].parameters())
+            generator_params = chain(self.encoders['generator'].parameters(), self.decoders['generator'].parameters())
             generator_opt = torch.optim.AdamW(**adam_hparams, params=generator_params)
-            return [generator_opt, discriminator_opt], []
+            return [generator_opt, discr_opt], []
         else:
-            return discriminator_opt
+            return discr_opt
 
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, optimizer_index: int) -> Tensor:
         # Either generator or discriminator forward pass
-        def _encoder_decoder_forward(inputs: Tensor, model_index: int) -> Tensor:
-            encoder, decoder = self.encoders[model_index], self.decoders[model_index]
+        def _encoder_decoder_forward(inputs: Tensor, model_type: str) -> Tensor:
+            encoder, decoder = self.encoders[model_type], self.decoders[model_type]
 
             encoder_output, hidden_states = encoder(inputs)
             decoder_input = encoder_output + hidden_states[0]  # Residual connection
@@ -99,7 +104,7 @@ class FunnelForPreTraining(pl.LightningModule):
             masked_text, labels = batch['token_ids'], batch['labels']
 
             # Probability distribution over tokens: (batch, seq_len, vocab_size)
-            generator_logits = _encoder_decoder_forward(masked_text, 0)['logits']
+            generator_logits = _encoder_decoder_forward(masked_text, 'generator')['logits']
 
             # Sample from the distribution (Gumbel softmax). Greedy sampling, plus some noise.
             noise = torch.rand_like(generator_logits)
@@ -112,8 +117,8 @@ class FunnelForPreTraining(pl.LightningModule):
             is_groundtruth = torch.eq(samples, labels)
 
             # For each token, the probability that matches the ground truth input.
-            discriminator_logits = _encoder_decoder_forward(samples, 1)['logits']
-            padding_mask = self.encoders[1].attention_state.input_mask
+            discriminator_logits = _encoder_decoder_forward(samples, 'discriminator')['logits']
+            padding_mask = self.encoders['discriminator'].attention_state.input_mask
             return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=~padding_mask)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
@@ -199,7 +204,7 @@ class FunnelForPreTraining(pl.LightningModule):
         if self.hparams.use_pretrained_adam_state:
             self.optimizer_state = defaultdict(dict)
 
-        copy_params_with_mapping(self.encoders[1].input_layer, prefix='model/input/', mapping={
+        copy_params_with_mapping(self.encoders['discriminator'].input_layer, prefix='model/input/', mapping={
             '0.weight': 'word_embedding/lookup_table',
             '1.bias': 'layer_norm/beta',
             '1.weight': 'layer_norm/gamma'
@@ -219,14 +224,14 @@ class FunnelForPreTraining(pl.LightningModule):
         })
 
         num_encoder_layers = sum(self.hparams.funnel_hparams.block_sizes)
-        def decoder_param_iterator(decoder: FunnelBlock):
+        def decoder_param_iterator(decoder: nn.Module):
             for i, layer in enumerate(decoder.layers):
                 for var_name, param in layer.named_parameters():
                     yield var_name, param, i + num_encoder_layers
 
-        copy_tf_params_with_prefix(self.encoders[1].enumerate_parameters_by_layer(), 'model/encoder/')
-        copy_tf_params_with_prefix(self.encoders[0].enumerate_parameters_by_layer(), 'generator/encoder/')
-        copy_tf_params_with_prefix(decoder_param_iterator(self.decoders[1]), 'model/decoder/')
-        copy_tf_params_with_prefix(decoder_param_iterator(self.decoders[0]), 'generator/decoder/')
+        copy_tf_params_with_prefix(self.encoders['discriminator'].enumerate_parameters_by_layer(), 'model/encoder/')
+        copy_tf_params_with_prefix(self.encoders['generator'].enumerate_parameters_by_layer(), 'generator/encoder/')
+        copy_tf_params_with_prefix(decoder_param_iterator(self.decoders['discriminator']), 'model/decoder/')
+        copy_tf_params_with_prefix(decoder_param_iterator(self.decoders['generator']), 'generator/decoder/')
 
         print("Finished.")
