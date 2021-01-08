@@ -197,9 +197,11 @@ class FunnelForPreTraining(pl.LightningModule):
             for name, param in module.named_parameters():
                 if tf_name := mapping.get(name):
                     # noinspection PyTypeChecker
-                    param.data = get_tf_param(prefix + tf_name, param)
-                    if transpose and len(param.data.shape) > 1:
-                        param.data.transpose_(-2, -1)
+                    tensor = get_tf_param(prefix + tf_name, param)
+                    if transpose and len(tensor.shape) > 1:
+                        tensor.transpose_(-2, -1)
+
+                    param.data = tensor
 
         # Store the Adam optimizer state in a temporary attribute until configure_optimizers() is called
         if self.hparams.use_pretrained_adam_state:
