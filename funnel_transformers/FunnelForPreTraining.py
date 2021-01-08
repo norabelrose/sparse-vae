@@ -193,11 +193,13 @@ class FunnelForPreTraining(pl.LightningModule):
             for key_string, param, abs_index in param_iterator:
                 copy_tf_param(key_string, param, abs_index, prefix)
 
-        def copy_params_with_mapping(module: nn.Module, mapping: Dict[str, str], prefix=""):
+        def copy_params_with_mapping(module: nn.Module, mapping: Dict[str, str], prefix="", transpose=False):
             for name, param in module.named_parameters():
                 if tf_name := mapping.get(name):
                     # noinspection PyTypeChecker
                     param.data = get_tf_param(prefix + tf_name, param)
+                    if transpose:
+                        param.data.transpose_(-2, -1)
 
         # Store the Adam optimizer state in a temporary attribute until configure_optimizers() is called
         if self.hparams.use_pretrained_adam_state:
@@ -212,8 +214,8 @@ class FunnelForPreTraining(pl.LightningModule):
         copy_params_with_mapping(gen_input, prefix='generator/encoder/', mapping={
             '1.bias': 'input_projection/bias',
             '1.weight': 'input_projection/kernel'
-        })
-        gen_input[0].weight.data = discr_input.input_layer[0].weight.data   # Tie embedding weights
+        }, transpose=True)
+        gen_input[0].weight.data = discr_input[0].weight.data   # Tie embedding weights
 
         copy_params_with_mapping(self.mlm_head, prefix='generator/', mapping={
             '0.bias': 'lm_proj/dense/bias',
