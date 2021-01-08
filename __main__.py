@@ -1,6 +1,7 @@
 from argparse import ArgumentParser, Namespace
 from pytorch_lightning import Trainer, LightningDataModule
 from typing import Mapping, MutableMapping, Sequence
+import warnings
 from .Autoencoder import Autoencoder
 from .funnel_transformers.FunnelForPreTraining import FunnelForPreTraining
 from .training.Datasets import ProjectGutenbergDataModule

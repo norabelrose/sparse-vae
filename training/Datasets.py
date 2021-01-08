@@ -9,6 +9,7 @@ import datasets
 import multiprocessing
 import pytorch_lightning as pl
 import torch
+import warnings
 
 
 # Base class for Text VAE data modules- takes care of boilerplate
@@ -24,6 +25,9 @@ class TextVaeDataModule(pl.LightningDataModule):
     def __init__(self, batch_size: int = 10, max_sample_length: int = 512, chunk_long_samples: bool = True,
                  dataset_save_dir: Optional[Path] = None):
         super(TextVaeDataModule, self).__init__()
+
+        # These warnings seem to pop up due to a bug in PyTorch which was fixed in PR #47160
+        warnings.filterwarnings('ignore', message='The given NumPy array is not writeable')
 
         self.batch_size = batch_size
         self.chunk_long_samples = chunk_long_samples
@@ -93,7 +97,8 @@ class TextVaeDataModule(pl.LightningDataModule):
                           num_workers=multiprocessing.cpu_count(), pin_memory=True)
 
     def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
-        return DataLoader(self.dataset['test'], batch_size=self.batch_size, collate_fn=self.collate)
+        return DataLoader(self.dataset['test'], batch_size=self.batch_size, collate_fn=self.collate,
+                          num_workers=multiprocessing.cpu_count(), pin_memory=True)
 
     def test_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return self.val_dataloader()

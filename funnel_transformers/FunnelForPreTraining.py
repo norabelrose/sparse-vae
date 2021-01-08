@@ -60,7 +60,7 @@ class FunnelForPreTraining(pl.LightningModule):
             nn.Linear(discriminator_hparams.d_model, 1)
         )
         # Tie the embedding weight matrices
-        self.mlm_head[0].weight = self.encoders['generator'].input_layer[0].weight
+        self.mlm_head[0].weight.data = self.encoders['generator'].input_layer[0].weight.data
 
         # Freeze the generator weights if indicated
         if not hparams.train_generator:
@@ -172,7 +172,7 @@ class FunnelForPreTraining(pl.LightningModule):
             param.data = get_tf_param(tf_name, param)
 
         def get_tf_param(tf_name: str, param: nn.Parameter):
-            weights = reader.get_tensor(tf_name)
+            weights = tf.train.load_variable(path, tf_name)
             if weights is None and strict:
                 return None
 
@@ -185,9 +185,7 @@ class FunnelForPreTraining(pl.LightningModule):
 
             # If we don't copy the weights we get a "The given NumPy array is not writeable, and PyTorch does not
             # support non-writeable tensors" warning
-            weights = np.copy(weights)
-            weights.setflags(write=True)
-            return torch.from_numpy(weights)
+            return torch.from_numpy(weights.copy())
 
         def copy_tf_params_with_prefix(param_iterator: Iterator[Tuple[str, torch.nn.Parameter, int]], prefix: str):
             for key_string, param, abs_index in param_iterator:
@@ -198,8 +196,9 @@ class FunnelForPreTraining(pl.LightningModule):
                 if tf_name := mapping.get(name):
                     # noinspection PyTypeChecker
                     tensor = get_tf_param(prefix + tf_name, param)
+                    print(f"Name: {tf_name} tensor shape: {tensor.shape}")
                     if transpose and len(tensor.shape) > 1:
-                        tensor.transpose_(-2, -1)
+                        tensor = tensor.transpose(-2, -1)
 
                     param.data = tensor
 

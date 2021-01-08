@@ -97,6 +97,7 @@ class FunnelTransformer(nn.Module):
         hidden_states = []
 
         if not config.upsampling:
+            breakpoint()
             x = self.input_layer(x)  # x.shape == (batch, length, d_model)
         
         attn_state = self.attention_state
