@@ -20,13 +20,13 @@ class TextVaeDataModule(pl.LightningDataModule):
     @classmethod
     def add_argparse_args(cls, parent_parser: ArgumentParser) -> ArgumentParser:
         parent_parser = super(TextVaeDataModule, cls).add_argparse_args(parent_parser)
-
+        return parent_parser
 
     def __init__(self, batch_size: int = 10, max_sample_length: int = 512, chunk_long_samples: bool = True,
                  dataset_save_dir: Optional[Path] = None):
         super(TextVaeDataModule, self).__init__()
 
-        # These warnings seem to pop up due to a bug in PyTorch which was fixed in PR #47160
+        # These warnings are spurious and seem to pop up due to a bug in PyTorch which was fixed in PR #47160
         warnings.filterwarnings('ignore', message='The given NumPy array is not writeable')
 
         self.batch_size = batch_size
@@ -38,11 +38,7 @@ class TextVaeDataModule(pl.LightningDataModule):
         self.tokenizer = BertWordPieceTokenizer.from_file(str(vocab_path), lowercase=True)
 
         # Get path to store the processed dataset
-        if not dataset_save_dir:
-            self.dataset_dir = Path.cwd() / 'text-vae-datasets'
-        else:
-            self.dataset_dir = dataset_save_dir
-
+        self.dataset_dir = dataset_save_dir or Path.cwd() / 'text-vae-datasets'
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
 
     # Subclass hook

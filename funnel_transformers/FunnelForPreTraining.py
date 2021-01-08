@@ -5,7 +5,6 @@ from collections import defaultdict
 from copy import deepcopy
 from itertools import chain
 from torch import nn, Tensor
-import numpy as np
 import pytorch_lightning as pl
 import torch.nn.functional as F
 import torch
@@ -172,7 +171,7 @@ class FunnelForPreTraining(pl.LightningModule):
             param.data = get_tf_param(tf_name, param)
 
         def get_tf_param(tf_name: str, param: nn.Parameter):
-            weights = tf.train.load_variable(path, tf_name)
+            weights = reader.get_tensor(tf_name)
             if weights is None and strict:
                 return None
 
@@ -183,24 +182,24 @@ class FunnelForPreTraining(pl.LightningModule):
                 if adam_m is not None and adam_v is not None:
                     self.optimizer_state[param] = dict(exp_avg=adam_m, exp_avg_sq=adam_v, step=1)
 
-            # If we don't copy the weights we get a "The given NumPy array is not writeable, and PyTorch does not
-            # support non-writeable tensors" warning
-            return torch.from_numpy(weights.copy())
+            tensor = torch.from_numpy(weights)
+
+            # Align the shapes if need be
+            old_shape, new_shape = list(param.data.shape), list(tensor.shape)
+            if old_shape != new_shape and sorted(old_shape) == sorted(new_shape):
+                tensor = tensor.permute(*[new_shape.index(x) for x in old_shape])
+
+            return tensor
 
         def copy_tf_params_with_prefix(param_iterator: Iterator[Tuple[str, torch.nn.Parameter, int]], prefix: str):
             for key_string, param, abs_index in param_iterator:
                 copy_tf_param(key_string, param, abs_index, prefix)
 
-        def copy_params_with_mapping(module: nn.Module, mapping: Dict[str, str], prefix="", transpose=False):
+        def copy_params_with_mapping(module: nn.Module, mapping: Dict[str, str], prefix=""):
             for name, param in module.named_parameters():
                 if tf_name := mapping.get(name):
                     # noinspection PyTypeChecker
-                    tensor = get_tf_param(prefix + tf_name, param)
-                    print(f"Name: {tf_name} tensor shape: {tensor.shape}")
-                    if transpose and len(tensor.shape) > 1:
-                        tensor = tensor.transpose(-2, -1)
-
-                    param.data = tensor
+                    param.data = get_tf_param(prefix + tf_name, param)
 
         # Store the Adam optimizer state in a temporary attribute until configure_optimizers() is called
         if self.hparams.use_pretrained_adam_state:
@@ -215,7 +214,7 @@ class FunnelForPreTraining(pl.LightningModule):
         copy_params_with_mapping(gen_input, prefix='generator/encoder/', mapping={
             '1.bias': 'input_projection/bias',
             '1.weight': 'input_projection/kernel'
-        }, transpose=True)
+        })
         gen_input[0].weight.data = discr_input[0].weight.data   # Tie embedding weights
 
         copy_params_with_mapping(self.mlm_head, prefix='generator/', mapping={

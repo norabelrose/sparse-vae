@@ -72,8 +72,8 @@ class Autoencoder(pl.LightningModule):
             for _ in sum(encoder_hparams.block_sizes)
         )
 
-        # After each layer in the decoder, call decoder_layer_forward with the layer's output and the corresponding
-        # ModuleDict with the corresponding Linear modules
+        # After each layer in the decoder, call decoder_layer_forward with the layer's output and the block and
+        # layer indices
         absolute_idx = 0
         for block_idx, block in enumerate(self.decoder_funnel.blocks):
             for layer in block.layers:
