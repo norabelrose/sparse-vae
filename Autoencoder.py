@@ -63,8 +63,8 @@ class Autoencoder(pl.LightningModule):
 
         self.decoder_cells = nn.ModuleList(
             nn.ModuleDict({
-                # Output contains mu & log sigma for p(z), and bias term for p(x)
-                'p(z)': linear_with_gelu(overt_depth, latent_depth * 2 + overt_depth),
+                # Output contains mu & log sigma for p(z)
+                'p(z)': linear_with_gelu(overt_depth, latent_depth * 2),
                 # Input is the encoder and decoder states concatenated depthwise, output is mu & log sigma for q(z|x)
                 'q(z|x)': linear_with_gelu(overt_depth * 2, latent_depth * 2),
                 'p(x|z)': linear_with_gelu(latent_depth, overt_depth),
@@ -145,14 +145,7 @@ class Autoencoder(pl.LightningModule):
     # Called once for each Transformer layer in the decoder
     def decoder_layer_forward(self, layer_index: int, block_index: int, layer_output: Tensor) -> Tensor:
         cell = self.decoder_cells[layer_index]
-        prior_output = cell['p(z)'](layer_output)
-
-        # Convnet output has 3 components: mu, log standard deviation, and a bias term to add to the input
-        overt_depth, latent_depth = self.hparams.latent_depth, self.hparams.overt_depth
-        p_mu = prior_output[:, :, :latent_depth]
-        p_logsigma = prior_output[:, :, latent_depth:latent_depth * 2]
-        xpp = prior_output[:, :, latent_depth * 2:]
-        layer_output += xpp
+        p_mu, p_logsigma = cell['p(z)'](layer_output).chunk(2, dim=-1)  # Prior
 
         @torch.jit.script
         def gaussian_kl_divergence(mu1: Tensor, mu2: Tensor, logsigma1: Tensor, logsigma2: Tensor) -> Tensor:

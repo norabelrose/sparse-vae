@@ -34,6 +34,7 @@ class FunnelForPreTraining(pl.LightningModule):
 
         discriminator_hparams = mutate(hparams.funnel_hparams, return_block_outputs=[0])
         generator_hparams = deepcopy(discriminator_hparams)
+        generator_hparams.d_embedding = discriminator_hparams.d_model   # Generator shares embeddings w/ discriminator
         generator_hparams.d_model //= 4
         generator_hparams.num_heads //= 4
 
@@ -202,11 +203,18 @@ class FunnelForPreTraining(pl.LightningModule):
         if self.hparams.use_pretrained_adam_state:
             self.optimizer_state = defaultdict(dict)
 
-        copy_params_with_mapping(self.encoders['discriminator'].input_layer, prefix='model/input/', mapping={
+        gen_input, discr_input = self.encoders['generator'].input_layer, self.encoders['discriminator'].input_layer
+        copy_params_with_mapping(discr_input, prefix='model/input/', mapping={
             '0.weight': 'word_embedding/lookup_table',
             '1.bias': 'layer_norm/beta',
             '1.weight': 'layer_norm/gamma'
         })
+        copy_params_with_mapping(gen_input, prefix='generator/encoder/', mapping={
+            '1.bias': 'input_projection/bias',
+            '1.weight': 'input_projection/kernel'
+        })
+        gen_input[0].weight.data = discr_input.input_layer[0].weight.data   # Tie embedding weights
+
         copy_params_with_mapping(self.mlm_head, prefix='generator/', mapping={
             '0.bias': 'lm_proj/dense/bias',
             '0.weight': 'lm_proj/dense/kernel',

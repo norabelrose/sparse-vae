@@ -21,7 +21,8 @@ class FunnelTransformer(nn.Module):
         num_heads=12,
         scaling_factors=(2, 2),
 
-        # **Default values taken from pretrained config files & flags**
+        # If None, d_embedding is set to equal d_model. For the generator in ELECTRA pretraining they are different.
+        d_embedding=None,
         vocab_size=30522,
         attention_dropout=0.1,
         dropout=0.1,
@@ -61,14 +62,27 @@ class FunnelTransformer(nn.Module):
         if len(hparams.scaling_factors) < len(hparams.block_sizes):
             hparams.scaling_factors += (1,)
 
+        if not hparams.d_embedding:
+            hparams.d_embedding = hparams.d_model
+
         self.hparams = hparams
 
         if not hparams.upsampling:
-            self.input_layer = nn.Sequential(
-                nn.Embedding(hparams.vocab_size, hparams.d_model),
+            input_modules = [
+                nn.Embedding(hparams.vocab_size, hparams.d_embedding),
                 LayerNorm(hparams.d_model),
                 nn.Dropout(hparams.dropout)
-            )
+            ]
+
+            # If the embeddings have a different dimensionality from the Transformer hidden states,
+            # we need to project the embeddings into d_model dimensions. This is needed for ELECTRA
+            # pretraining where the generator has 4 times smaller hidden states than the discriminator,
+            # but shares embeddings with the discriminator.
+            if hparams.d_embedding != hparams.d_model:
+                input_projection = nn.Linear(hparams.d_embedding, hparams.d_model)
+                input_modules.insert(1, input_projection)
+
+            self.input_layer = nn.Sequential(*input_modules)
         else:
             self.output_layer = nn.Sequential(
                 nn.Linear(hparams.d_model, hparams.vocab_size),
@@ -137,6 +151,7 @@ class FunnelTransformer(nn.Module):
         noninitialized_keys = []
 
         # Don't forget about the embeddings
+        assert len(self.input_layer) == 3   # We don't support loading PyTorch weights where d_embedding != d_model
         self.input_layer.load_state_dict({
             '0.weight': state_dict['input_layer.0.lookup_table'],
             '1.weight': state_dict['input_layer.1.weight'],
