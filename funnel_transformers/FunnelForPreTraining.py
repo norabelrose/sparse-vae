@@ -5,6 +5,7 @@ from collections import defaultdict
 from copy import deepcopy
 from itertools import chain
 from torch import nn, Tensor
+import numpy as np
 import pytorch_lightning as pl
 import torch.nn.functional as F
 import torch
@@ -92,9 +93,13 @@ class FunnelForPreTraining(pl.LightningModule):
         # Either generator or discriminator forward pass
         def _encoder_decoder_forward(inputs: Tensor, model_type: str) -> Tensor:
             encoder, decoder = self.encoders[model_type], self.decoders[model_type]
-
             result = encoder(inputs)
-            decoder_input = result['output'] + result['hidden_states'][0]  # Residual connection
+
+            # Residual connection
+            total_scaling = np.prod(encoder.hparams.scaling_factors)
+            scaled_output = F.interpolate(result['output'], scale_factor=total_scaling, mode='nearest')
+            decoder_input = scaled_output + result['hidden_states'][0]
+
             return decoder(decoder_input)
 
         # Train generator
