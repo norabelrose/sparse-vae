@@ -1,7 +1,7 @@
 from argparse import ArgumentParser, Namespace
+from copy import deepcopy
 from pytorch_lightning import Trainer, LightningDataModule
 from typing import Mapping, MutableMapping, Sequence
-import warnings
 from .Autoencoder import Autoencoder
 from .funnel_transformers.FunnelForPreTraining import FunnelForPreTraining
 from .training.Datasets import ProjectGutenbergDataModule
@@ -24,22 +24,24 @@ def add_args_from_hparam_defaults(argparser: ArgumentParser, defaults: Mapping):
     return argparser
 
 def get_hparam_dict_from_args(args: Namespace, defaults: MutableMapping):
-    hparams = type(defaults)()
-
-    # Recursively search for a hyperparameter with the appropriate name
-    def search_for_key(key: str, mapping: Mapping) -> bool:
-        if key in mapping:
-            hparams[key] = value
-            return True
-        else:
-            for subdict in filter(lambda x: isinstance(x, MutableMapping), mapping.values()):
-                if search_for_key(key, subdict):
-                    return True
-
-            return False
+    hparams = deepcopy(defaults)
 
     for argname, value in vars(args).items():
-        search_for_key(argname, defaults)
+        if value is None:
+            continue
+
+        # Recursively search for a hyperparameter with the appropriate name
+        def search_for_key(key: str, mapping: Mapping) -> bool:
+            if key in mapping:
+                mapping[key] = value
+                return True
+            else:
+                for subdict in filter(lambda x: isinstance(x, MutableMapping), mapping.values()):
+                    if search_for_key(key, subdict):
+                        return True
+        
+        search_for_key(argname, hparams)
+
 
     return hparams
 
@@ -61,7 +63,8 @@ if __name__ == "__main__":
     if args.command == 'finetune-funnel':
         print("Finetuning a pretrained Funnel Transformer for Performer attention...")
         data = FunnelPreTrainingDataModule.from_argparse_args(args)
-        model = FunnelForPreTraining(get_hparam_dict_from_args(args, FunnelForPreTraining.default_hparams))
+        hparams = get_hparam_dict_from_args(args, FunnelForPreTraining.default_hparams)
+        model = FunnelForPreTraining(hparams)
     elif args.command == 'train':
         print("Training a Text VAE...")
         data = ProjectGutenbergDataModule.from_argparse_args(args)

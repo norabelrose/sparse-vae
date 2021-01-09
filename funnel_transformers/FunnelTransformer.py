@@ -49,8 +49,6 @@ class FunnelTransformer(nn.Module):
         super().__init__()
 
         if hparams.get('use_performer_attention'):
-            assert 'attention_type' not in hparams or hparams['attention_type'] == 'factorized',\
-                "Performer attention is not compatible with the relative shift method of relative positional attention."
             hparams['attention_type'] = 'factorized'
 
         hparams = merge(self.default_hparams, hparams)

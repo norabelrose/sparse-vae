@@ -108,6 +108,9 @@ class FunnelForPreTraining(pl.LightningModule):
             discriminator_logits = self.discriminator_head(discriminator_output)
             return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=nonpadding_mask)
 
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
+        del checkpoint['hyper_parameters']['__builtins__']
+
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         return self.training_step(batch, batch_index, optimizer_index=0)
 
