@@ -76,7 +76,7 @@ class PerformerAttention(nn.Module):
         self.kernel_fn = KERNEL_CALLABLES[self.kernel_type]
 
         if self.use_linear_layers:
-            self.use_linear_layers = [nn.Linear(self.d_model, self.d_model) for _ in range(3)]
+            self.linear_layers = [nn.Linear(self.d_model, self.d_model) for _ in range(3)]
 
         self.output_linear = nn.Linear(in_features=self.d_model, out_features=self.d_model)
         self.pruned_heads = set()
@@ -125,7 +125,7 @@ class PerformerAttention(nn.Module):
             assert q_length == 1, "When use_recurrent_decoding == True, we only input and output one token at a time."
 
         if self.use_linear_layers:
-            q, k, v = (linear(x) for linear, x in zip(self.qkv_linear_layers, (q, k, v)))
+            q, k, v = (linear(x) for linear, x in zip(self.linear_layers, (q, k, v)))
 
         # Add the head dimension
         q, k, v = (rearrange(x, "b l (h d) -> b h l d", h=self.num_heads) for x in (q, k, v))
