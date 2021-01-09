@@ -5,6 +5,7 @@ from torch import nn
 from torch import Tensor
 from .HparamUtils import *
 from .funnel_transformers.FunnelTransformer import FunnelTransformer
+from pytorch_lightning.utilities import AttributeDict
 import math
 import torch.nn.functional as F
 import pytorch_lightning as pl
