@@ -37,7 +37,7 @@ class AttentionState:
 
     @property
     def attention_mask(self) -> Tensor:
-        return None if self.input_mask is None else self.input_mask[:, None, None, :].float()
+        return None if self.input_mask is None else self.input_mask[:, None, None, :]
 
     @property
     def positional_encoding(self) -> PositionalEncoding:
@@ -65,11 +65,6 @@ class AttentionState:
         if len(self._mask_stack) > 0:
             self.input_mask, self.not_cls_mask, self.segment_mask = self._mask_stack.pop()
             return
-
-        # By default, mask out all the padding tokens
-        pad_id = self.hparams.pad_id
-        if input_mask is None and pad_id is not None:
-            input_mask = x.eq(pad_id)
 
         self.input_mask = input_mask
 
@@ -104,6 +99,7 @@ class AttentionState:
             scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
 
             # Downsample the Q portion of these masks
+            self.input_mask = self._stride_downsample(self.input_mask, -2, scaling_factor)
             self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
             self.segment_mask = self._stride_downsample(self.segment_mask, -2, scaling_factor)
         
@@ -115,6 +111,7 @@ class AttentionState:
             scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
 
             # Downsample the K portion of these masks
+            self.input_mask = self._stride_downsample(self.input_mask, -1, scaling_factor)
             self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -1, scaling_factor)
             self.segment_mask = self._stride_downsample(self.segment_mask, -1, scaling_factor)
 

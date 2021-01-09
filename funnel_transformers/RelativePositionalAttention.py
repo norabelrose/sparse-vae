@@ -188,7 +188,7 @@ class RelativePositionalAttention(nn.Module):
             # perform masking
             attn_mask = attn_state.attention_mask
             if attn_mask is not None:
-                attn_score = attn_score - BIG_CONST * attn_mask.float()
+                attn_score = attn_score - BIG_CONST * attn_mask
 
             # attention distribution
             attn_dist = torch.softmax(attn_score, dim=-1)
