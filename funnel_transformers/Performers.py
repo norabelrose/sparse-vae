@@ -107,22 +107,9 @@ class PerformerAttention(nn.Module):
                 self.z = None   # Denominator
 
     def forward(self, q, k, v, mask=None, head_mask=None, output_attentions=False):
-        """
-        Parameters:
-            q: torch.tensor(bs, seq_length, dim)
-            k: torch.tensor(bs, seq_length, dim)
-            v: torch.tensor(bs, seq_length, dim)
-            mask: torch.tensor(bs, seq_length)
-
-        Returns:
-            weights: torch.tensor(bs, num_heads, seq_length, seq_length) Attention weights context: torch.tensor(bs,
-            seq_length, dim) Contextualized layer. Optional: only if `output_attentions=True`
-        """
-        bs, q_length, _ = q.shape
-
         assert not output_attentions, "Can't output attention maps when using Performer attention."
         if self.use_recurrent_decoding:
-            assert q_length == 1, "When use_recurrent_decoding == True, we only input and output one token at a time."
+            assert q.shape[1] == 1, "When use_recurrent_decoding == True, we only input and output one token at a time."
 
         if self.use_linear_layers:
             q, k, v = (linear(x) for linear, x in zip(self.linear_layers, (q, k, v)))
@@ -130,14 +117,14 @@ class PerformerAttention(nn.Module):
         # Add the head dimension
         q, k, v = (rearrange(x, "b l (h d) -> b h l d", h=self.num_heads) for x in (q, k, v))
 
-        self._redraw_features_if_needed(bs, q.device)
-
         # Get the transformed values of Q and K
         q_prime, k_prime = self.get_projected_queries_and_keys(q, k)
         return self.compute_attention_with_projected_queries_and_keys(q_prime, k_prime, v, mask, head_mask)
 
     # Turns Q into Q', K into K'
     def get_projected_queries_and_keys(self, q, k):
+        self._redraw_features_if_needed(q.shape[0], q.device)
+
         # Instead of dividing the product QK^T by sqrt(d), we divide Q and K by the 4th root of d.
         q = q / (self.d_model ** 0.25)
         k = k / (self.d_model ** 0.25)
