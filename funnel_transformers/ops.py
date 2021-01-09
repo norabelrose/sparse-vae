@@ -143,7 +143,7 @@ class RelativePositionalAttention(nn.Module):
 
         if self.hparams.use_performer_attention:
             # "Funnel Transformers" page 13, formula 8 and page 14, final formula of section A.2
-            r_r = self.r_r_bias
+            r_r = self.r_r_bias[:, None, :]
             q_i = (q + r_r) @ self.r_kernel.transpose(-2, -1)
 
             # See the trigonometric identities in the paper on page 14
