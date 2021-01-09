@@ -8,30 +8,25 @@ from ..performers import PerformerAttentionConfig, PerformerAttention
 
 BIG_CONST = 1e6
 
-try:
-    import apex
+class LayerNorm(nn.LayerNorm):
+    def __init__(self, *args, **kwargs):
+        super(LayerNorm, self).__init__(*args, **kwargs)
+        self.eps = 1e-9
 
-    LayerNorm = apex.normalization.FusedLayerNorm
-except ImportError as e:
-    class LayerNorm(nn.LayerNorm):
-        def __init__(self, *args, **kwargs):
-            super(LayerNorm, self).__init__(*args, **kwargs)
-            self.eps = 1e-9
-
-        def forward(self, inputs):
-            dtype = torch.float32
-            if self.elementwise_affine:
-                weight = self.weight.type(dtype)
-                bias = self.bias.type(dtype)
-            else:
-                weight = self.weight
-                bias = self.bias
-            input_dtype = inputs.dtype
-            inputs = inputs.type(dtype)
-            output = F.layer_norm(inputs, self.normalized_shape, weight, bias, self.eps)
-            if output.dtype != input_dtype:
-                output = output.type(input_dtype)
-            return output
+    def forward(self, inputs):
+        dtype = torch.float32
+        if self.elementwise_affine:
+            weight = self.weight.type(dtype)
+            bias = self.bias.type(dtype)
+        else:
+            weight = self.weight
+            bias = self.bias
+        input_dtype = inputs.dtype
+        inputs = inputs.type(dtype)
+        output = F.layer_norm(inputs, self.normalized_shape, weight, bias, self.eps)
+        if output.dtype != input_dtype:
+            output = output.type(input_dtype)
+        return output
 
 
 class EinsumLayer(nn.Module):

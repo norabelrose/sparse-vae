@@ -60,7 +60,7 @@ if __name__ == "__main__":
 
     if args.command == 'finetune-funnel':
         print("Finetuning a pretrained Funnel Transformer for Performer attention...")
-        data = FunnelPreTrainingDataModule.from_argparse_args(args, batch_size=48)
+        data = FunnelPreTrainingDataModule.from_argparse_args(args)
         model = FunnelForPreTraining(get_hparam_dict_from_args(args, FunnelForPreTraining.default_hparams))
     elif args.command == 'train':
         print("Training a Text VAE...")
@@ -69,5 +69,5 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
-    trainer = Trainer.from_argparse_args(args)
+    trainer = Trainer.from_argparse_args(args, accumulate_grad_batches=500)
     trainer.fit(model, datamodule=data)

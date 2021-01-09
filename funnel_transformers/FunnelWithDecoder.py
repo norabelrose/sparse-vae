@@ -27,5 +27,5 @@ class FunnelWithDecoder(nn.Module):
         scaled_output = result['output'].repeat_interleave(total_scaling, dim=-2)
         decoder_input = scaled_output + result['hidden_states'][0]
 
-        result['output'] = self.decoder(decoder_input)
+        result['output'] = self.decoder(decoder_input, decoder_input, self.encoder.attention_state)[1]
         return result

@@ -40,10 +40,10 @@ class FunnelForPreTraining(pl.LightningModule):
         self.discriminator = FunnelWithDecoder(discriminator_hparams, num_decoder_layers=2)
 
         self.mlm_head = nn.Sequential(
-            nn.Linear(generator_hparams.d_model, generator_hparams.d_model),
+            nn.Linear(generator_hparams.d_model, generator_hparams.d_embedding),
             nn.GELU(),
-            nn.LayerNorm([generator_hparams.d_model]),
-            nn.Linear(generator_hparams.d_model, generator_hparams.vocab_size),
+            nn.LayerNorm([generator_hparams.d_embedding]),
+            nn.Linear(generator_hparams.d_embedding, generator_hparams.vocab_size),
             nn.LogSoftmax(dim=-1)
         )
         self.discriminator_head = nn.Sequential(
@@ -52,7 +52,7 @@ class FunnelForPreTraining(pl.LightningModule):
             nn.Linear(discriminator_hparams.d_model, 1)
         )
         # Tie the embedding weight matrices
-        self.mlm_head[0].weight.data = self.generator.encoder.input_layer[0].weight.data
+        self.mlm_head[-2].weight.data = self.generator.encoder.input_layer[0].weight.data
 
         # Freeze the generator weights if indicated
         if not hparams.train_generator:
