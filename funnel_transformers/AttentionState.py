@@ -61,11 +61,6 @@ class AttentionState:
             self._last_device = x.device
             self._last_dtype = x.dtype
 
-        # When we reset last time, keep_masks was set to True. Let's reuse the old masks.
-        if len(self._mask_stack) > 0:
-            self.input_mask, self.not_cls_mask, self.segment_mask = self._mask_stack.pop()
-            return
-
         self.input_mask = input_mask
 
         if self.hparams.separate_cls:
@@ -78,13 +73,10 @@ class AttentionState:
         if seg_id is not None:
             # [CLS] has a 'third' segment of its own- seg_id_cls, which is 2 by default
             mask = seg_id.eq(self.hparams.seg_id_cls)          # 1 where position is [CLS], 0 otherwise
-            cls_mat = torch.unsqueeze(mask, -1) | torch.unsqueeze(mask, -2)
+            cls_mat = mask.unsqueeze(-1) | mask.unsqueeze(-2)
 
-            seg_mat = torch.unsqueeze(seg_id, -1).eq(torch.unsqueeze(seg_id, -2))
+            seg_mat = seg_id.unsqueeze(-1).eq(seg_id.unsqueeze(-2))
             self.segment_mask = cls_mat | seg_mat     # Treat [CLS] as in the same segment as both A & B
-
-        if self.cache_masks:
-            self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
 
     def invert_block_order(self):
         self._pos_encodings.reverse()
@@ -94,29 +86,36 @@ class AttentionState:
     @contextmanager
     def begin_block(self):  # with attention_state.begin_block(): ...
         # We're entering the first layer of a new funnel block
-        if self._current_block > 0:
-            self.block_begin_flag = True
-            scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
-
-            # Downsample the Q portion of these masks
-            self.input_mask = self._stride_downsample(self.input_mask, -2, scaling_factor)
-            self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -2, scaling_factor)
-            self.segment_mask = self._stride_downsample(self.segment_mask, -2, scaling_factor)
+        self._get_scaled_masks('q')
         
         yield   # Compute attention and stuff...
         
         # We're exiting the first layer of the new block
-        if self._current_block > 0:
-            self.block_begin_flag = False
-            scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
+        self._get_scaled_masks('k')
 
-            # Downsample the K portion of these masks
-            self.input_mask = self._stride_downsample(self.input_mask, -1, scaling_factor)
-            self.not_cls_mask = self._stride_downsample(self.not_cls_mask, -1, scaling_factor)
-            self.segment_mask = self._stride_downsample(self.segment_mask, -1, scaling_factor)
+    # Called twice every time we transition to a new block
+    def _get_scaled_masks(self, component: str):
+        dim = -1 if component == 'q' else -2
 
+        # If we're upsampling, fetch cached masks from an earlier downsampling operation. Otherwise, average/min pool.
+        if self.hparams.upsampling:
+            # We must have cached masks from a previous downsampling operation— use them
+            assert self._mask_stack, "We need to have cached masks from an earlier downsampling operation"
+            self.input_mask, self.not_cls_mask, self.segment_mask = self._mask_stack.pop()
+
+        else:
             if self.cache_masks:
                 self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
+
+            if self._current_block > 0:
+                self.block_begin_flag = True
+                scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
+
+                # Downsample either the Q or K portion of these masks
+                self.not_cls_mask = self._stride_downsample(self.not_cls_mask, dim, scaling_factor)
+                self.segment_mask = self._stride_downsample(self.segment_mask, dim, scaling_factor)
+                if dim == -1:
+                    self.input_mask = self._stride_downsample(self.input_mask, dim, scaling_factor)
 
     # This method should be called at the end of a forward pass
     def reset(self):
@@ -130,21 +129,11 @@ class AttentionState:
 
     # Either downsample or upsample the tensor, whichever is appropriate for the current block.
     def scale_input(self, x: Tensor) -> Tensor:
-        config = self.hparams
-        factors = config.scaling_factors
+        hparams = self.hparams
+        factors = hparams.scaling_factors
 
-        # Special case for when we're using a traditional Funnel Transformer decoder with all-at-once upsampling
-        if self.has_decoder_block and self._current_block == len(factors):
-            upsampling = True
-            scaling_factor = prod(factors)  # Upsample all at once to the scale we started with
-            mask_stack_index = 0            # We'll want the very first set of masks
-
-        # Usual case
-        else:
-            upsampling = config.upsampling
-            scaling_factor = factors[self._current_block]
-            mask_stack_index = -1
-
+        # Suppress the sanity check if we have a decoder block since FunnelWithDecoder will do the upsample for us
+        if not self.has_decoder_block:
             # Sanity check
             assert self._current_block < len(factors), \
                 "We ran out of scaling factors to use. Did you forget to call AttentionState.reset()?"
@@ -153,28 +142,8 @@ class AttentionState:
         self._current_block += 1
 
         # Don't actually do anything if we don't have to
-        if scaling_factor == 1:
-            return x
-
-        # Okay, we actually have to scale
-        x = self._scale_tensor(x, scaling_factor, upsampling)
-        if upsampling:
-            # We have cached masks from a previous downsampling operation, so use them
-            if len(self._mask_stack) > 0:
-                self.input_mask, self.not_cls_mask, self.segment_mask = self._mask_stack.pop(mask_stack_index)
-
-            # We don't have cached masks, so just nearest-neighbor upsample our current ones (not ideal)
-            else:
-                self.input_mask = self._scale_tensor(self.input_mask, scaling_factor, True)
-                self.not_cls_mask = self._scale_tensor(self.not_cls_mask, scaling_factor, True)
-                self.segment_mask = self._scale_tensor(self.segment_mask, scaling_factor, True)
-        else:
-            self.input_mask = self._scale_tensor(self.input_mask, scaling_factor, upsampling, mode="min")
-
-            if self.cache_masks:
-                self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
-
-        return x
+        scaling_factor = factors[self._current_block]
+        return self._scale_tensor(x, scaling_factor, hparams.upsampling) if scaling_factor != 1 else x
 
     # Used for scaling multiple different kinds of tensors (pos encodings, text representations, etc.)
     def _scale_tensor(self, x: Tensor, scaling_factor: int, upsample: bool, mode: str = None) -> Optional[Tensor]:
