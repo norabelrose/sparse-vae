@@ -4,7 +4,7 @@ import numpy as np
 from einops import rearrange
 from torch import nn
 from .AttentionState import *
-from ..performers import PerformerAttentionConfig, PerformerAttention
+from .Performers import PerformerAttention, PerformerAttentionConfig
 
 BIG_CONST = 1e6
 

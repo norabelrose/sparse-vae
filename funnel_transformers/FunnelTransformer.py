@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from .AttentionState import AttentionState
-from .RelativePositionalAttention import RelativePositionalAttention
-from .RelativePositionalAttention import LayerNorm
-from .RelativePositionalAttention import PositionwiseFFN
+from .ops import RelativePositionalAttention
+from .ops import LayerNorm
+from .ops import PositionwiseFFN
 from .RemoteModels import *
 from ..HparamUtils import *
 from pytorch_lightning.utilities import AttributeDict

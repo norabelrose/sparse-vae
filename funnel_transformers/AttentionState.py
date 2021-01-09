@@ -133,7 +133,7 @@ class AttentionState:
 
         # Sanity check
         assert self._current_block < len(factors), \
-                "We ran out of scaling factors to use. Did you forget to call AttentionState.reset()?"
+            "We ran out of scaling factors to use. Did you forget to call AttentionState.reset()?"
 
         # We assume that scale_input() will only be called once at the end of each block
         scaling_factor = factors[self._current_block]

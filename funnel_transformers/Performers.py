@@ -1,13 +1,44 @@
+from dataclasses import dataclass
 from einops import rearrange
 from itertools import count
 from torch import nn
+from typing import *
 import logging
 import math
 import random
 import torch
 import torch.nn.functional as F
 
-from .PerformerAttentionConfig import *
+
+@dataclass
+class PerformerAttentionConfig:
+    attention_dropout: float = 0.1
+    kernel_type: str = 'exp'
+
+    causal: bool = False
+    use_recurrent_decoding: bool = False
+
+    kernel_epsilon: float = 1e-4
+    normalize_output: bool = True
+    normalization_stabilizer: float = 1e-6
+    use_linear_layers: bool = True
+
+    num_random_features: Optional[int] = None
+    use_thick_features: bool = False
+    regularize_feature_norms: bool = True
+
+    use_orthogonal_features: bool = True
+    orthogonal_feature_algorithm: Optional[str] = None
+
+    feature_redraw_interval: int = 1
+    redraw_stochastically: bool = False
+    redraw_verbose: bool = False
+
+    # Optional here so the user doesn't have to set redundant parameters, but must be set by model before config is
+    # passed to PerformerAttention.__init__()
+    d_model: Optional[int] = None
+    num_heads: Optional[int] = None
+
 
 KERNEL_CALLABLES = {
     'cosh': lambda x, h: torch.cat((torch.exp(h + x), torch.exp(h - x)), dim=-1),
