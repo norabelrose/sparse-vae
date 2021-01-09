@@ -42,13 +42,10 @@ class FunnelTransformer(nn.Module):
         # selected blocks will be returned.
         return_block_outputs=False,
         use_performer_attention=False,
-        upsampling=False,  # True for the "reverse" funnel transformer; e.g. a VAE decoder
-
-        has_decoder_block=False,        # Set to True by FunnelForPreTraining and used by AttentionState.
-        use_mlm_head=False
+        upsampling=False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
     )
     
-    def __init__(self, hparams: MutableMapping[str, Any], shared_attention_state: Optional[AttentionState] = None):
+    def __init__(self, hparams: AttributeDict[str, Any], shared_attention_state: Optional[AttentionState] = None):
         super().__init__()
 
         if hparams.get('use_performer_attention'):

@@ -25,6 +25,7 @@ class AttentionState:
     # When True, AttentionState will cache a list of all the mask tensors it computes for each block of the model.
     # These masks can then be reused, e.g. by a VAE decoder.
     cache_masks: bool = False
+    has_decoder_block: bool = False
 
     # Private variables
     _current_block: int = field(init=False, default=0)
@@ -136,7 +137,7 @@ class AttentionState:
         factors = config.scaling_factors
 
         # Special case for when we're using a traditional Funnel Transformer decoder with all-at-once upsampling
-        if config.has_decoder_block and self._current_block == len(factors):
+        if self.has_decoder_block and self._current_block == len(factors):
             upsampling = True
             scaling_factor = prod(factors)  # Upsample all at once to the scale we started with
             mask_stack_index = 0            # We'll want the very first set of masks
