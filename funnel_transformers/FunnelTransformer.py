@@ -89,7 +89,7 @@ class FunnelTransformer(nn.Module):
         self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
         self.attention_state = shared_attention_state or AttentionState(hparams)
 
-    def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None) -> Dict[str, Any]:
+    def forward(self, x: Tensor, input_mask: Tensor = None) -> Dict[str, Any]:
         config = self.hparams
         hidden_states = []
 
@@ -97,7 +97,7 @@ class FunnelTransformer(nn.Module):
             x = self.input_layer(x)  # x.shape == (batch, length, d_model)
         
         attn_state = self.attention_state
-        attn_state.configure_for_input(x, input_mask, seg_id)
+        attn_state.configure_for_input(x, input_mask, None)
 
         q = kv = x
         for i, block in enumerate(self.blocks):

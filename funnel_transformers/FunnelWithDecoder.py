@@ -14,18 +14,20 @@ class FunnelWithDecoder(nn.Module):
             hparams.return_block_outputs = [0] + hparams.return_block_outputs
 
         self.encoder = FunnelTransformer(hparams)
+
+        decoder_hparams = mutate(hparams, block_sizes=(1,), scaling_factors=(1,))
         self.decoder = FunnelBlock(hparams, num_decoder_layers)
+        self.decoder_attention_state = AttentionState(decoder_hparams)
 
-        # AttentionState needs to know that the decoder exists
-        self.encoder.attention_state.has_decoder_block = True
-
-    def forward(self, x: Tensor, input_mask: Tensor = None, seg_id: Tensor = None) -> Dict[str, Any]:
-        result = self.encoder(x, input_mask, seg_id)
+    def forward(self, x: Tensor, input_mask: Tensor = None) -> Dict[str, Any]:
+        result = self.encoder(x, input_mask)
 
         # Residual connection
         total_scaling = np.prod(self.encoder.hparams.scaling_factors)
         scaled_output = result['output'].repeat_interleave(total_scaling, dim=-2)
         decoder_input = scaled_output + result['hidden_states'][0]
 
-        result['output'] = self.decoder(decoder_input, decoder_input, self.encoder.attention_state)[1]
+        self.decoder_attention_state.configure_for_input(decoder_input, input_mask)
+        result['output'] = self.decoder(decoder_input, decoder_input, self.decoder_attention_state)[1]
+        self.decoder_attention_state.reset()
         return result

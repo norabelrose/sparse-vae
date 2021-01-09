@@ -18,6 +18,7 @@ class AttentionState:
     segment_mask: Optional[Tensor] = None     # 1 where Q and K are in same segment, 0 otherwise
     input_mask: Optional[Tensor] = None       # 1 for positions we should ignore (like padding), 0 otherwise
     not_cls_mask: Optional[Tensor] = None     # 0 where position is the [CLS] token, 1 otherwise
+    _current_block: int = field(init=False, default=0)
 
     # True inside a 'with attention_state.begin_block()' block
     block_begin_flag: bool = field(init=False, default=False)
@@ -25,10 +26,8 @@ class AttentionState:
     # When True, AttentionState will cache a list of all the mask tensors it computes for each block of the model.
     # These masks can then be reused, e.g. by a VAE decoder.
     cache_masks: bool = False
-    has_decoder_block: bool = False
 
     # Private variables
-    _current_block: int = field(init=False, default=0)
     _last_seq_len: int = field(init=False, default=None)
     _last_dtype: torch.dtype = field(init=False, default=None)
     _last_device: torch.device = field(init=False, default=None)
@@ -95,7 +94,7 @@ class AttentionState:
 
     # Called twice every time we transition to a new block
     def _get_scaled_masks(self, component: str):
-        dim = -1 if component == 'q' else -2
+        dim = -2 if component == 'q' else -1
 
         # If we're upsampling, fetch cached masks from an earlier downsampling operation. Otherwise, average/min pool.
         if self.hparams.upsampling:
@@ -108,7 +107,7 @@ class AttentionState:
                 self._mask_stack.append((self.input_mask, self.not_cls_mask, self.segment_mask))
 
             if self._current_block > 0:
-                self.block_begin_flag = True
+                self.block_begin_flag = True if component == 'q' else False
                 scaling_factor = self.hparams.scaling_factors[self._current_block - 1]
 
                 # Downsample either the Q or K portion of these masks
@@ -132,17 +131,15 @@ class AttentionState:
         hparams = self.hparams
         factors = hparams.scaling_factors
 
-        # Suppress the sanity check if we have a decoder block since FunnelWithDecoder will do the upsample for us
-        if not self.has_decoder_block:
-            # Sanity check
-            assert self._current_block < len(factors), \
+        # Sanity check
+        assert self._current_block < len(factors), \
                 "We ran out of scaling factors to use. Did you forget to call AttentionState.reset()?"
 
         # We assume that scale_input() will only be called once at the end of each block
+        scaling_factor = factors[self._current_block]
         self._current_block += 1
 
         # Don't actually do anything if we don't have to
-        scaling_factor = factors[self._current_block]
         return self._scale_tensor(x, scaling_factor, hparams.upsampling) if scaling_factor != 1 else x
 
     # Used for scaling multiple different kinds of tensors (pos encodings, text representations, etc.)

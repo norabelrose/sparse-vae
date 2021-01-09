@@ -78,7 +78,7 @@ class FunnelForPreTraining(pl.LightningModule):
             return discr_opt
 
     # Returns the loss
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int, optimizer_index: int) -> Tensor:
+    def training_step(self, batch: Dict[str, Tensor], batch_index: int, optimizer_index: int = 0) -> Tensor:
         # Train generator
         if optimizer_index == 0 and self.hparams.train_generator:
             raise NotImplementedError
@@ -101,7 +101,7 @@ class FunnelForPreTraining(pl.LightningModule):
             # 1 where the generator output is equal to the ground truth, 0 elsewhere. Note that this will be 1 where
             # a word was masked out and the generator correctly predicted the original token. The discriminator
             # is only asked to find the generator's mistakes.
-            is_groundtruth = samples.eq(labels)
+            is_groundtruth = samples.eq(labels).float()
 
             # For each token, the probability that matches the ground truth input.
             discriminator_output = self.discriminator(samples, input_mask=padding_mask)['output']
@@ -111,8 +111,8 @@ class FunnelForPreTraining(pl.LightningModule):
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         return self.training_step(batch, batch_index, optimizer_index=0)
 
-    def validation_epoch_end(self, losses: List[Tensor]) -> dict:
-        return {'log': {'val_loss': torch.mean(torch.stack(losses))}}
+    def validation_epoch_end(self, losses: List[Tensor]):
+        self.log('val_loss', torch.mean(torch.stack(losses)))
 
     def _load_weights_from_tf_ckpt(self, path: str, strict: bool):
         import tensorflow as tf
