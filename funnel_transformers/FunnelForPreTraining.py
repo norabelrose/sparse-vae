@@ -99,7 +99,7 @@ class FunnelForPreTraining(pl.LightningModule):
             # 1 where the generator output is equal to the ground truth, 0 elsewhere. Note that this will be 1 where
             # a word was masked out and the generator correctly predicted the original token. The discriminator
             # is only asked to find the generator's mistakes.
-            is_groundtruth = torch.eq(samples, labels)
+            is_groundtruth = samples.eq(labels)
 
             # For each token, the probability that matches the ground truth input.
             discriminator_output = self.discriminator(samples, input_mask=padding_mask)['output']

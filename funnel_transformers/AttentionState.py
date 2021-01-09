@@ -211,7 +211,10 @@ class AttentionState:
             elif mode == "max":
                 x = F.max_pool2d(x, stride, stride=stride, ceil_mode=True)
             elif mode == "min":
-                x = -F.max_pool2d(-x, stride, stride=stride, ceil_mode=True)
+                if x.dtype == torch.bool:
+                    x = ~F.max_pool2d(~x, stride, stride=stride, ceil_mode=True)
+                else:
+                    x = -F.max_pool2d(-x, stride, stride=stride, ceil_mode=True)
             else:
                 raise NotImplementedError
             if ndims == 2:
