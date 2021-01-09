@@ -86,6 +86,8 @@ class FunnelForPreTraining(pl.LightningModule):
         # Train discriminator
         else:
             masked_text, labels, padding_mask = batch['token_ids'], batch['labels'], batch['padding_mask']
+            nonpadding_mask = (~padding_mask).float()
+            padding_mask = padding_mask.float()
 
             # Probability distribution over tokens: (batch, seq_len, vocab_size)
             generator_output = self.generator(masked_text, input_mask=padding_mask)['output']
@@ -104,7 +106,7 @@ class FunnelForPreTraining(pl.LightningModule):
             # For each token, the probability that matches the ground truth input.
             discriminator_output = self.discriminator(samples, input_mask=padding_mask)['output']
             discriminator_logits = self.discriminator_head(discriminator_output)
-            return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=~padding_mask)
+            return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=nonpadding_mask)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         return self.training_step(batch, batch_index, optimizer_index=0)
