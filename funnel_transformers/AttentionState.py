@@ -69,7 +69,7 @@ class AttentionState:
         # By default, mask out all the padding tokens
         pad_id = self.hparams.pad_id
         if input_mask is None and pad_id is not None:
-            input_mask = torch.eq(x, pad_id)
+            input_mask = x.eq(pad_id)
 
         self.input_mask = input_mask
 
@@ -82,10 +82,10 @@ class AttentionState:
         # are in different segments. This is used for the Next Sentence Prediction training task.
         if seg_id is not None:
             # [CLS] has a 'third' segment of its own- seg_id_cls, which is 2 by default
-            mask = torch.eq(seg_id, self.hparams.seg_id_cls)          # 1 where position is [CLS], 0 otherwise
+            mask = seg_id.eq(self.hparams.seg_id_cls)          # 1 where position is [CLS], 0 otherwise
             cls_mat = torch.unsqueeze(mask, -1) | torch.unsqueeze(mask, -2)
 
-            seg_mat = torch.eq(torch.unsqueeze(seg_id, -1), torch.unsqueeze(seg_id, -2))
+            seg_mat = torch.unsqueeze(seg_id, -1).eq(torch.unsqueeze(seg_id, -2))
             self.segment_mask = cls_mat | seg_mat     # Treat [CLS] as in the same segment as both A & B
 
         if self.cache_masks:

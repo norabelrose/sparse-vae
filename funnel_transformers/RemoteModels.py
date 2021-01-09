@@ -48,7 +48,7 @@ def load_remote_model(url: str) -> Path:
     if local_path.exists():
         return local_path
 
-    print(f"Downloading model from URL {url}...")
+    print(f"Downloading model from {url}...")
 
     response = requests.get(url, stream=True)
     response.raise_for_status()

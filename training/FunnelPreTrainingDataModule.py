@@ -18,14 +18,14 @@ class FunnelPreTrainingDataModule(TextVaeDataModule):
     # Create MLM batches for the generator. Adapted from DataCollatorForLanguageModeling from huggingface/transformers
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         # Combine into a single batched tensor
-        inputs = torch.cat([x['token_ids'].unsqueeze(0) for x in inputs], dim=0)
+        inputs = torch.nn.utils.rnn.pad_sequence([x['token_ids'] for x in inputs], batch_first=True)
         labels = inputs.clone()
         vocab = self.tokenizer.get_vocab()
 
         # We sample a few tokens in each sequence for MLM training (with 15% probability)
         probability_matrix = torch.full(labels.shape, 0.15)
-        special_tokens_mask = torch.lt(inputs, 1000)    # Token IDs under 1000 are special tokens or unused
-        padding_mask = torch.eq(inputs, 0)              # Padding token id is 0
+        special_tokens_mask = inputs.lt(1000)    # Token IDs under 1000 are special tokens or unused
+        padding_mask = inputs.eq(0)              # Padding token id is 0
 
         probability_matrix.masked_fill_(special_tokens_mask | padding_mask, value=0.0)
         masked_indices = torch.bernoulli(probability_matrix).bool()

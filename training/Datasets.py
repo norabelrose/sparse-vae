@@ -49,7 +49,7 @@ class TextVaeDataModule(pl.LightningDataModule):
         # Check if we already have the dataset
         processed_path = self.dataset_dir / self.dataset_name
         if processed_path.exists():
-            self.dataset = datasets.load_from_disk(processed_path)
+            self.dataset = datasets.load_from_disk(str(processed_path))
             return
 
         self.create_dataset()   # Download or load a big file from disk
@@ -84,9 +84,9 @@ class TextVaeDataModule(pl.LightningDataModule):
 
     @staticmethod
     def collate(inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        # Combine into a single batched tensor
-        inputs = torch.cat([x['token_ids'].unsqueeze(0) for x in inputs], dim=0)
-        return {'token_ids': inputs}
+        # Combine into a single batched and padded tensor
+        inputs = torch.nn.utils.rnn.pad_sequence([x['token_ids'] for x in inputs], batch_first=True)
+        return {'token_ids': inputs, 'padding_mask': inputs.eq(0)}
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
         return DataLoader(self.dataset['train'], batch_size=self.batch_size, shuffle=True, collate_fn=self.collate,

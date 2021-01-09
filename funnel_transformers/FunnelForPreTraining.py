@@ -85,10 +85,10 @@ class FunnelForPreTraining(pl.LightningModule):
 
         # Train discriminator
         else:
-            masked_text, labels = batch['token_ids'], batch['labels']
+            masked_text, labels, padding_mask = batch['token_ids'], batch['labels'], batch['padding_mask']
 
             # Probability distribution over tokens: (batch, seq_len, vocab_size)
-            generator_output = self.generator(masked_text)['output']
+            generator_output = self.generator(masked_text, input_mask=padding_mask)['output']
             generator_logits = self.mlm_head(generator_output)
 
             # Sample from the distribution (Gumbel softmax). Greedy sampling, plus some noise.
@@ -102,9 +102,8 @@ class FunnelForPreTraining(pl.LightningModule):
             is_groundtruth = torch.eq(samples, labels)
 
             # For each token, the probability that matches the ground truth input.
-            discriminator_output = self.discriminator(samples)['output']
+            discriminator_output = self.discriminator(samples, input_mask=padding_mask)['output']
             discriminator_logits = self.discriminator_head(discriminator_output)
-            padding_mask = self.discriminator.encoder.attention_state.input_mask
             return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=~padding_mask)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
