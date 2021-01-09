@@ -1,5 +1,4 @@
 from copy import copy
-from pytorch_lightning.utilities import AttributeDict
 from typing import *
 
 

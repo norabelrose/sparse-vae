@@ -45,7 +45,7 @@ class FunnelTransformer(nn.Module):
         upsampling=False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
     )
     
-    def __init__(self, hparams: AttributeDict[str, Any], shared_attention_state: Optional[AttentionState] = None):
+    def __init__(self, hparams: AttributeDict, shared_attention_state: Optional[AttentionState] = None):
         super().__init__()
 
         if hparams.get('use_performer_attention'):

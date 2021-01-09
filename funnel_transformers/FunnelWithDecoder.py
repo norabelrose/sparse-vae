@@ -3,7 +3,7 @@ import numpy as np
 
 
 class FunnelWithDecoder(nn.Module):
-    def __init__(self, hparams: AttributeDict[str, Any], num_decoder_layers: int):
+    def __init__(self, hparams: AttributeDict, num_decoder_layers: int):
         super().__init__()
 
         # Make sure the first block's output is returned from the encoder so that we can
