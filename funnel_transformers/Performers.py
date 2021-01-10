@@ -76,9 +76,8 @@ class PerformerAttention(nn.Module):
         self.kernel_fn = KERNEL_CALLABLES[self.kernel_type]
 
         if self.use_linear_layers:
-            self.linear_layers = [nn.Linear(self.d_model, self.d_model) for _ in range(3)]
+            self.linear_layers = [nn.Linear(self.d_model, self.d_model) for _ in range(4)]
 
-        self.output_linear = nn.Linear(in_features=self.d_model, out_features=self.d_model)
         self.pruned_heads = set()
 
         if self.causal:
@@ -218,7 +217,8 @@ class PerformerAttention(nn.Module):
 
         # Coalesce attention heads
         context = rearrange(context, "b h l d -> b l (h d)")
-        context = self.output_linear(context)  # (bs, q_length, dim)
+        if self.use_linear_layers:
+            context = self.linear_layers[-1](context)  # (bs, q_length, dim)
 
         if att_map_to_output:
             return context, att_map_to_output
@@ -340,8 +340,8 @@ def _get_kacs_random_walk_chain(batch, num_rows, device=None):
 
         # Group the matrix into random, non-overlapping pairs of rows. Because these pairs are non-overlapping, we can
         # perform each set of rotations in parallel.
-        shuffled_rows = _batch_randperm(batch, num_rows, device=device).view(batch, -1, 1, 1)
-        random_row_pairs = block.gather(1, shuffled_rows.expand_as(block)).view(batch, -1, 2, num_rows)
+        shuffled_rows = rearrange(_batch_randperm(batch, num_rows, device=device), 'b r -> b r 1')
+        random_row_pairs = rearrange(block.gather(1, shuffled_rows.expand_as(block)), 'b (r p) c -> b r p c', p=2)
 
         rows1, rows2 = random_row_pairs[:, :, 0], random_row_pairs[:, :, 1]
         new_rows1 = cosines * rows1 + sines * rows2
@@ -369,6 +369,6 @@ def _headwise_causal_numerator(q_prime, k_prime_t, v):
         prefix_sums = outer_prods.cumsum(dim=1)
 
         query_prods = torch.einsum('blmd,blm->bld', prefix_sums, q_prime[:, head])
-        results.append(query_prods.unsqueeze(1))
+        results.append(query_prods)
 
-    return torch.cat(results, dim=1)
+    return torch.stack(results, dim=1)

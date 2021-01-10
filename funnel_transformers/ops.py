@@ -164,7 +164,7 @@ class RelativePositionalAttention(nn.Module):
             q_prime_prod, k_prime_prod, denom_prod = norm, norm, 1.0
             for attn, (query, key) in zip(self.performer_attentions, qk_pairs):
                 q_prime, k_prime = attn.get_projected_queries_and_keys(query, key)
-                denom = attn.denominator_for_projected_queries_and_keys(query, key)
+                denom = attn.denominator_for_projected_queries_and_keys(q_prime, k_prime.transpose(-2, -1))
 
                 q_prime_prod *= q_prime; k_prime_prod *= k_prime; denom_prod *= denom
 
