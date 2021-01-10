@@ -340,8 +340,8 @@ def _get_kacs_random_walk_chain(batch, num_rows, device=None):
 
         # Group the matrix into random, non-overlapping pairs of rows. Because these pairs are non-overlapping, we can
         # perform each set of rotations in parallel.
-        shuffled_rows = rearrange(_batch_randperm(batch, num_rows, device=device), 'b r -> b r 1 1')
-        random_row_pairs = rearrange(block.gather(1, shuffled_rows.expand_as(block)), 'b (r p) c -> b r p c', p=2)
+        shuffled_rows = _batch_randperm(batch, num_rows, device=device).view(batch, -1, 1, 1)
+        random_row_pairs = block.gather(1, shuffled_rows.expand_as(block)).view(batch, -1, 2, num_rows)
 
         rows1, rows2 = random_row_pairs[:, :, 0], random_row_pairs[:, :, 1]
         new_rows1 = cosines * rows1 + sines * rows2
