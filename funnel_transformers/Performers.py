@@ -330,7 +330,6 @@ def _get_kacs_random_walk_chain(batch, num_rows, device=None):
     # Start with identity matrix
     block = torch.eye(num_rows, device=device)
     block = block.expand(batch, num_rows, num_rows)
-    block.unsqueeze_(2)
 
     burnin_steps = 2 * int(math.ceil(math.log(num_rows)))
     for n in count():

@@ -93,7 +93,6 @@ class RelativePositionalAttention(nn.Module):
 
         self.hparams = hparams
         self.attn_type = hparams.attention_type
-        breakpoint()
 
         self.dropout = hparams.dropout
         self.dropatt = hparams.attention_dropout
