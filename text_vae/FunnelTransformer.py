@@ -28,7 +28,6 @@ class FunnelTransformer(nn.Module):
         attention_dropout=0.1,
         dropout=0.1,
         ffn_dropout=0.0,
-        pooling_type='mean',
         separate_cls=True,
         num_classes=0,
 
@@ -84,7 +83,7 @@ class FunnelTransformer(nn.Module):
         self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
         self.attention_state = shared_attention_state or AttentionState(hparams)
 
-    def forward(self, x: Tensor, input_mask: Tensor = None) -> Dict[str, Any]:
+    def forward(self, x: Tensor, input_mask: Tensor = None, reset_attention_state: bool = True) -> Dict[str, Any]:
         config = self.hparams
         hidden_states = []
 
@@ -114,7 +113,8 @@ class FunnelTransformer(nn.Module):
         if len(hidden_states) > 0:
             output['hidden_states'] = hidden_states
 
-        attn_state.reset()
+        if reset_attention_state:
+            attn_state.reset()
         return output
     
     def enumerate_layers(self) -> Iterator[int, FunnelLayer]:
@@ -194,7 +194,7 @@ class FunnelTransformer(nn.Module):
     def get_backward_compatible_dict(self) -> Dict:
         return transmute(
             self.hparams,
-            'vocab_size', 'd_model', 'dropout', 'pooling_type', 'separate_cls',
+            'vocab_size', 'd_model', 'dropout', 'separate_cls',
             d_embed='d_model',
             n_head='num_heads',
             d_head='d_model // num_heads',
@@ -205,6 +205,7 @@ class FunnelTransformer(nn.Module):
             
             # We lose info here since Funnel-Transformers doesn't support different scaling factors for each block
             pooling_size='scaling_factors[0]',
+            pooling_type='"mean"',
             pool_q_only='True'
         )
 

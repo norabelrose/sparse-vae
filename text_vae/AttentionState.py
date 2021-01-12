@@ -38,7 +38,8 @@ class AttentionState:
         return id(self)
 
     def get_attention_mask(self) -> Tensor:
-        return None if self.input_mask is None else self.input_mask[:, None, None, :]
+        input_mask = self.input_mask if not self.current_block else self.scaled_input_mask_for_block(self.current_block)
+        return None if input_mask is None else input_mask[:, None, None, :]
 
     def get_positional_encodings(self) -> Union[Tensor, List[Tensor]]:
         assert self.input_seq_len is not None, \
@@ -161,7 +162,7 @@ class AttentionState:
             return torch.cat([sines, cosines], dim=-1)
         else:
             # Factorized relative positional encodings are just absolute encodings with extra steps
-            cosines, sines = get_sinusoidal_encodings(0, seq_len)
+            sines, cosines = get_sinusoidal_encodings(0, seq_len)
 
             if positional_encoding_type == 'absolute':
                 return torch.cat([sines, cosines], dim=-1)
@@ -187,10 +188,14 @@ class AttentionState:
         encoding_type = hparams.positional_encoding_type
 
         if encoding_type == 'rel_shift':
-            # The indices of encodings we need to gather from the base_encodings tensor
-            encoding_indices = torch.arange(2 * seq_len - 1, 0, -k_stride, dtype=torch.long, device=device)
-            encoding_indices = encoding_indices[:, None].expand(encoding_indices.shape[0], hparams.d_model)
-            return base_encodings.gather(0, encoding_indices)
+            # All possible relative positional offsets at this scale, from greatest to least
+            rel_offsets = torch.arange(seq_len, 1 - seq_len, -k_stride, dtype=torch.long, device=device)
+
+            # Gather the relative positional encodings that are relevant for this sequence length
+            zero_offset = seq_len * 2
+            rel_offsets = rel_offsets[:, None] + zero_offset
+            rel_offsets = rel_offsets.expand(rel_offsets.size(0), hparams.d_model)
+            return base_encodings.gather(0, rel_offsets)
         else:
             # With absolute positional encodings, we have two encoding tensors; one for queries and one for keys
             if encoding_type == 'absolute':
@@ -207,7 +212,7 @@ class AttentionState:
             return q_encodings + k_encodings
 
     # Used for scaling input tensors and padding masks
-    def _scale_tensor(self, x: Tensor, scaling_factor: int, mode: str = None) -> Optional[Tensor]:
+    def _scale_tensor(self, x: Tensor, scaling_factor: int, mode: str = "mean") -> Optional[Tensor]:
         # Don't do unnecessary work
         if x is None:
             return None
@@ -221,7 +226,6 @@ class AttentionState:
             stride = (scaling_factor, 1)
             x = x[:, None, :, :]
 
-            mode = mode or hparams.pooling_type
             if mode == "mean":
                 x = F.avg_pool2d(x, stride, stride=stride, ceil_mode=True)
             elif mode == "min":
