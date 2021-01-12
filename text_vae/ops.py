@@ -92,7 +92,7 @@ class RelativePositionalAttention(nn.Module):
         d_head = d_model // n_head
 
         self.hparams = hparams
-        self.attn_type = hparams.attention_type
+        self.positional_encoding_type = hparams.positional_encoding_type
 
         self.dropout = hparams.dropout
         self.dropatt = hparams.attention_dropout
@@ -110,7 +110,6 @@ class RelativePositionalAttention(nn.Module):
         self.r_r_bias = nn.Parameter(torch.zeros(n_head, 1, d_head))
         self.r_kernel = nn.Parameter(torch.zeros(n_head, d_model, d_head))
         self.r_s_bias = nn.Parameter(torch.zeros(n_head, d_head))
-        self.seg_embed = nn.Parameter(torch.zeros(2, n_head, d_head))
 
         self.post_proj = EinsumLayer("blnh,nhd->bld", [n_head, d_head], [d_model])
         self.layer_norm = LayerNorm(d_model)
@@ -118,19 +117,23 @@ class RelativePositionalAttention(nn.Module):
         self.reset_parameters()
 
         if hparams.use_performer_attention:
-            assert hparams.attention_type == "factorized",\
+            assert hparams.positional_encoding_type == "factorized",\
                 "Performer attention is only compatible with the factorized form of relative positional attention"
 
-            # One module for content attention, and two for positional attention
-            performer_config = PerformerAttentionConfig(d_model=d_model, num_heads=n_head, use_linear_layers=False)
-            self.performer_attentions = [PerformerAttention(performer_config) for _ in range(3)]
+            self.performer_attentions = nn.ModuleList([
+                # For the content attention
+                PerformerAttention(d_model=d_model, num_heads=n_head, use_linear_layers=False),
+
+                # For the positional attention- we actually just use a single attention head for this
+                PerformerAttention(d_model=d_model, num_heads=1, use_linear_layers=False),
+                PerformerAttention(d_model=d_model, num_heads=1, use_linear_layers=False)
+            ])
 
     def reset_parameters(self):
         nn.init.uniform_(self.r_w_bias, b=0.1)
         nn.init.uniform_(self.r_r_bias, b=0.1)
         nn.init.uniform_(self.r_kernel, b=0.1)
         nn.init.uniform_(self.r_s_bias, b=0.1)
-        nn.init.uniform_(self.seg_embed, b=0.1)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState) -> Tensor:
         input_q = q  # Save for residual connection
@@ -142,11 +145,10 @@ class RelativePositionalAttention(nn.Module):
 
         if self.hparams.use_performer_attention:
             # "Funnel Transformers" page 13, formula 8 and page 14, final formula of section A.2
-            r_r = self.r_r_bias[:, None, :]
-            q_i = (q + r_r) @ self.r_kernel.transpose(-2, -1)
+            q_i = (q + self.r_r_bias) @ self.r_kernel.transpose(-2, -1)
 
             # See the trigonometric identities in the paper on page 14
-            phi_i, pi_i, psi_j, omega_j = attn_state.positional_encoding
+            phi_i, pi_i, psi_j, omega_j = attn_state.get_positional_encodings()
 
             # This is my own derivation. Basically, the exp(A^{content} + A^{position}) in relative positional attention
             # can be decomposed into the elementwise product exp(A^{content}) * exp(A^{position}), and with the
@@ -155,8 +157,8 @@ class RelativePositionalAttention(nn.Module):
             # attention kernel function with O(n) time and space complexity. In order to have an unbiased estimate,
             # though, we need to draw the random features for each term independently, hence the three separate
             # PerformerAttention objects.
-            pos_query1, pos_query2, pos_key1, pos_key2 = q_i * phi_i, psi_j, q_i * pi_i, omega_j
-            qk_pairs = [(q, k), (pos_query1, pos_key1), (pos_query2, pos_query2)]
+            pos_q1, pos_q2, pos_k1, pos_k2 = q_i * phi_i, psi_j, q_i * pi_i, omega_j
+            qk_pairs = [(q, k), (pos_q1, pos_k1), (pos_q2, pos_q2)]
             norm = self.normalizer ** 0.5   # We multiply both Q and K by the 4th root of d_model, not Q by its sqrt
 
             # Get the elementwise products of all the Q', K', and denominators
@@ -171,26 +173,23 @@ class RelativePositionalAttention(nn.Module):
             output = q_prime_prod @ (k_prime_prod @ v) / denom_prod
 
         else:
-            # content based attention score
-            r_w = self.r_w_bias[:, None, :]
-            content_score = (q + r_w) @ k.transpose(-2, -1) * self.normalizer
-            
-            pos_bias = self._attn_pos_term(q, k.size(-2), attn_state)
-            seg_bias = self._attn_seg_term(attn_state.segment_mask, q, attn_state)
+            # Content based attention score
+            content_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * self.normalizer
+            pos_term = self._attn_pos_term(q, k.size(-2), attn_state)
 
-            # merge attention scores
-            attn_score = content_score + pos_bias + seg_bias
+            # Merge attention scores
+            attn_score = content_score + pos_term
 
-            # precision safe
+            # Precision safety
             dtype = attn_score.dtype
             attn_score = attn_score.float()
 
-            # perform masking
-            attn_mask = attn_state.attention_mask
+            # Perform masking
+            attn_mask = attn_state.get_attention_mask()
             if attn_mask is not None:
                 attn_score = attn_score - BIG_CONST * attn_mask
 
-            # attention distribution
+            # Attention distribution
             attn_dist = torch.softmax(attn_score, dim=-1)
             attn_dist = attn_dist.type(dtype)
             attn_dist = self.att_drop(attn_dist)
@@ -204,6 +203,34 @@ class RelativePositionalAttention(nn.Module):
 
         output = self.layer_norm(input_q + attn_out)  # Residual connection
         return output
+
+    # A^{position} in the paper
+    def _attn_pos_term(self, q, k_len, attn_state: AttentionState):
+        pos_enc = attn_state.get_positional_encodings()
+
+        if self.positional_encoding_type == "factorized":
+            enc_q_1, enc_q_2, enc_k_1, enc_k_2 = pos_enc  # seq_len, d_model
+            q_r = (q + self.r_r_bias) @ self.r_kernel.transpose(-2, -1) * self.normalizer
+
+            # Broadcast positional encodings across the batch and head dimensions
+            q_r_1 = q_r * enc_q_1
+            q_r_2 = q_r * enc_q_2
+
+            bd = q_r_1 @ enc_k_1.transpose(-2, -1) + q_r_2 @ enc_k_2.transpose(-2, -1)
+
+        elif self.positional_encoding_type == "rel_shift":
+            shift = 1 + attn_state.block_begin_flag
+
+            # Funnel Transformer paper, page 13
+            bd = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
+            bd = self._rel_shift(bd, -2, k_len, shift)
+        else:
+            raise NotImplementedError
+
+        if (not_cls := attn_state.get_not_cls_mask()) is not None:
+            bd *= not_cls
+
+        return bd
 
     @staticmethod
     def _rel_shift(x, row_axis, key_len, shift=1):
@@ -233,53 +260,3 @@ class RelativePositionalAttention(nn.Module):
         y = torch.narrow(y, col_axis, 0, key_len)
 
         return y
-
-    # A^{position} in the paper
-    def _attn_pos_term(self, q, k_len, attn_state: AttentionState):
-        pos_enc = attn_state.positional_encoding
-        r_r = self.r_r_bias[:, None, :]
-
-        if self.attn_type == "factorized":
-            enc_q_1, enc_q_2, enc_k_1, enc_k_2 = pos_enc    # seq_len, d_model
-            q_r = (q + r_r) @ self.r_kernel.transpose(-2, -1) * self.normalizer
-
-            # Broadcast positional encodings across the batch and head dimensions
-            q_r_1 = q_r * enc_q_1
-            q_r_2 = q_r * enc_q_2
-
-            bd = q_r_1 @ enc_k_1.transpose(-2, -1) + q_r_2 @ enc_k_2.transpose(-2, -1)
-
-        elif self.attn_type == "rel_shift":
-            shift = 1 + attn_state.block_begin_flag
-
-            # Funnel Transformer paper, page 13
-            bd = (q + r_r) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
-            bd = self._rel_shift(bd, -2, k_len, shift)
-        else:
-            raise NotImplementedError
-
-        if attn_state.not_cls_mask is not None:
-            bd *= attn_state.not_cls_mask
-        
-        return bd
-
-    def _attn_seg_term(self, seg_mat, q_head, attn_state: AttentionState):
-        # segment based attention score
-        if seg_mat is None:
-            seg_bias = 0
-        else:
-            r_s_bias = self.r_s_bias * self.normalizer
-            seg_embed = self.seg_embed
-
-            seg_bias = torch.einsum("...ind,snd->...nis", q_head + r_s_bias, seg_embed)
-            tgt_shape = list(seg_mat.size())
-            tgt_shape.insert(-2, self.hparams.num_heads)
-            seg_mat = torch.unsqueeze(seg_mat, -3).expand(tgt_shape)
-            _diff, _same = torch.split(seg_bias, 1, dim=-1)
-            _diff = _diff.expand(tgt_shape)
-            _same = _same.expand(tgt_shape)
-            seg_bias = torch.where(seg_mat, _same, _diff)
-            if attn_state.not_cls_mask is not None:
-                seg_bias *= attn_state.not_cls_mask
-
-        return seg_bias

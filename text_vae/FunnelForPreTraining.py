@@ -1,6 +1,6 @@
 from .FunnelWithDecoder import *
 from .RemoteModels import *
-from ..HparamUtils import *
+from .HparamUtils import *
 from collections import defaultdict
 from copy import deepcopy
 from torch import nn, Tensor

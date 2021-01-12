@@ -3,10 +3,11 @@ import os
 import torch
 import unittest
 from contextlib import nullcontext
-from ..funnel_transformers.FunnelTransformer import FunnelTransformer
+from pytorch_lightning.utilities import AttributeDict
+from text_vae import FunnelTransformer
 
 # This should be set to wherever the 'pytorch' directory of original Funnel-Transformer package is on your system
-TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS = os.getenv("TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS", None)
+TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS = os.getenv("TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS")
 
 
 class TestFunnelTransformer(unittest.TestCase):
@@ -16,8 +17,8 @@ class TestFunnelTransformer(unittest.TestCase):
     def test_backward_compatibility(self):
         directory = os.path.expanduser(TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS)
         if not os.path.isdir(directory):
-            print(f"test_backward_compatibility: Can't find the Funnel-Transformer package on your system. Make sure"
-                  f" you've downloaded it (see https://github.com/laiguokun/Funnel-Transformer) and then set the "
+            print(f"test_backward_compatibility: Can't find the Funnel-Transformer package at {directory}. Make sure"
+                  f" you've downloaded it (see https://github.com/laiguokun/Funnel-Transformer) and then set the"
                   f" TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS environment variable appropriately. Skipping test for now.")
             return
 
@@ -40,8 +41,8 @@ class TestFunnelTransformer(unittest.TestCase):
             exec(file_text, globals())  # Load everything
         
         with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext(), torch.no_grad():
-            for attn_type in ("factorized", "rel_shift"):
-                new_model = FunnelTransformer(dict(attention_type=attn_type))
+            for positional_encoding_type in ("factorized", "rel_shift"):
+                new_model = FunnelTransformer(AttributeDict(positional_encoding_type=positional_encoding_type))
                 new_model.load_pretrained_weights()
                 new_model.eval()
                 
@@ -69,4 +70,5 @@ class TestFunnelTransformer(unittest.TestCase):
                 print('Mean absolute error: ', mean_err.item())
                 print('Old output: ', output_old[0][4::4])
                 print('New output: ', output_new)
-                self.assertTrue(mean_err < 1e-4)
+                with self.subTest(positional_encoding_type):
+                    self.assertTrue(mean_err < 1e-4)

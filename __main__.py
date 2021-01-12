@@ -2,10 +2,10 @@ from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 from pytorch_lightning import Trainer, LightningDataModule
 from typing import Mapping, MutableMapping, Sequence
-from .Autoencoder import Autoencoder
-from .funnel_transformers.FunnelForPreTraining import FunnelForPreTraining
-from .training.Datasets import ProjectGutenbergDataModule
-from .training.FunnelPreTrainingDataModule import FunnelPreTrainingDataModule
+from text_vae import Autoencoder
+from text_vae import FunnelForPreTraining
+from text_vae import ProjectGutenbergDataModule
+from text_vae import FunnelPreTrainingDataModule
 
 
 def add_args_from_hparam_defaults(argparser: ArgumentParser, defaults: Mapping):

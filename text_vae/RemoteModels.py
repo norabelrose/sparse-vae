@@ -63,8 +63,8 @@ def load_remote_model(url: str) -> Path:
     iterator = response.iter_content(chunk_size=chunk_size)
     pbar = tqdm(desc="Downloading model", total=content_length, unit='iB', unit_scale=True)
 
+    archive_path = models_dir / model_name
     try:
-        archive_path = models_dir / model_name
         with archive_path.open(mode='wb') as f:
             for chunk in iterator:
                 f.write(chunk)

@@ -4,8 +4,9 @@ from .AttentionState import AttentionState
 from .ops import RelativePositionalAttention
 from .ops import LayerNorm
 from .ops import PositionwiseFFN
+from .Performers import PerformerAttention
 from .RemoteModels import *
-from ..HparamUtils import *
+from .HparamUtils import *
 from pytorch_lightning.utilities import AttributeDict
 from torch import Tensor
 from typing import *
@@ -29,13 +30,9 @@ class FunnelTransformer(nn.Module):
         ffn_dropout=0.0,
         pooling_type='mean',
         separate_cls=True,
-        pool_q_only=True,
-        truncate_seq=True,
-        seg_id_cls=2,  # Segment ID of the [CLS] token
-        pad_id=None,
         num_classes=0,
 
-        attention_type='rel_shift',
+        positional_encoding_type='rel_shift',  # 'absolute', 'rel_shift' or 'factorized'
         rezero_nonpretrained_blocks=False,
     
         # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of
@@ -49,7 +46,7 @@ class FunnelTransformer(nn.Module):
         super().__init__()
 
         if hparams.get('use_performer_attention'):
-            hparams['attention_type'] = 'factorized'
+            hparams['positional_encoding_type'] = 'factorized'
 
         hparams = merge(self.default_hparams, hparams)
 
@@ -95,7 +92,7 @@ class FunnelTransformer(nn.Module):
             x = self.input_layer(x)  # x.shape == (batch, length, d_model)
         
         attn_state = self.attention_state
-        attn_state.configure_for_input(x, input_mask, None)
+        attn_state.configure_for_input(x, input_mask)
 
         q = kv = x
         for i, block in enumerate(self.blocks):
@@ -184,14 +181,20 @@ class FunnelTransformer(nn.Module):
 
     # For the "args" parameter in the old FunnelTFM.__init__()
     def get_backward_compatible_args(self) -> AttributeDict:
-        return transmute(self.hparams, 'pad_id', 'seg_id_cls', 'truncate_seq',
-                         attn_type='attention_type', num_class='num_classes')
+        return transmute(
+            self.hparams,
+            attn_type='positional_encoding_type',
+            num_class='num_classes',
+            pad_id='None',
+            seg_id_cls='2',
+            truncate_seq='True'
+        )
     
     # Get a dictionary compatible with the old ModelConfig class from Funnel-Transformers
     def get_backward_compatible_dict(self) -> Dict:
         return transmute(
             self.hparams,
-            'vocab_size', 'd_model', 'dropout', 'pooling_type', 'separate_cls', 'pool_q_only',
+            'vocab_size', 'd_model', 'dropout', 'pooling_type', 'separate_cls',
             d_embed='d_model',
             n_head='num_heads',
             d_head='d_model // num_heads',
@@ -201,7 +204,8 @@ class FunnelTransformer(nn.Module):
             block_size="'_'.join([str(x) for x in block_sizes])",
             
             # We lose info here since Funnel-Transformers doesn't support different scaling factors for each block
-            pooling_size='scaling_factors[0]'
+            pooling_size='scaling_factors[0]',
+            pool_q_only='True'
         )
 
 
@@ -209,7 +213,30 @@ class FunnelLayer(nn.Module):
     def __init__(self, hparams):
         super().__init__()
 
-        self.attention = RelativePositionalAttention(hparams)
+        d_model = hparams.d_model
+        if hparams.positional_encoding_type == 'absolute':
+            # Softmax attention with absolute, sinusoidal positional encodings
+            if not hparams.use_performer_attention:
+                raw_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=hparams.num_heads)
+
+            # Performer attention with absolute positional embeddings
+            else:
+                raw_attn = PerformerAttention(**select(hparams, 'd_model', 'num_heads'))
+
+            # Wrap the raw attention module with this function that adds the positional encodings to the queries and
+            # keys, but not to the values, as proposed in the Shortformer paper
+            def absolute_pos_attn_func(q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState):
+                q_pos_encodings, k_pos_encodings = attn_state.get_positional_encodings()
+                q += q_pos_encodings
+                k += k_pos_encodings
+                return raw_attn(q, k, v)
+
+            self.attention = absolute_pos_attn_func
+
+        # Either softmax or Performer attention with relative positional embeddings
+        else:
+            self.attention = RelativePositionalAttention(hparams)
+
         self.feedforward = PositionwiseFFN(hparams.d_model, hparams.d_model * 4, hparams.dropout, hparams.ffn_dropout)
 
         # A Callable (e.g. a Module) that will be called with the output of this layer. The output of
