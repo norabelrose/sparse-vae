@@ -181,7 +181,7 @@ class Autoencoder(pl.LightningModule):
             self.total_nonpadding_positions += (~padding_mask).sum()
 
         # Sample unconditionally (used during evaluation/generation)
-        elif not (z := self.clamped_latents.get(layer_index)):
+        elif (z := self.clamped_latents.get(layer_index)) is None:
             z = sample_diagonal_gaussian_variable(p_mu, p_logsigma, self.temperatures[layer_index])
 
         layer_output += cell['p(x|z)'](z)
@@ -204,9 +204,10 @@ class Autoencoder(pl.LightningModule):
         # We have to be careful to exclude padding positions from our KL divergence calculation
         kl_divergence = self.total_kl_divergence / (self.total_nonpadding_positions * self.hparams.latent_depth)
         negative_log_likelihood = F.nll_loss(output_logits, target=input_tokens, weight=~padding_mask)
+        self.log_dict({'kl': kl_divergence, 'nll': negative_log_likelihood})
 
         negative_elbo = kl_divergence + negative_log_likelihood
-        return {'loss': negative_elbo, 'log': {'kl': kl_divergence, 'nll': negative_log_likelihood}}
+        return {'loss': negative_elbo}
 
     # Implements gradient skipping to stabilize training as described in 'Very Deep VAEs'
     def on_after_backward(self):
@@ -223,5 +224,5 @@ class Autoencoder(pl.LightningModule):
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Any]:
         return self.training_step(batch, batch_index)
 
-    def validation_epoch_end(self, losses: List[Tensor]) -> dict:
-        return {'log': {'val_loss': torch.mean(torch.stack(losses))}}
+    def validation_epoch_end(self, losses: List[Tensor]):
+        self.log('val_loss', torch.mean(torch.stack(losses)))
