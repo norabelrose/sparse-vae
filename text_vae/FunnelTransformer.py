@@ -31,7 +31,7 @@ class FunnelTransformer(nn.Module):
         separate_cls=True,
         num_classes=0,
 
-        positional_encoding_type='rel_shift',  # 'absolute', 'rel_shift' or 'factorized'
+        positional_encoding_type='rel_shift',  # 'absolute', 'absolute_decoupled', 'rel_shift' or 'factorized'
         rezero_nonpretrained_blocks=False,
     
         # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of

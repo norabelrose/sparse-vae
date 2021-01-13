@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from einops import rearrange
 from itertools import count
+from pytorch_lightning.utilities import AttributeDict
 from torch import nn
 from typing import *
 import logging
@@ -65,6 +66,10 @@ class PerformerAttention(nn.Module):
 
         assert self.num_heads and self.d_model, "Num_heads and d_model must be non-None"
         assert self.d_model % self.num_heads == 0, "Num_heads must divide d_model evenly"
+
+        if not self.num_random_features:
+            dim_per_head = self.d_model // self.num_heads
+            self.num_random_features = round(dim_per_head * math.log(dim_per_head))
 
         self.dropout = nn.Dropout(p=self.attention_dropout)
         self.calls_since_last_redraw = 0
@@ -242,7 +247,7 @@ class PerformerAttention(nn.Module):
 
     def _get_feature_matrix(self, batch_size, device):
         dim_per_head = self.d_model // self.num_heads
-        num_rows = self.num_random_features or round(dim_per_head * math.log(dim_per_head))
+        num_rows = self.num_random_features
         batch = batch_size if self.use_thick_features else 1
 
         if not self.use_orthogonal_features:

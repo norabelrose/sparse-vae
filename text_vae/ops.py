@@ -4,7 +4,7 @@ import numpy as np
 from einops import rearrange
 from torch import nn
 from .AttentionState import *
-from .Performers import PerformerAttention, PerformerAttentionConfig
+from .Performers import PerformerAttention
 
 BIG_CONST = 1e6
 
@@ -120,13 +120,15 @@ class RelativePositionalAttention(nn.Module):
             assert hparams.positional_encoding_type == "factorized",\
                 "Performer attention is only compatible with the factorized form of relative positional attention"
 
+            content_attn = PerformerAttention(d_model=d_model, num_heads=n_head, use_linear_layers=False)
             self.performer_attentions = nn.ModuleList([
-                # For the content attention
-                PerformerAttention(d_model=d_model, num_heads=n_head, use_linear_layers=False),
+                content_attn,
 
                 # For the positional attention- we actually just use a single attention head for this
-                PerformerAttention(d_model=d_model, num_heads=1, use_linear_layers=False),
-                PerformerAttention(d_model=d_model, num_heads=1, use_linear_layers=False)
+                PerformerAttention(d_model=d_model, num_heads=1, num_random_features=content_attn.num_random_features,
+                                   use_linear_layers=False),
+                PerformerAttention(d_model=d_model, num_heads=1, num_random_features=content_attn.num_random_features,
+                                   use_linear_layers=False)
             ])
 
     def reset_parameters(self):

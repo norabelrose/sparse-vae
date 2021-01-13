@@ -239,15 +239,12 @@ class AttentionState:
         return x.squeeze(1)
 
     def _prepare_for_pooling(self, x: Tensor, scaling_factor: int):
-        # Repeat the [CLS] token N times, where N is the scaling factor, in order to make sure it doesn't
-        # get pooled into the adjacent tokens
+        # Copy the [CLS] token (scaling_factor - 1) times to make sure it doesn't get pooled into the adjacent tokens
         if self.hparams.separate_cls:
-            # Sort of annoying thing we have to do for batch dimensions
-            batch_slices = [slice(None) for _ in range(x.dim() - 2)]
-            cls_slices = batch_slices + [slice(0, 1)]
-            cls_token = x[cls_slices]
+            cls_token = x.narrow(-2, 0, 1)           # The [CLS] token across all batches etc.
 
-            x = x.roll(scaling_factor - 1, -2)  # Shift everything over to make room for the bigger [CLS] token
-            x[batch_slices + [slice(0, scaling_factor - 1)]] = cls_token  # Overwrite a few tokens with the bigger [CLS]
+            shift = scaling_factor - 1               # We're magnifying [CLS] by scaling_factor
+            x = x.roll(shift, -2)                    # Roll to the right to make room for the bigger [CLS] token
+            x.narrow(-2, 0, shift).copy_(cls_token)  # Overwrite the last few tokens with [CLS]
 
         return x
