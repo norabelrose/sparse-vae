@@ -173,9 +173,23 @@ class FunnelForPreTraining(pl.LightningModule):
             tensor = torch.from_numpy(weights)
 
             # Align the shapes if need be
-            old_shape, new_shape = list(param.data.shape), list(tensor.shape)
-            if old_shape != new_shape and sorted(old_shape) == sorted(new_shape):
-                tensor = tensor.permute(*[new_shape.index(x) for x in old_shape])
+            pt_shape, tf_shape = param.shape, tensor.shape
+            if pt_shape != tf_shape:
+                assert param.numel() == tensor.numel(), f"{tf_name} of shape {tf_shape} cannot be coerced into shape "\
+                                                        f"{pt_shape}"
+
+                singleton_dims = [i for i, x in enumerate(pt_shape) if x == 1]  # Indices of singleton dims
+                tensor.squeeze_()
+
+                pt_shape2, tf_shape2 = param.squeeze().shape, tensor.shape
+                try:
+                    tensor = tensor.permute(*[tf_shape2.index(x) for x in pt_shape2])
+                except ValueError:
+                    raise ValueError(f"Cannot permute() {tf_name} from {tf_shape} to {pt_shape} since the "\
+                                     f"nonsingleton dimensions differ.")
+
+                for i in singleton_dims:
+                    tensor.unsqueeze_(i)
 
             return tensor
 

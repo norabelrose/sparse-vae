@@ -157,6 +157,7 @@ class PerformerAttention(nn.Module):
 
             q_prime = normalizing_constant * (q_kernel_output + self.kernel_epsilon)
             k_prime = normalizing_constant * (k_kernel_output + self.kernel_epsilon)
+            breakpoint()
             return q_prime, k_prime
 
         # Generalized attention (ReLU, ELU...)
