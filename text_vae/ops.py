@@ -159,7 +159,7 @@ class RelativePositionalAttention(nn.Module):
             # attention kernel function with O(n) time and space complexity. In order to have an unbiased estimate,
             # though, we need to draw the random features for each term independently, hence the three separate
             # PerformerAttention objects.
-            pos_q1, pos_q2, pos_k1, pos_k2 = q_i * phi_i, psi_j, q_i * pi_i, omega_j
+            pos_q1, pos_q2, pos_k1, pos_k2 = q_i * phi_i, psi_j[None, None], q_i * pi_i, omega_j[None, None]
             qk_pairs = [(q, k), (pos_q1, pos_k1), (pos_q2, pos_q2)]
             norm = self.normalizer ** 0.5   # We multiply both Q and K by the 4th root of d_model, not Q by its sqrt
 
@@ -169,10 +169,12 @@ class RelativePositionalAttention(nn.Module):
                 q_prime, k_prime = attn.get_projected_queries_and_keys(query, key)
                 denom = attn.denominator_for_projected_queries_and_keys(q_prime, k_prime.transpose(-2, -1))
 
-                q_prime_prod *= q_prime; k_prime_prod *= k_prime; denom_prod *= denom
+                q_prime_prod *= q_prime
+                k_prime_prod *= k_prime
+                denom_prod *= denom
 
             k_prime_prod = self.att_drop(k_prime_prod)
-            output = q_prime_prod @ (k_prime_prod @ v) / denom_prod
+            output = q_prime_prod @ (k_prime_prod.transpose(-2, -1) @ v) / denom_prod
 
         else:
             # Content based attention score

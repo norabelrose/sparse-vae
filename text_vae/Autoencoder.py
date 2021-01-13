@@ -54,24 +54,24 @@ class Autoencoder(pl.LightningModule):
         self.decoder_funnel = FunnelTransformer(decoder_hparams, shared_attention_state=attn_state)
 
         # Initial input into the decoder
-        self.decoder_seed = nn.Parameter(torch.zeros(1, 1, hparams.d_model))
-        overt_depth, latent_depth = hparams.latent_depth, hparams.overt_depth
+        overt_depth, latent_depth = encoder_hparams.d_model, hparams.latent_depth
+        self.decoder_seed = nn.Parameter(torch.zeros(1, 1, overt_depth))
 
         # Construct the decoder cells which generate p(z), q(z|x), and p(x|z) given the output of a Transformer layer
         def linear_with_gelu(input_dim, output_dim):
             # Note that we apply the activation function FIRST and then the Linear layer
             return nn.Sequential(nn.GELU(), nn.Linear(input_dim, output_dim))
 
-        self.decoder_cells = nn.ModuleList(
+        self.decoder_cells = nn.ModuleList([
             nn.ModuleDict({
                 # Output contains mu & log sigma for p(z)
                 'p(z)': linear_with_gelu(overt_depth, latent_depth * 2),
                 # Input is the encoder and decoder states concatenated depthwise, output is mu & log sigma for q(z|x)
                 'q(z|x)': linear_with_gelu(overt_depth * 2, latent_depth * 2),
-                'p(x|z)': linear_with_gelu(latent_depth, overt_depth),
+                'p(x|z)': linear_with_gelu(latent_depth, overt_depth)
             })
-            for _ in sum(encoder_hparams.block_sizes)
-        )
+            for _ in range(sum(encoder_hparams.block_sizes))
+        ])
 
         # After each layer in the decoder, call decoder_layer_forward with the layer's output and the block and
         # layer indices

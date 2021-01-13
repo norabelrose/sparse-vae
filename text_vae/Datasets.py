@@ -1,10 +1,10 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from itertools import chain, islice
 from pathlib import Path
 from tokenizers import BertWordPieceTokenizer
 from torch import Tensor
 from torch.utils.data import DataLoader
-from typing import ClassVar, Dict, List, Optional, Union
+from typing import *
 import datasets
 import multiprocessing
 import pytorch_lightning as pl
@@ -20,7 +20,13 @@ class TextVaeDataModule(pl.LightningDataModule):
     @classmethod
     def add_argparse_args(cls, parent_parser: ArgumentParser) -> ArgumentParser:
         parent_parser = super(TextVaeDataModule, cls).add_argparse_args(parent_parser)
+        parent_parser.add_argument("--split", type=str, default='train')
         return parent_parser
+
+    @classmethod
+    def from_argparse_args(cls, args: Namespace, **kwargs):
+        new_module = super(TextVaeDataModule, cls).from_argparse_args(args)
+        return new_module
 
     def __init__(self, batch_size: int = 10, max_sample_length: int = 512, chunk_long_samples: bool = True,
                  dataset_save_dir: Optional[Path] = None):
@@ -43,7 +49,7 @@ class TextVaeDataModule(pl.LightningDataModule):
 
     # Subclass hook
     def create_dataset(self):
-        self.dataset = datasets.load_dataset(self.dataset_name)
+        self.dataset = datasets.load_dataset(self.dataset_name, split='train')
 
     def prepare_data(self, *args, **kwargs):
         # Check if we already have the dataset

@@ -128,7 +128,7 @@ class PerformerAttention(nn.Module):
     # Turns Q into Q', K into K'
     def get_projected_queries_and_keys(self, q, k):
         self._redraw_features_if_needed(q.shape[0], q.device)
-
+        
         # Instead of dividing the product QK^T by sqrt(d), we divide Q and K by the 4th root of d.
         q = q / (self.d_model ** 0.25)
         k = k / (self.d_model ** 0.25)
@@ -162,7 +162,6 @@ class PerformerAttention(nn.Module):
 
             q_prime = normalizing_constant * (q_kernel_output + self.kernel_epsilon)
             k_prime = normalizing_constant * (k_kernel_output + self.kernel_epsilon)
-            breakpoint()
             return q_prime, k_prime
 
         # Generalized attention (ReLU, ELU...)
