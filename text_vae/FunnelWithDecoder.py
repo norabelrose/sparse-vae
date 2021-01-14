@@ -3,15 +3,13 @@ import numpy as np
 
 
 class FunnelWithDecoder(nn.Module):
-    def __init__(self, hparams: AttributeDict, num_decoder_layers: int):
+    def __init__(self, hparams: Union[FunnelTransformerHparams, OmegaConf], num_decoder_layers: int):
         super().__init__()
 
         # Make sure the first block's output is returned from the encoder so that we can
         # use it in the residual connection for the decoder
-        if not hparams.return_block_outputs:
-            hparams.return_block_outputs = [0]
-        elif 0 not in hparams.return_block_outputs:
-            hparams.return_block_outputs = [0] + hparams.return_block_outputs
+        if not hparams.block_outputs_to_return:
+            hparams.block_outputs_to_return = [0]
 
         self.encoder = FunnelTransformer(hparams)
         self.decoder = FunnelBlock(hparams, num_decoder_layers)

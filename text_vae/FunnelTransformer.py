@@ -7,6 +7,8 @@ from .ops import PositionwiseFFN
 from .Performers import PerformerAttention
 from .RemoteModels import *
 from .HparamUtils import *
+from dataclasses import dataclass, field
+from omegaconf import OmegaConf
 from pytorch_lightning.utilities import AttributeDict
 from torch import Tensor
 from typing import *
@@ -15,46 +17,51 @@ import torch
 import torch.nn as nn
 
 
-class FunnelTransformer(nn.Module):
-    default_hparams = AttributeDict(
-        block_sizes=(4, 4, 4),
-        d_model=768,
-        num_heads=12,
-        scaling_factors=(2, 2),
+@dataclass
+class FunnelTransformerHparams:
+    block_sizes: Tuple[int, ...] = (4, 4, 4)
+    d_model: int = 768
+    num_heads: int = 12
+    scaling_factors: Tuple[int, ...] = (2, 2)
 
-        # If None, d_embedding is set to equal d_model. For the generator in ELECTRA pretraining they are different.
-        d_embedding=None,
-        vocab_size=30522,
-        attention_dropout=0.1,
-        dropout=0.1,
-        ffn_dropout=0.0,
-        separate_cls=True,
-        num_classes=0,
+    # If None, d_embedding is set to equal d_model. For the generator in ELECTRA pretraining they are different.
+    d_embedding: Optional[int] = None
+    vocab_size: int = 30522
+    attention_dropout: float = 0.1
+    dropout: float = 0.1
+    ffn_dropout: float = 0.0
+    separate_cls: bool = True
+    num_classes: int = 0
 
-        positional_encoding_type='rel_shift',  # 'absolute', 'absolute_decoupled', 'rel_shift' or 'factorized'
-        rezero_nonpretrained_blocks=False,
-    
-        # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of
-        # selected blocks will be returned.
-        return_block_outputs=False,
-        use_performer_attention=False,
-        upsampling=False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
-    )
-    
-    def __init__(self, hparams: AttributeDict, shared_attention_state: Optional[AttentionState] = None):
-        super().__init__()
+    positional_encoding_type: str = 'rel_shift'  # 'absolute', 'absolute_decoupled', 'rel_shift' or 'factorized'
+    rezero_nonpretrained_blocks: bool = False
 
-        if hparams.get('use_performer_attention'):
-            hparams['positional_encoding_type'] = 'factorized'
+    # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of
+    # selected blocks will be returned.
+    block_outputs_to_return: Sequence[int] = field(default_factory=list)
+    use_performer_attention: bool = False
+    upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
-        hparams = merge(self.default_hparams, hparams)
+    def __post_init__(self):
+        if self.use_performer_attention:
+            assert self.positional_encoding_type not in ('rel_shift', 'factorized'),\
+                "Performer attention not supported with relative positional encodings"
 
         # Make it so scaling_factors and block_sizes are equal length; last scaling factor is 1 (no scaling)
-        if len(hparams.scaling_factors) < len(hparams.block_sizes):
-            hparams.scaling_factors += (1,)
+        if len(self.scaling_factors) < len(self.block_sizes):
+            self.scaling_factors += (1,)
 
-        if not hparams.d_embedding:
-            hparams.d_embedding = hparams.d_model
+        if not self.d_embedding:
+            self.d_embedding = self.d_model
+
+
+class FunnelTransformer(nn.Module):
+    def __init__(self, hparams: Union[FunnelTransformerHparams, OmegaConf],
+                 shared_attention_state: Optional[AttentionState] = None):
+        super().__init__()
+
+        if isinstance(hparams, FunnelTransformerHparams):
+            hparams = OmegaConf.structured(hparams)
 
         self.hparams = hparams
 
@@ -84,10 +91,10 @@ class FunnelTransformer(nn.Module):
         self.attention_state = shared_attention_state or AttentionState(hparams)
 
     def forward(self, x: Tensor, input_mask: Tensor = None, reset_attention_state: bool = True) -> Dict[str, Any]:
-        config = self.hparams
+        hparams = self.hparams
         hidden_states = []
 
-        if not config.upsampling:
+        if not hparams.upsampling:
             x = self.input_layer(x)  # x.shape == (batch, length, d_model)
         
         attn_state = self.attention_state
@@ -98,13 +105,11 @@ class FunnelTransformer(nn.Module):
             q, kv = block(q, kv, attn_state)
 
             # Cache intermediate hidden states if indicated
-            return_blocks = config.return_block_outputs
-            return_blocks = return_blocks if type(return_blocks) == bool else i in return_blocks
-            if return_blocks:
+            if i in hparams.block_outputs_to_return:
                 hidden_states.append(kv)
 
         output = {}
-        if config.upsampling:
+        if hparams.upsampling:
             # Non-autoregressively generate a softmax distribution over words
             output['logits'] = self.output_layer(q)
         else:
@@ -177,7 +182,7 @@ class FunnelTransformer(nn.Module):
 
         if len(noninitialized_keys) > 0:
             logger = logging.getLogger(__name__)
-            logger.warning(f'PretrainedModelManager: Failed to initialize weights: {noninitialized_keys}')
+            logger.warning(f'Failed to initialize weights: {noninitialized_keys}')
 
     # For the "args" parameter in the old FunnelTFM.__init__()
     def get_backward_compatible_args(self) -> AttributeDict:

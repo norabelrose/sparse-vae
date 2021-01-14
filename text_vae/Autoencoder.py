@@ -1,51 +1,52 @@
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import partial
 from numpy import prod
+from omegaconf import OmegaConf
 from torch import nn
 from torch import Tensor
 from .HparamUtils import *
-from .FunnelTransformer import FunnelTransformer
-from pytorch_lightning.utilities import AttributeDict
+from .FunnelTransformer import FunnelTransformer, FunnelTransformerHparams
 import math
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import torch
 
 
-class Autoencoder(pl.LightningModule):
-    default_hparams = AttributeDict(
-        encoder_hparams=mutate(
-            FunnelTransformer.default_hparams,
-            block_sizes=(4, 4, 4, 2, 2),    # Number of layers in each encoder block; reversed for the decoder
-            scaling_factors=(2, 2, 4, 4)    # How much the hidden state is downsampled between each encoder block
-        ),
-        latent_depth=16,                        # Depth of the latent tensors (dimensionality per token)
-        use_pretrained_encoder=True,
-        copy_encoder_weights_to_decoder=True,
-        use_autoregressive_decoding=False,
-
-        grad_clip_threshold=200.0,
-        grad_skip_threshold=400.0,
-        lr=1e-4,
-        warmup_steps=100,
-        weight_decay=0.01
+@dataclass
+class AutoencoderHparams:
+    encoder: FunnelTransformerHparams = FunnelTransformerHparams(
+        block_sizes=(4, 4, 4, 2, 2),  # Number of layers in each encoder block; reversed for the decoder
+        scaling_factors=(2, 2, 4, 4)  # How much the hidden state is downsampled between each encoder block
     )
+    latent_depth: int = 16  # Depth of the latent tensors (dimensionality per token)
+    use_pretrained_encoder: bool = True
+    copy_encoder_weights_to_decoder: bool = True
+    use_autoregressive_decoding: bool = False
 
-    def __init__(self, hparams: MutableMapping[str, Any]):
+    grad_clip_threshold: float = 200.0
+    grad_skip_threshold: float = 400.0
+    lr: float = 1e-4
+    warmup_steps: int = 100
+    weight_decay: float = 0.01
+
+
+class Autoencoder(pl.LightningModule):
+    def __init__(self, hparams: OmegaConf):
         super().__init__()
 
         # save_hyperparameters() stores the hparams in self.hparams and ensures they are saved to disk during training.
-        hparams = merge(self.default_hparams, hparams)
         self.save_hyperparameters(hparams)
 
-        encoder_hparams = hparams.encoder_hparams
+        encoder_hparams = hparams.encoder
         decoder_hparams = mutate(
             encoder_hparams,
             block_sizes=encoder_hparams.block_sizes[::-1],          # Reverse the order of the blocks
             scaling_factors=encoder_hparams.scaling_factors[::-1],
             upsampling=True
         )
-        encoder_hparams = mutate(encoder_hparams, return_block_outputs=True)
+        all_blocks = list(range(len(encoder_hparams.block_sizes)))
+        encoder_hparams = mutate(encoder_hparams, return_block_outputs=all_blocks)
 
         # This way, the encoder and decoder Transformers share information about, i.e., the padding mask
         self.encoder_funnel = FunnelTransformer(encoder_hparams)

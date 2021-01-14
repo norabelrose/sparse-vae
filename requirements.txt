@@ -7,3 +7,4 @@ torch>=1.4.0
 tokenizers>=0.9.4
 tqdm>=4.49.0
 requests>=2.24.0
+omegaconf>=2.0.5

@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from einops import rearrange
 from itertools import count
-from pytorch_lightning.utilities import AttributeDict
 from torch import nn
 from typing import *
 import logging
@@ -12,7 +11,7 @@ import torch.nn.functional as F
 
 
 @dataclass
-class PerformerAttentionConfig:
+class PerformerAttentionHparams:
     attention_dropout: float = 0.1
     kernel_type: str = 'exp'
 
@@ -52,17 +51,17 @@ KERNEL_CALLABLES = {
 class PerformerAttention(nn.Module):
     causal_numerator_fn = None  # Either refers to _headwise_causal_numerator or the fast_transformers CUDA kernel
 
-    def __init__(self, config: Optional[PerformerAttentionConfig] = None, **kwargs):
+    def __init__(self, hparams: Optional[PerformerAttentionHparams] = None, **kwargs):
         super().__init__()
 
-        config = config or PerformerAttentionConfig()
+        hparams = hparams or PerformerAttentionHparams()
 
         # kwargs take precedence over the default values that might be stored in the config object
         for k, v in kwargs.items():
-            assert hasattr(config, k), f"'{k}' is an invalid config parameter"
-            setattr(config, k, v)
+            assert hasattr(hparams, k), f"'{k}' is an invalid config parameter"
+            setattr(hparams, k, v)
 
-        self.__dict__.update(config.__dict__)
+        self.__dict__.update(hparams.__dict__)
 
         assert self.num_heads and self.d_model, "Num_heads and d_model must be non-None"
         assert self.d_model % self.num_heads == 0, "Num_heads must divide d_model evenly"

@@ -3,34 +3,38 @@ from .RemoteModels import *
 from .HparamUtils import *
 from collections import defaultdict
 from copy import deepcopy
+from dataclasses import *
 from torch import nn, Tensor
 import pytorch_lightning as pl
 import torch.nn.functional as F
 import torch
 
 
+@dataclass
+class FunnelForPreTrainingHparams:
+    # Discriminator and generator hparams copied from this
+    funnel: FunnelTransformerHparams = field(default_factory=FunnelTransformerHparams)
+    train_generator: bool = False,
+    use_pretrained_adam_state: bool = False,  # Whether to use the saved Adam `m` and `v` from the pretrained checkpoint
+    use_pretrained_weights: bool = True,
+
+    # See Funnel Transformer paper, page 15
+    lr: float = 1e-4,
+    weight_decay: float = 0.01,
+    adam_eps: float = 1e-6
+
+
 # Funnel Transformer with a decoder block at the end for ELECTRA pretraining
 class FunnelForPreTraining(pl.LightningModule):
-    default_hparams = AttributeDict(
-        # Discriminator and generator hparams copied from this
-        funnel_hparams=FunnelTransformer.default_hparams,
-        train_generator=False,
-        use_pretrained_adam_state=False,    # Whether to use the saved Adam `m` and `v` from the pretrained checkpoint
-        use_pretrained_weights=True,
-
-        # See Funnel Transformer paper, page 15
-        lr=1e-4,
-        weight_decay=0.01,
-        adam_eps=1e-6
-    )
-
-    def __init__(self, hparams: Mapping[str, Any]):
+    def __init__(self, hparams: Union[FunnelForPreTrainingHparams, OmegaConf]):
         super(FunnelForPreTraining, self).__init__()
 
-        hparams = merge(self.default_hparams, hparams)
+        if isinstance(hparams, FunnelTransformerHparams):
+            hparams = OmegaConf.structured(FunnelTransformerHparams)
+
         self.save_hyperparameters(hparams)
 
-        discriminator_hparams = hparams.funnel_hparams
+        discriminator_hparams = hparams.funnel
         generator_hparams = deepcopy(discriminator_hparams)
         generator_hparams.d_embedding = discriminator_hparams.d_model   # Generator shares embeddings w/ discriminator
         generator_hparams.d_model //= 4

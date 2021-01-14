@@ -73,7 +73,7 @@ class TextVaeDataModule(pl.LightningDataModule):
             return {'text': list(chunk_iter)}
 
         nontext_cols = self.dataset.column_names
-        nontext_cols.remove('text')
+        del nontext_cols['text']
 
         # Tokenize, chunk, and save
         size = max(multiprocessing.cpu_count(), 10)
