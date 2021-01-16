@@ -6,7 +6,7 @@ from .ops import LayerNorm
 from .ops import PositionwiseFFN
 from .Performers import PerformerAttention
 from .RemoteModels import *
-from .HparamUtils import *
+from .Utilities import *
 from dataclasses import dataclass, field
 from omegaconf import OmegaConf
 from pytorch_lightning.utilities import AttributeDict
@@ -90,37 +90,34 @@ class FunnelTransformer(nn.Module):
         self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
         self.attention_state = shared_attention_state or AttentionState(hparams)
 
-    def forward(self, x: Tensor, input_mask: Tensor = None, reset_attention_state: bool = True) -> Dict[str, Any]:
+    def forward(self, x: Dict[str, Any], reset_attention_state: bool = True) -> Dict[str, Any]:
         hparams = self.hparams
-        hidden_states = []
 
         if not hparams.upsampling:
-            x = self.input_layer(x)  # x.shape == (batch, length, d_model)
+            x['input'] = self.input_layer(x['input'])  # x.shape == (batch, length, d_model)
         
         attn_state = self.attention_state
-        attn_state.configure_for_input(x, input_mask)
+        attn_state.configure_for_input(x['input'], x.get('input_mask'))
 
-        q = kv = x
+        x.update(q=x['input'], kv=x.pop('input'), attn_state=attn_state, hidden_states=[])
         for i, block in enumerate(self.blocks):
-            q, kv = block(q, kv, attn_state)
+            x = block(x)
 
             # Cache intermediate hidden states if indicated
             if i in hparams.block_outputs_to_return:
-                hidden_states.append(kv)
+                x['hidden_states'].append(x['kv'])
 
-        output = {}
         if hparams.upsampling:
             # Non-autoregressively generate a softmax distribution over words
-            output['logits'] = self.output_layer(q)
+            x['logits'] = self.output_layer(x.pop('q'))
         else:
-            output['output'] = q
+            x['output'] = x.pop('q')
 
-        if len(hidden_states) > 0:
-            output['hidden_states'] = hidden_states
+        del x['attn_state'], x['kv']
 
         if reset_attention_state:
             attn_state.reset()
-        return output
+        return x
     
     def enumerate_layers(self) -> Iterator[int, FunnelLayer]:
         absolute_index = 0
@@ -168,8 +165,6 @@ class FunnelTransformer(nn.Module):
             try:
                 old_weights: Tensor = state_dict[old_name]
 
-                # The old Funnel-Transformer had custom Dense layers that reshaped the input and therefore had
-                # 3D kernel tensors- in this project we're more conventional so we're using standard nn.Linear modules
                 if old_weights.shape != param.data.shape:
                     if "r_kernel" in var_name:
                         old_weights = old_weights.permute(1, 0, 2)
@@ -251,12 +246,13 @@ class FunnelLayer(nn.Module):
         self.output_transform: Optional[Callable] = None
 
     # Q is different from K and V right after pooling; K and V are always the same
-    def forward(self, q, kv, attention_state: AttentionState):
+    def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
         # These custom attention and feedforward layers have built-in residual connections
-        x = self.attention(q, kv, kv, attention_state)
-        x = self.feedforward(x)
+        x['kv'] = self.attention(x['q'], x['kv'], x['q'], x['attn_state'])
+        x['kv'] = self.feedforward(x['kv'])
 
         if self.output_transform:
+            # The transform may add or mutate its own keys in the dictionary (see i.e. Autoencoder)
             x = self.output_transform(x)
 
         return x
@@ -272,18 +268,17 @@ class FunnelBlock(nn.Module):
     def activate_rezero(self):
         self.rezero_alpha = nn.Parameter(torch.tensor(0))
 
-    def forward(self, q, kv, attention_state: AttentionState) -> Tuple[Tensor, Tensor]:
-        with attention_state.begin_block():
-            kv = self.layers[0](q, kv, attention_state)
-
-        for layer in self.layers[1:]:
-            kv = layer(kv, kv, attention_state)
+    def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
+        for i, layer in enumerate(self.layers):
+            x['attn_state'].begin_block_flag = (i == 0)  # Let AttentionState know we're starting a new block
+            x = layer(x)
+            x['attn_state'].begin_block_flag = False
 
         # With ReZero, we introduce an additional residual connection between blocks, where the output of each
         # block is multiplied by a parameter alpha that is initialized to zero. When alpha == 0, the block has
         # 'no effect' and simply outputs an average pooled version of its input.
         if self.rezero_alpha is not None:
-            kv = q + (kv * self.rezero_alpha)
+            x['kv'] = x['q'] + (x['kv'] * self.rezero_alpha)
 
-        q = attention_state.scale_input(kv)
-        return q, kv
+        x['q'] = x['attn_state'].scale_input(x['kv'])
+        return x

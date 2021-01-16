@@ -4,13 +4,12 @@ import tarfile
 
 from pathlib import Path
 from tqdm.auto import tqdm
-from pytorch_lightning.utilities import AttributeDict
 from typing import Dict
 
 DOWNLOAD_CHUNK_SIZE = 5242880  # 5 MB
 
 
-def remote_model_url_for_hparams(hparams: AttributeDict, suffix: str="") -> str:
+def remote_model_url_for_hparams(hparams, suffix: str="") -> str:
     block_size_to_name = {
         (4, 4, 4): "B4-4-4H768-ELEC",
         (6, 6, 6): "B6-6-6H768-ELEC",

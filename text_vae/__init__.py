@@ -1,5 +1,5 @@
 # Sort of in order of how many internal dependencies each file has
-from .HparamUtils import *
+from .Utilities import *
 from .RemoteModels import *
 from .Performers import *
 from .ops import *

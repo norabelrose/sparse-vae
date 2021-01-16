@@ -1,6 +1,6 @@
 from .FunnelWithDecoder import *
 from .RemoteModels import *
-from .HparamUtils import *
+from .Utilities import *
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import *
@@ -189,7 +189,7 @@ class FunnelForPreTraining(pl.LightningModule):
                 try:
                     tensor = tensor.permute(*[tf_shape2.index(x) for x in pt_shape2])
                 except ValueError:
-                    raise ValueError(f"Cannot permute() {tf_name} from {tf_shape} to {pt_shape} since the "\
+                    raise ValueError(f"Cannot permute() {tf_name} from {tf_shape} to {pt_shape} since the "
                                      f"nonsingleton dimensions differ.")
 
                 for i in singleton_dims:

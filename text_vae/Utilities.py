@@ -5,22 +5,8 @@ from typing import *
 # Get a new dictionary with a subset of the keys
 T = TypeVar('T', bound=Mapping)
 def select(source_dict: T, *keys: str) -> T:
-    dict_cls = type(source_dict)  # May be an AttributeDict or other dict subclass
+    dict_cls = type(source_dict)  # May be an OmegaConf or other Mapping
     return dict_cls(**{k: source_dict[k] for k in keys})
-
-
-# Merge two mappings, possibly recursively. Any conflicts are resolved by picking the value from the second mapping.
-T = TypeVar('T', bound=Mapping)
-def merge(dict1: T, dict2: Mapping) -> T:
-    new_dict = copy(dict1)
-
-    for key, value2 in dict2.items():
-        if (value1 := dict1.get(key)) and isinstance(value1, Mapping) and isinstance(value2, Mapping):
-            new_dict[key] = merge(value1, value2)
-        else:
-            new_dict[key] = value2
-
-    return new_dict
 
 
 T = TypeVar('T', bound=Mapping)

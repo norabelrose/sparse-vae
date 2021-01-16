@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 from dataclasses import *
 from functools import lru_cache
 from numpy import prod
@@ -53,17 +52,6 @@ class AttentionState:
         # Save information about the input for calls to, i.e., get_positional_encoding()
         self.input_seq_len, self.input_dtype, self.input_device = x.shape[1], x.dtype, x.device
         self.input_mask = input_mask
-    
-    # We use with-statements to keep track of whether we need to yield tensors that are appropriate
-    # for when q.shape[1] < k.shape[1]; that is, right after a downsampling operation.
-    @contextmanager
-    def begin_block(self):  # with attention_state.begin_block(): ...
-        if self.current_block > 0:
-            self.block_begin_flag = True
-        
-        yield   # Compute attention and stuff...
-        
-        self.block_begin_flag = False
 
     # Mask which is 0 where a position is [CLS], 1 otherwise
     def get_not_cls_mask(self) -> Optional[Tensor]:
