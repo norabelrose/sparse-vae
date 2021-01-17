@@ -44,21 +44,21 @@ class Autoencoder(pl.LightningModule):
         self.save_hyperparameters(hparams)
 
         encoder_hparams = hparams.encoder
+        all_blocks = list(range(len(encoder_hparams.block_sizes)))
+        encoder_hparams = mutate(encoder_hparams, block_outputs_to_return=all_blocks)
+        
+        # This way, the encoder and decoder Transformers share information about, i.e., the padding mask
+        self.encoder = FunnelTransformer(encoder_hparams)
+        attn_state = self.encoder.attention_state
+        attn_state.cache_masks = True
         decoder_hparams = mutate(
             encoder_hparams,
             block_sizes=encoder_hparams.block_sizes[::-1],          # Reverse the order of the blocks
             scaling_factors=encoder_hparams.scaling_factors[::-1],
             upsampling=True
         )
-        all_blocks = list(range(len(encoder_hparams.block_sizes)))
-        encoder_hparams = mutate(encoder_hparams, return_block_outputs=all_blocks)
-
-        # This way, the encoder and decoder Transformers share information about, i.e., the padding mask
-        self.encoder = FunnelTransformer(encoder_hparams)
-        attn_state = self.encoder.attention_state
-        attn_state.cache_masks = True
         self.decoder = FunnelTransformer(decoder_hparams, shared_attention_state=attn_state)
-
+        
         # Initial input into the decoder
         overt_depth, latent_depth = encoder_hparams.d_model, hparams.latent_depth
         self.decoder_seed = nn.Parameter(torch.zeros(1, 1, overt_depth))
@@ -126,15 +126,11 @@ class Autoencoder(pl.LightningModule):
     # Get a tighter estimate for the negative log likelihood of some input using Monte Carlo importance sampling
     def get_nll_monte_carlo(self, batch: Dict[str, Tensor], num_samples: int = 10):
         batch_size = batch['token_ids'].shape[0]
+        batch['return_log_probs'] = True
 
         marginal_prob_list = []
         for _ in range(num_samples):
-            encoder_input = dict(
-                input=batch['token_ids'],
-                input_mask=batch['padding_mask'],
-                return_log_probs=True
-            )
-            decoder_output = self.reconstruct(encoder_input)
+            decoder_output = self.reconstruct(batch)
 
             # These are all scalar tensors, marginalized over batches, tokens, and the latent depth
             log_prior_prob = decoder_output['p(z)']

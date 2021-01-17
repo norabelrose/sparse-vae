@@ -6,7 +6,9 @@ from tokenizers import BertWordPieceTokenizer
 from torch import Tensor
 from torch.utils.data import DataLoader
 from typing import *
+from .Utilities import *
 import datasets
+import math
 import multiprocessing
 import os
 import pytorch_lightning as pl
@@ -22,14 +24,12 @@ class TextVaeDataModuleHparams:
     max_sentences_per_sample: Optional[int] = None
     max_tokens_per_sample: int = 512
     split: str = 'train'    # Any string of the format supported by the HuggingFace datasets library
-    dataset_save_dir: Path = field(default_factory=lambda: Path.cwd() / 'text-vae-datasets')
+    dataset_save_dir: str = os.path.join(os.getcwd(), 'text-vae-datasets')
 
 
 # Base class for Text VAE data modules- takes care of boilerplate
 # noinspection PyAbstractClass
 class TextVaeDataModule(pl.LightningDataModule):
-    dataset_name: ClassVar[str] = 'dataset'  # Should be overridden by subclasses
-
     def __init__(self, hparams: OmegaConf):
         super(TextVaeDataModule, self).__init__()
 
@@ -43,16 +43,16 @@ class TextVaeDataModule(pl.LightningDataModule):
         self.tokenizer = BertWordPieceTokenizer.from_file(str(vocab_path), lowercase=True)
 
         # Make sure dataset save dir exists
-        self.hparams.dataset_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(self.hparams.dataset_save_dir, exist_ok=True)
 
     # Subclass hook
     def create_dataset(self):
-        self.dataset = datasets.load_dataset(self.dataset_name, split='train')
+        self.dataset = datasets.load_dataset(self.hparams.dataset_name, split='train')
 
     def prepare_data(self, *args, **kwargs):
         # Check if we already have the dataset
-        processed_path = self.hparams.dataset_dir / self.dataset_name
-        if processed_path.exists():
+        processed_path = os.path.join(self.hparams.dataset_save_dir, self.hparams.dataset_name)
+        if os.path.exists(processed_path):
             self.dataset = datasets.load_from_disk(str(processed_path))
             return
 
@@ -82,10 +82,17 @@ class TextVaeDataModule(pl.LightningDataModule):
         # Order of magnitude faster than list(iter(list(islice(x, chunk_size)), []))
         def fast_flatten_and_chunk(original, chunk_size, delimiter):
             total_size = sum(len(x) for x in original) + len(original) - 1
-            num_chunks = total_size // chunk_size  # Pre-compute how many chunks we'll have
+            num_chunks = int(math.ceil(total_size / chunk_size))
 
+            # Use our SizedIterator wrapper which implements __length_hint__ to avoid a bunch of copies and reallocs
             chained_iter = chain.from_iterable(original)
-            return list(chain(islice(chained_iter, chunk_size - 1), [delimiter])) * num_chunks
+            def chunk_getter():
+                chunk = list(SizedIterator(islice(chained_iter, chunk_size - 1), chunk_size))
+                if chunk:
+                    chunk += [delimiter]
+                return chunk
+
+            return list(SizedIterator(iter(chunk_getter, []), num_chunks))
 
         # Accumulates elements from an iterable into a list until a predicate, called on the list, is True
         def accumulate_until(iterable, predicate):
@@ -108,46 +115,51 @@ class TextVaeDataModule(pl.LightningDataModule):
 
             sent_tokenizer = nltk.data.load(os.path.join(punkt_dir, 'tokenizers/punkt/english.pickle'))
             max_sents = self.hparams.max_sentences_per_sample or int(1e9)
-        else:
-            sent_tokenizer = None
+
+            def sentence_tokenize(batch: Dict[str, list]) -> Dict[str, list]:
+                sentences = sent_tokenizer.tokenize_sents(batch['text'])
+                sentences = fast_flatten(sentences)  # Chain lists of sentences together from different samples
+                return {'text', sentences}
+
+            self.dataset = self.dataset.map(sentence_tokenize, batched=True)
 
         max_tokens = self.hparams.max_tokens_per_sample
         sep_token: int = self.tokenizer.get_vocab()['[SEP]']
 
-        def tokenize_and_chunk(batch: Dict[str, list]) -> Dict[str, list]:
-            if sent_tokenizer:
-                sentences = sent_tokenizer.tokenize_sents(batch['text'])
-                sentences = fast_flatten(sentences)  # Chain sentences together from different samples
-                encoded_sentences = self.tokenizer.encode_batch(sentences)
+        #def chunk_sentences():
+# This code is currently causing weird crashes from inside dill, a HuggingFace datasets dependency, ostensibly due to the fact that
+# we are using closures inside the function. Needs to be rewritten to get around this dill bug.
+#                sent_list_iter = accumulate_until(
+#                    # Take off the [SEP] at the end of each sentence- we only want one [SEP] at the end of each batch
+#                    map(lambda sentence: sentence[:-1], iter(encoded_sentences)),
+#                    # Take the last list of full sentences that isn't too long
+#                    lambda sents: len(sents) > max_sents or sum(len(x) for x in sents) > max_tokens
+#                )
+#                # Flatten the lists of sentences into lists of tokens
+#                batch_iter = map(lambda sents: fast_flatten(sents, delimiter=sep_token), sent_list_iter)
+#                return {'text': list(batch_iter)}
+        
+        def tokenize(batch: Dict[str, list]) -> Dict[str, list]:
+            encodings = [x.ids for x in self.tokenizer.encode_batch(batch['text'])]
+            return {'text': encodings}
 
-                # We're just doing a single sentence per sample
-                if max_sents == 1:
-                    return {'text': sentences}
-
-                sent_list_iter = accumulate_until(
-                    # Take off the [SEP] at the end of each sentence- we only want one [SEP] at the end of each batch
-                    map(lambda sentence: sentence[:-1], iter(encoded_sentences)),
-                    # Take the last list of full sentences that isn't too long
-                    lambda sents: len(sents) > max_sents or sum(len(x) for x in sents) > max_tokens
-                )
-                # Flatten the lists of sentences into lists of tokens
-                batch_iter = map(lambda sents: fast_flatten(sents, delimiter=sep_token), sent_list_iter)
-                return {'text': list(batch_iter)}
-            else:
-                encodings = self.tokenizer.encode_batch(batch['text'])
-                return {'text': fast_flatten_and_chunk(encodings, max_tokens, delimiter=sep_token)}
+        def chunk(batch: Dict[str, list]) -> Dict[str, list]:
+            return {'text': fast_flatten_and_chunk(batch['text'], max_tokens, delimiter=sep_token)}
 
         nontext_cols = self.dataset.column_names
-        del nontext_cols['text']
+        nontext_cols.remove('text')
 
         # Tokenize, chunk, and save
-        size = max(multiprocessing.cpu_count(), 10)
-        print(f"Tokenizing and chunking '{self.dataset_name}'...")
-        self.dataset = self.dataset.map(tokenize_and_chunk, batched=True, batch_size=size, remove_columns=nontext_cols)
+        print(f"Tokenizing '{self.hparams.dataset_name}'...")
+        self.dataset = self.dataset.map(tokenize, batched=True, remove_columns=nontext_cols)
+        os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Silence annoying warnings after we spawn DataLoader processes
+        
+        print(f"Chunking '{self.hparams.dataset_name}'...")
+        self.dataset = self.dataset.map(chunk, batched=True)
         self.dataset.rename_column_('text', 'token_ids')
 
-        print(f"Saving '{self.dataset_name}'...")
-        self.dataset.save_to_disk(self.hparams.dataset_dir / self.dataset_name)
+        print(f"Saving '{self.hparams.dataset_name}'...")
+        self.dataset.save_to_disk(os.path.join(self.hparams.dataset_save_dir, self.hparams.dataset_name))
 
     def setup(self, stage: Optional[str] = None):
         self.dataset = self.dataset.train_test_split(test_size=0.05, shuffle=True)

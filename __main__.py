@@ -12,16 +12,17 @@ if __name__ == "__main__":
     args = sys.argv
     command = args[1]
 
+    gpu_available = torch.cuda.is_available()
     config = OmegaConf.create({
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
-            'gpus': int(torch.cuda.is_available()),
+            'auto_select_gpus': gpu_available,
+            'gpus': int(gpu_available),
             'precision': 16
         }
     })
     if command == 'finetune-funnel':
         print("Finetuning a pretrained Funnel Transformer for Performer attention...")
-
         config.data = OmegaConf.structured(TextVaeDataModuleHparams)
         config.funnel = OmegaConf.structured(FunnelTransformerHparams)
         config.merge_with_dotlist(args[2:])  # Skip both the application name and the subcommand

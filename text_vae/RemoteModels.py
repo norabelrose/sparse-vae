@@ -24,7 +24,7 @@ def remote_model_url_for_hparams(hparams, suffix: str="") -> str:
     }
 
     # Sanity checks
-    beginning_blocks = hparams.block_sizes[0:3]
+    beginning_blocks = tuple(hparams.block_sizes[0:3])
     pretrained_d_model = block_size_to_dims[beginning_blocks][0]
     assert len(hparams.block_sizes) >= 3
     assert beginning_blocks in block_size_to_name, f"No pretrained model with block layout {beginning_blocks}"

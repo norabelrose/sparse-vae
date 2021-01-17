@@ -4,7 +4,7 @@ import torch
 import unittest
 from contextlib import nullcontext
 from pytorch_lightning.utilities import AttributeDict
-from text_vae import FunnelTransformer
+from ..text_vae import FunnelTransformer, FunnelTransformerHparams
 
 # This should be set to wherever the 'pytorch' directory of original Funnel-Transformer package is on your system
 TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS = os.getenv("TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS")
@@ -42,13 +42,13 @@ class TestFunnelTransformer(unittest.TestCase):
         
         with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext(), torch.no_grad():
             for positional_encoding_type in ("factorized", "rel_shift"):
-                new_model = FunnelTransformer(AttributeDict(positional_encoding_type=positional_encoding_type))
+                new_model = FunnelTransformer(FunnelTransformerHparams(positional_encoding_type=positional_encoding_type))
                 new_model.load_pretrained_weights()
                 new_model.eval()
                 
                 new_config = new_model.hparams
-                old_config_dict = new_model.get_backward_compatible_dict()
-                old_model_args = new_model.get_backward_compatible_args()
+                old_config_dict = AttributeDict(**new_model.get_backward_compatible_dict())
+                old_model_args = AttributeDict(**new_model.get_backward_compatible_args())
         
                 checkpoint_path = new_model.path_to_pretrained_checkpoint() / "model.pt"
                 old_config = eval('ModelConfig(**old_config_dict)')
@@ -64,7 +64,7 @@ class TestFunnelTransformer(unittest.TestCase):
                 inputs = torch.randint(low=999, high=new_config.vocab_size, size=(1, 512))
                 
                 output_old = old_model(inputs)
-                output_new = new_model(inputs)
+                output_new = new_model({'input': inputs})
                 mean_err = torch.mean(abs(output_old[0][-1] - output_new['output']))
         
                 print('Mean absolute error: ', mean_err.item())

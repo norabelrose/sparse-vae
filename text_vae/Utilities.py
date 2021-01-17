@@ -1,17 +1,31 @@
-from copy import copy
+from copy import deepcopy
 from typing import *
+
+
+class SizedIterator:
+    def __init__(self, raw_iter, size: int):
+        self.raw_iter = iter(raw_iter)
+        self.size = size
+
+    def __iter__(self):
+        return self
+    
+    def __length_hint__(self):
+        return self.size
+    
+    def __next__(self):
+        return next(self.raw_iter)
 
 
 # Get a new dictionary with a subset of the keys
 T = TypeVar('T', bound=Mapping)
 def select(source_dict: T, *keys: str) -> T:
-    dict_cls = type(source_dict)  # May be an OmegaConf or other Mapping
-    return dict_cls(**{k: source_dict[k] for k in keys})
+    return {k: source_dict[k] for k in keys}
 
 
 T = TypeVar('T', bound=Mapping)
 def mutate(old_dict: T, **kwargs: Any) -> T:
-    new_dict = copy(old_dict)
+    new_dict = deepcopy(old_dict)
     new_dict.update(kwargs)
     return new_dict
 
@@ -22,5 +36,6 @@ def mutate(old_dict: T, **kwargs: Any) -> T:
 T = TypeVar('T', bound=Mapping)
 def transmute(big_dict: T, *args: str, **kwargs: str) -> T:
     new_dict = select(big_dict, *args)
-    new_dict.update({new_k: eval(expr, big_dict) for new_k, expr in kwargs.items()})
+    eval_ctx = big_dict if isinstance(big_dict, dict) else dict(**big_dict)
+    new_dict.update({new_k: eval(expr, eval_ctx) for new_k, expr in kwargs.items()})
     return new_dict

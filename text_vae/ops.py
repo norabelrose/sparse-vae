@@ -258,6 +258,7 @@ class RelativePositionalAttention(nn.Module):
                 tgt_shape_1.append(x.shape[i])
                 tgt_shape_2.append(x.shape[i])
         
+        breakpoint()
         y = torch.reshape(x, tgt_shape_1)
         y = torch.narrow(y, row_axis, shift, x.shape[col_axis] - shift)
         y = torch.reshape(y, tgt_shape_2)

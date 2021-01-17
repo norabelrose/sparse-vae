@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from .AttentionState import AttentionState
 from .ops import RelativePositionalAttention
 from .ops import LayerNorm
@@ -119,7 +117,7 @@ class FunnelTransformer(nn.Module):
             attn_state.reset()
         return x
     
-    def enumerate_layers(self) -> Iterator[int, FunnelLayer]:
+    def enumerate_layers(self) -> Iterator:
         absolute_index = 0
         for block in self.blocks:
             for layer in block.layers:
@@ -136,7 +134,7 @@ class FunnelTransformer(nn.Module):
         url = remote_model_url_for_hparams(self.hparams, suffix="-PT")
         return load_remote_model(url)
 
-    def load_pretrained_weights(self):
+    def load_pretrained_weights(self, verbose: bool = False):
         model_path = self.path_to_pretrained_checkpoint()
 
         # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the training
@@ -175,7 +173,7 @@ class FunnelTransformer(nn.Module):
             except KeyError:
                 noninitialized_keys.append({'new_name': var_name, 'old_name': old_name})
 
-        if len(noninitialized_keys) > 0:
+        if len(noninitialized_keys) > 0 and verbose:
             logger = logging.getLogger(__name__)
             logger.warning(f'Failed to initialize weights: {noninitialized_keys}')
 
