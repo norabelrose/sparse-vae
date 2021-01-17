@@ -24,6 +24,7 @@ class AttentionState:
     # When True, AttentionState will cache a list of all the mask tensors it computes for each block of the model.
     # These masks can then be reused, e.g. by a VAE decoder.
     cache_masks: bool = False
+    upsampling: bool = False
 
     def __post_init__(self):
         # Wrap these functions in functools.lru_cache() objects so that we don't compute the same values multiple times
@@ -48,10 +49,11 @@ class AttentionState:
                                                   self.input_dtype, self.input_device)
 
     # This method should be called before any other AttentionState methods are called in a forward pass
-    def configure_for_input(self, x: Tensor, input_mask: Tensor = None):
+    def configure_for_input(self, x: Dict[str, Any]):
         # Save information about the input for calls to, i.e., get_positional_encoding()
-        self.input_seq_len, self.input_dtype, self.input_device = x.shape[1], x.dtype, x.device
-        self.input_mask = input_mask
+        data = x['input']
+        self.input_seq_len, self.input_dtype, self.input_device = data.shape[1], data.dtype, data.device
+        self.input_mask = x.get('input_mask')
 
     # Mask which is 0 where a position is [CLS], 1 otherwise
     def get_not_cls_mask(self) -> Optional[Tensor]:
@@ -62,7 +64,7 @@ class AttentionState:
         q_scale, k_scale = self.query_and_key_strides_for_step(self.current_block, self.block_begin_flag,
                                                                count_from_end=False)
 
-        if self.hparams.upsampling:
+        if self.upsampling:
             q_seq_len *= q_scale
             k_seq_len *= k_scale
         else:
@@ -73,18 +75,16 @@ class AttentionState:
         return F.pad(mask, (1, 0, 1, 0))
 
     # What is the total scaling factor at block N?
-    def query_and_key_strides_for_step(self, block_index: int, pooled_q_unpooled_k: bool,
+    def query_and_key_strides_for_step(self, block_index: int, block_begin_flag: bool,
                                        count_from_end: bool = True) -> Tuple[int, int]:
-        if pooled_q_unpooled_k:
-            assert block_index > 0, "query_and_key_strides_for_step() was called with block_index=0, " \
-                                    "pooled_q_unpooled_k=True but no pooling is ever done in the first block."
+        pooled_q_unpooled_k = block_begin_flag and self.current_block > 0
 
         hparams = self.hparams
         factors = hparams.scaling_factors
-        if hparams.upsampling and count_from_end:
+        if self.upsampling and count_from_end:
             factors = factors[::-1]  # Count from the last block when upsampling
 
-        q_stride = int(prod(factors[:block_index], dtype=int))
+        q_stride = int(prod(factors[:block_index]))
         shift = factors[block_index - 1] if pooled_q_unpooled_k else 1
         k_stride = q_stride // shift
 
@@ -102,6 +102,7 @@ class AttentionState:
         self.current_block = 0
         self.input_mask = None
         self.scaled_input_mask_for_block.cache_clear()
+        self.upsampling = False
 
     # Either downsample or upsample the tensor, whichever is appropriate for the current block.
     def scale_input(self, x: Tensor) -> Tensor:
@@ -129,7 +130,7 @@ class AttentionState:
         hparams = self.hparams
         positional_encoding_type = hparams.positional_encoding_type
 
-        if hparams.upsampling:
+        if self.upsampling:
             seq_len *= prod(hparams.scaling_factors)  # What's the sequence length we WILL have at the end?
         
         # Values and routines used by all three positional encoding types
@@ -207,8 +208,7 @@ class AttentionState:
         if scaling_factor == 1:
             return x
 
-        hparams = self.hparams
-        if not hparams.upsampling:
+        if not self.upsampling:
             x = self._prepare_for_pooling(x, scaling_factor)
 
             stride = (scaling_factor, 1)
@@ -236,3 +236,4 @@ class AttentionState:
             x.narrow(-2, 0, shift).copy_(cls_token)  # Overwrite the last few tokens with [CLS]
 
         return x
+

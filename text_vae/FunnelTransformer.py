@@ -88,14 +88,16 @@ class FunnelTransformer(nn.Module):
         self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
         self.attention_state = shared_attention_state or AttentionState(hparams)
 
-    def forward(self, x: Dict[str, Any], reset_attention_state: bool = True) -> Dict[str, Any]:
+    def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
         hparams = self.hparams
 
         if not hparams.upsampling:
             x['input'] = self.input_layer(x['input'])  # x.shape == (batch, length, d_model)
+        else:
+            x['upsampling'] = True  # So that the shared AttentionState object knows we're upsampling now
         
         attn_state = self.attention_state
-        attn_state.configure_for_input(x['input'], x.get('input_mask'))
+        attn_state.configure_for_input(x)
 
         x.update(q=x['input'], kv=x.pop('input'), attn_state=attn_state, hidden_states=[])
         for i, block in enumerate(self.blocks):
@@ -113,7 +115,7 @@ class FunnelTransformer(nn.Module):
 
         del x['attn_state'], x['kv']
 
-        if reset_attention_state:
+        if not x.pop('keep_masks'):
             attn_state.reset()
         return x
     
@@ -246,7 +248,7 @@ class FunnelLayer(nn.Module):
     # Q is different from K and V right after pooling; K and V are always the same
     def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
         # These custom attention and feedforward layers have built-in residual connections
-        x['kv'] = self.attention(x['q'], x['kv'], x['q'], x['attn_state'])
+        x['kv'] = self.attention(x['q'], x['kv'], x['kv'], x['attn_state'])
         x['kv'] = self.feedforward(x['kv'])
 
         if self.output_transform:

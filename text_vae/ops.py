@@ -211,7 +211,7 @@ class RelativePositionalAttention(nn.Module):
     # A^{position} in the paper
     def _attn_pos_term(self, q, k_len, attn_state: AttentionState):
         pos_enc = attn_state.get_positional_encodings()
-
+        
         if self.positional_encoding_type == "factorized":
             enc_q_1, enc_q_2, enc_k_1, enc_k_2 = pos_enc  # seq_len, d_model
             q_r = (q + self.r_r_bias) @ self.r_kernel.transpose(-2, -1) * self.normalizer
@@ -220,48 +220,31 @@ class RelativePositionalAttention(nn.Module):
             q_r_1 = q_r * enc_q_1
             q_r_2 = q_r * enc_q_2
 
-            bd = q_r_1 @ enc_k_1.transpose(-2, -1) + q_r_2 @ enc_k_2.transpose(-2, -1)
+            scores = q_r_1 @ enc_k_1.transpose(-2, -1) + q_r_2 @ enc_k_2.transpose(-2, -1)
 
         elif self.positional_encoding_type == "rel_shift":
             shift = 1 + attn_state.block_begin_flag
 
             # Funnel Transformer paper, page 13
-            bd = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
-            bd = self._rel_shift(bd, -2, k_len, shift)
+            scores = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
+            
+            # Do the "relative shift"
+            target_shape1 = list(scores.shape)
+            target_shape2 = target_shape1.copy()
+            target_shape1[-2], target_shape1[-1] = target_shape1[-1], target_shape1[-2]
+            
+            print("Target shape 1: ", target_shape1)
+            scores = scores.reshape(target_shape1)
+            target_shape2[-1] -= shift
+            print("Target shape 2: ", target_shape2)
+            scores = scores.narrow(-2, shift, target_shape2[-1])
+            scores = scores.reshape(target_shape2)
+            scores = scores.narrow(-1, 0, k_len)
         else:
             raise NotImplementedError
 
         if (not_cls := attn_state.get_not_cls_mask()) is not None:
-            bd *= not_cls
+            scores *= not_cls
 
-        return bd
+        return scores
 
-    @staticmethod
-    def _rel_shift(x, row_axis, key_len, shift=1):
-        """Perform relative shift to form the relative attention score."""
-        # Deal with negative indexing
-        row_axis = row_axis % x.ndim
-
-        # Assume `col_axis` = `row_axis + 1`
-        col_axis = row_axis + 1
-        assert col_axis < x.ndim
-
-        tgt_shape_1, tgt_shape_2 = [], []
-        for i in range(x.ndim):
-            if i == row_axis:
-                tgt_shape_1.append(x.shape[col_axis])
-                tgt_shape_2.append(x.shape[row_axis])
-            elif i == col_axis:
-                tgt_shape_1.append(x.shape[row_axis])
-                tgt_shape_2.append(x.shape[col_axis] - shift)
-            else:
-                tgt_shape_1.append(x.shape[i])
-                tgt_shape_2.append(x.shape[i])
-        
-        breakpoint()
-        y = torch.reshape(x, tgt_shape_1)
-        y = torch.narrow(y, row_axis, shift, x.shape[col_axis] - shift)
-        y = torch.reshape(y, tgt_shape_2)
-        y = torch.narrow(y, col_axis, 0, key_len)
-
-        return y

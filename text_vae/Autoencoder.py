@@ -119,9 +119,10 @@ class Autoencoder(pl.LightningModule):
         return [adam], [scheduler]
 
     # Returns hidden states of the encoder
-    def forward(self, batch: Dict[str, Tensor]) -> List[Tensor]:
-        encoder_input = {'input': batch['token_ids'], 'input_mask': batch['padding_mask']}
-        return self.encoder(encoder_input)['encoder_states']
+    def forward(self, batch: Dict[str, Any]) -> List[Tensor]:
+        batch['input'] = batch.pop('token_ids')
+        batch['input_mask'] = batch.pop('padding_mask')
+        return self.encoder(batch)['encoder_states']
 
     # Get a tighter estimate for the negative log likelihood of some input using Monte Carlo importance sampling
     def get_nll_monte_carlo(self, batch: Dict[str, Tensor], num_samples: int = 10):
@@ -235,7 +236,8 @@ class Autoencoder(pl.LightningModule):
         return layer_out
 
     # Runs a forward pass through the encoder and the decoder and returns a dict with the KL and reconstruction loss
-    def reconstruct(self, batch: Dict[str, Tensor], loss_only: bool = True) -> Dict[str, Tensor]:
+    def reconstruct(self, batch: Dict[str, Any], loss_only: bool = True) -> Dict[str, Tensor]:
+        batch['keep_masks'] = True
         encoder_states = self(batch)
 
         seed = self.decoder_seed.expand_as(encoder_states[-1])
