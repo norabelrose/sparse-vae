@@ -39,7 +39,7 @@ class AttentionState:
 
     def get_attention_mask(self) -> Tensor:
         input_mask = self.input_mask if not self.current_block else self.scaled_input_mask_for_block(self.current_block)
-        return None if input_mask is None else input_mask[:, None, None, :]
+        return None if input_mask is None else input_mask[:, None, :, None]
 
     def get_positional_encodings(self) -> Union[Tensor, List[Tensor]]:
         assert self.input_seq_len is not None, \
@@ -207,13 +207,13 @@ class AttentionState:
         if not self.upsampling:
             x = self._prepare_for_pooling(x, scaling_factor)
 
-            stride = (scaling_factor, 1)
-            x = x[:, None, :, :]
+            x.unsqueeze_(1)
 
             if mode == "mean":
+                stride = (scaling_factor, 1)
                 x = F.avg_pool2d(x, stride, stride=stride, ceil_mode=True)
             elif mode == "min":
-                x = -F.max_pool2d(-x, stride, stride=stride, ceil_mode=True)
+                x = -F.max_pool1d(-x, kernel_size=scaling_factor, ceil_mode=True)
             else:
                 raise NotImplementedError
         else:

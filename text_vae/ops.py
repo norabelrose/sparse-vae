@@ -233,10 +233,8 @@ class RelativePositionalAttention(nn.Module):
             target_shape2 = target_shape1.copy()
             target_shape1[-2], target_shape1[-1] = target_shape1[-1], target_shape1[-2]
             
-            print("Target shape 1: ", target_shape1)
             scores = scores.reshape(target_shape1)
             target_shape2[-1] -= shift
-            print("Target shape 2: ", target_shape2)
             scores = scores.narrow(-2, shift, target_shape2[-1])
             scores = scores.reshape(target_shape2)
             scores = scores.narrow(-1, 0, k_len)

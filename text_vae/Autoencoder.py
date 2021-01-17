@@ -122,7 +122,7 @@ class Autoencoder(pl.LightningModule):
     def forward(self, batch: Dict[str, Any]) -> List[Tensor]:
         batch['input'] = batch.pop('token_ids')
         batch['input_mask'] = batch.pop('padding_mask')
-        return self.encoder(batch)['encoder_states']
+        return self.encoder(batch)['hidden_states']
 
     # Get a tighter estimate for the negative log likelihood of some input using Monte Carlo importance sampling
     def get_nll_monte_carlo(self, batch: Dict[str, Tensor], num_samples: int = 10):

@@ -169,7 +169,7 @@ class TextVaeDataModule(pl.LightningDataModule):
     def collate(inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         # Combine into a single batched and padded tensor
         inputs = torch.nn.utils.rnn.pad_sequence([x['token_ids'] for x in inputs], batch_first=True)
-        return {'token_ids': inputs, 'padding_mask': inputs.eq(0)}
+        return {'token_ids': inputs, 'padding_mask': inputs.eq(0).float()}
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
         return DataLoader(self.dataset['train'], batch_size=self.hparams.batch_size, shuffle=True,
