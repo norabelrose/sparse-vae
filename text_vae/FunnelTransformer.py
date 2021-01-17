@@ -115,7 +115,7 @@ class FunnelTransformer(nn.Module):
 
         del x['attn_state'], x['kv']
 
-        if not x.pop('keep_masks'):
+        if not x.pop('keep_masks', False):
             attn_state.reset()
         return x
     
@@ -270,9 +270,9 @@ class FunnelBlock(nn.Module):
 
     def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
         for i, layer in enumerate(self.layers):
-            x['attn_state'].begin_block_flag = (i == 0)  # Let AttentionState know we're starting a new block
+            x['attn_state'].block_begin_flag = (i == 0)  # Let AttentionState know we're starting a new block
             x = layer(x)
-            x['attn_state'].begin_block_flag = False
+            x['attn_state'].block_begin_flag = False
 
         # With ReZero, we introduce an additional residual connection between blocks, where the output of each
         # block is multiplied by a parameter alpha that is initialized to zero. When alpha == 0, the block has

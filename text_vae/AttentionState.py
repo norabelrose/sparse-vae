@@ -178,13 +178,9 @@ class AttentionState:
 
         if encoding_type == 'rel_shift':
             # All possible relative positional offsets at this scale, from greatest to least
-            rel_offsets = torch.arange(seq_len, 1 - seq_len, -k_stride, dtype=torch.long, device=device)
-
-            # Gather the relative positional encodings that are relevant for this sequence length
-            zero_offset = seq_len * 2
-            rel_offsets = rel_offsets[:, None] + zero_offset
-            rel_offsets = rel_offsets.expand(rel_offsets.size(0), hparams.d_model)
-            return base_encodings.gather(0, rel_offsets)
+            encoding_indices = torch.arange(2 * seq_len - 1, 0, -k_stride, dtype=torch.long, device=device)
+            encoding_indices = encoding_indices[:, None].expand(encoding_indices.size(0), hparams.d_model)
+            return base_encodings.gather(0, encoding_indices)
         else:
             # With absolute positional encodings, we have two encoding tensors; one for queries and one for keys
             if encoding_type == 'absolute':

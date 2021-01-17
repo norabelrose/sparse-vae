@@ -42,7 +42,10 @@ class TestFunnelTransformer(unittest.TestCase):
         
         with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext(), torch.no_grad():
             for positional_encoding_type in ("factorized", "rel_shift"):
-                new_model = FunnelTransformer(FunnelTransformerHparams(positional_encoding_type=positional_encoding_type))
+                new_model = FunnelTransformer(FunnelTransformerHparams(
+                    positional_encoding_type=positional_encoding_type,
+                    block_outputs_to_return=list(range(12))
+                ))
                 new_model.load_pretrained_weights()
                 new_model.eval()
                 
@@ -58,7 +61,7 @@ class TestFunnelTransformer(unittest.TestCase):
                 with open(checkpoint_path, 'rb') as f:
                     old_model.load_state_dict(torch.load(f))
         
-                print(f'Running forward pass of both models...')
+                print('Running forward pass of both models...')
         
                 # Tokens below 999 are either unused or are special tokens like [CLS] and [MASK]
                 inputs = torch.randint(low=999, high=new_config.vocab_size, size=(1, 512))
