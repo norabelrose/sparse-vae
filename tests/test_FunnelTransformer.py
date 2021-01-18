@@ -4,7 +4,7 @@ import torch
 import unittest
 from contextlib import nullcontext
 from pytorch_lightning.utilities import AttributeDict
-from ..text_vae import FunnelTransformer, FunnelTransformerHparams
+from text_vae import FunnelTransformer, FunnelTransformerHparams
 
 # This should be set to wherever the 'pytorch' directory of original Funnel-Transformer package is on your system
 TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS = os.getenv("TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS")

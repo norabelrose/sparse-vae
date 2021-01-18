@@ -1,6 +1,5 @@
 from .AttentionState import AttentionState
 from .ops import RelativePositionalAttention
-from .ops import LayerNorm
 from .ops import PositionwiseFFN
 from .Performers import PerformerAttention
 from .RemoteModels import *
@@ -28,6 +27,7 @@ class FunnelTransformerHparams:
     attention_dropout: float = 0.1
     dropout: float = 0.1
     ffn_dropout: float = 0.0
+    layer_norm_eps: float = 1e-9
     separate_cls: bool = True
     num_classes: int = 0
 
@@ -41,21 +41,18 @@ class FunnelTransformerHparams:
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
     def __post_init__(self):
+        assert 1 not in self.scaling_factors, "Blocks with unitary scaling factors are not supported. Try simply"\
+                                              "making the preceding block larger with block_sizes."
         if self.use_performer_attention:
             assert self.positional_encoding_type not in ('rel_shift', 'factorized'),\
                 "Performer attention not supported with relative positional encodings"
-
-        # Make it so scaling_factors and block_sizes are equal length; last scaling factor is 1 (no scaling)
-        if len(self.scaling_factors) < len(self.block_sizes):
-            self.scaling_factors += (1,)
 
         if not self.d_embedding:
             self.d_embedding = self.d_model
 
 
 class FunnelTransformer(nn.Module):
-    def __init__(self, hparams: Union[FunnelTransformerHparams, OmegaConf],
-                 shared_attention_state: Optional[AttentionState] = None):
+    def __init__(self, hparams: Union[FunnelTransformerHparams, OmegaConf]):
         super().__init__()
 
         if isinstance(hparams, FunnelTransformerHparams):
@@ -66,7 +63,7 @@ class FunnelTransformer(nn.Module):
         if not hparams.upsampling:
             input_modules = [
                 nn.Embedding(hparams.vocab_size, hparams.d_embedding),
-                LayerNorm(hparams.d_model),
+                nn.LayerNorm(hparams.d_model, eps=hparams.layer_norm_eps),
                 nn.Dropout(hparams.dropout)
             ]
 
@@ -86,18 +83,21 @@ class FunnelTransformer(nn.Module):
             )
 
         self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
-        self.attention_state = shared_attention_state or AttentionState(hparams)
 
     def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
         hparams = self.hparams
 
         if not hparams.upsampling:
             x['input'] = self.input_layer(x['input'])  # x.shape == (batch, length, d_model)
-        else:
-            x['upsampling'] = True  # So that the shared AttentionState object knows we're upsampling now
-        
-        attn_state = self.attention_state
-        attn_state.configure_for_input(x)
+
+        # This lazy loading allows the user to give us a pre-initialized, possibly shared AttentionState object
+        if not (attn_state := self.attention_state):
+            attn_state = self.attention_state = AttentionState(hparams)
+
+        # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
+        # for the current input, because that could result in it getting configured twice
+        elif not attn_state.shared:
+            attn_state.configure_for_input(x)
 
         x.update(q=x['input'], kv=x.pop('input'), attn_state=attn_state, hidden_states=[])
         for i, block in enumerate(self.blocks):
@@ -115,8 +115,6 @@ class FunnelTransformer(nn.Module):
 
         del x['attn_state'], x['kv']
 
-        if not x.pop('keep_masks', False):
-            attn_state.reset()
         return x
     
     def enumerate_layers(self) -> Iterator:
@@ -136,7 +134,7 @@ class FunnelTransformer(nn.Module):
         url = remote_model_url_for_hparams(self.hparams, suffix="-PT")
         return load_remote_model(url)
 
-    def load_pretrained_weights(self, verbose: bool = False):
+    def load_pretrained_weights(self, freeze: bool = True, verbose: bool = False):
         model_path = self.path_to_pretrained_checkpoint()
 
         # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the training
@@ -151,6 +149,7 @@ class FunnelTransformer(nn.Module):
             '1.weight': state_dict['input_layer.1.weight'],
             '1.bias': state_dict['input_layer.1.bias']
         }, strict=True)
+        self.input_layer.requires_grad_(not freeze)
 
         for var_name, param, absolute_index in self.enumerate_parameters_by_layer():
             keys = var_name.split('.')
@@ -172,6 +171,7 @@ class FunnelTransformer(nn.Module):
                         old_weights = old_weights.reshape(*param.data.shape)
 
                 param.data = old_weights
+                param.requires_grad = not freeze
             except KeyError:
                 noninitialized_keys.append({'new_name': var_name, 'old_name': old_name})
 
@@ -238,7 +238,8 @@ class FunnelLayer(nn.Module):
         else:
             self.attention = RelativePositionalAttention(hparams)
 
-        self.feedforward = PositionwiseFFN(hparams.d_model, hparams.d_model * 4, hparams.dropout, hparams.ffn_dropout)
+        self.feedforward = PositionwiseFFN(hparams.d_model, hparams.d_model * 4, hparams.dropout, hparams.ffn_dropout,
+                                           layer_norm_eps=hparams.layer_norm_eps)
 
         # A Callable (e.g. a Module) that will be called with the output of this layer. The output of
         # *this transform* will then be passed on to the next layer. This makes it possible to add extra information
@@ -264,6 +265,7 @@ class FunnelBlock(nn.Module):
 
         self.layers = nn.ModuleList([FunnelLayer(hparams) for _ in range(num_layers)])
         self.rezero_alpha = None
+        self.upsampling = hparams.upsampling
 
     def activate_rezero(self):
         self.rezero_alpha = nn.Parameter(torch.tensor(0))
@@ -281,4 +283,9 @@ class FunnelBlock(nn.Module):
             x['kv'] = x['q'] + (x['kv'] * self.rezero_alpha)
 
         x['q'] = x['attn_state'].scale_input(x['kv'])
+
+        # When we're upsampling, there's no stage where we pool Q but don't pool K and V.
+        if self.upsampling:
+            x['kv'] = x['q']
+
         return x

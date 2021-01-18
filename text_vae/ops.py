@@ -8,26 +8,6 @@ from .Performers import PerformerAttention
 
 BIG_CONST = 1e6
 
-class LayerNorm(nn.LayerNorm):
-    def __init__(self, *args, **kwargs):
-        super(LayerNorm, self).__init__(*args, **kwargs)
-        self.eps = 1e-9
-
-    def forward(self, inputs):
-        dtype = torch.float32
-        if self.elementwise_affine:
-            weight = self.weight.type(dtype)
-            bias = self.bias.type(dtype)
-        else:
-            weight = self.weight
-            bias = self.bias
-        input_dtype = inputs.dtype
-        inputs = inputs.type(dtype)
-        output = F.layer_norm(inputs, self.normalized_shape, weight, bias, self.eps)
-        if output.dtype != input_dtype:
-            output = output.type(input_dtype)
-        return output
-
 
 class EinsumLayer(nn.Module):
     def __init__(self, einsum_formula: str, input_shape: List[int], output_shape: List[int], bias: bool=True):
@@ -68,7 +48,7 @@ class GELU(nn.Module):
 
 
 class PositionwiseFFN(nn.Module):
-    def __init__(self, d_model, d_inner, dropout, dropact):
+    def __init__(self, d_model, d_inner, dropout, dropact, layer_norm_eps=1e-9):
         super(PositionwiseFFN, self).__init__()
         self.pffn = nn.Sequential(
             EinsumLayer("...a,ab->...b", [d_model], [d_inner]),
@@ -76,7 +56,7 @@ class PositionwiseFFN(nn.Module):
             nn.Dropout(dropact),
             EinsumLayer("...b,ba->...a", [d_inner], [d_model]),
             nn.Dropout(dropout))
-        self.layer_norm = LayerNorm(d_model)
+        self.layer_norm = nn.LayerNorm(d_model, eps=layer_norm_eps)
 
     def forward(self, inputs):
         pffn_out = self.pffn(inputs)
@@ -112,7 +92,7 @@ class RelativePositionalAttention(nn.Module):
         self.r_s_bias = nn.Parameter(torch.zeros(n_head, d_head))
         
         self.post_proj = EinsumLayer("blnh,nhd->bld", [n_head, d_head], [d_model])
-        self.layer_norm = LayerNorm(d_model)
+        self.layer_norm = nn.LayerNorm(d_model, eps=hparams.layer_norm_eps)
         self.normalizer = 1. / np.sqrt(d_head)
         self.reset_parameters()
 
@@ -228,9 +208,6 @@ class RelativePositionalAttention(nn.Module):
 
             # Funnel Transformer paper, page 13
             scores = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
-            print(attn_state.current_block)
-            print(attn_state.upsampling)
-            print(scores.shape)
 
             # Do the "relative shift"
             target_shape1 = list(scores.shape)

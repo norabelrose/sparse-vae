@@ -94,7 +94,7 @@ class FunnelForPreTraining(pl.LightningModule):
             padding_mask = padding_mask.float()
 
             # Probability distribution over tokens: (batch, seq_len, vocab_size)
-            generator_output = self.generator(masked_text, input_mask=padding_mask)['output']
+            generator_output = self.generator(masked_text, padding_mask=padding_mask)['output']
             generator_logits = self.mlm_head(generator_output)
 
             # Sample from the distribution (Gumbel softmax). Greedy sampling, plus some noise.
@@ -108,7 +108,7 @@ class FunnelForPreTraining(pl.LightningModule):
             is_groundtruth = samples.eq(labels).float()
 
             # For each token, the probability that matches the ground truth input.
-            discriminator_output = self.discriminator(samples, input_mask=padding_mask)['output']
+            discriminator_output = self.discriminator(samples, padding_mask=padding_mask)['output']
             discriminator_logits = self.discriminator_head(discriminator_output)
             return F.binary_cross_entropy_with_logits(discriminator_logits, is_groundtruth, weight=nonpadding_mask)
 

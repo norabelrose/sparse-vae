@@ -6,6 +6,7 @@ from omegaconf import OmegaConf
 from torch import nn
 from torch import Tensor
 from .Utilities import *
+from .AttentionState import AttentionState
 from .FunnelTransformer import FunnelTransformer, FunnelTransformerHparams
 import math
 import torch.nn.functional as F
@@ -31,7 +32,7 @@ class AutoencoderHparams:
     grad_clip_threshold: float = 200.0
     grad_skip_threshold: float = 400.0
     kl_warmup_steps: int = 0  # For KL annealing
-    lr: float = 1e-4
+    lr: float = 1e-3
     warmup_steps: int = 1000
     weight_decay: float = 0.01
 
@@ -47,17 +48,20 @@ class Autoencoder(pl.LightningModule):
         all_blocks = list(range(len(encoder_hparams.block_sizes)))
         encoder_hparams = mutate(encoder_hparams, block_outputs_to_return=all_blocks)
         
-        # This way, the encoder and decoder Transformers share information about, i.e., the padding mask
-        self.encoder = FunnelTransformer(encoder_hparams)
-        attn_state = self.encoder.attention_state
-        attn_state.cache_masks = True
+        # The encoder and decoder share an AttentionState object, which caches positional encodings and the
+        # padding mask for each scale
+        attn_state = AttentionState(encoder_hparams)
+        attn_state.shared = True
         decoder_hparams = mutate(
             encoder_hparams,
             block_sizes=encoder_hparams.block_sizes[::-1],          # Reverse the order of the blocks
             scaling_factors=encoder_hparams.scaling_factors[::-1],
             upsampling=True
         )
-        self.decoder = FunnelTransformer(decoder_hparams, shared_attention_state=attn_state)
+        self.encoder = FunnelTransformer(encoder_hparams)
+        self.decoder = FunnelTransformer(decoder_hparams)
+        self.encoder.attention_state = attn_state
+        self.decoder.attention_state = attn_state
         
         # Initial input into the decoder
         overt_depth, latent_depth = encoder_hparams.d_model, hparams.latent_depth
@@ -118,14 +122,14 @@ class Autoencoder(pl.LightningModule):
 
         return [adam], [scheduler]
 
-    # Returns hidden states of the encoder
     def forward(self, batch: Dict[str, Any]) -> List[Tensor]:
-        batch['input'] = batch.pop('token_ids')
-        batch['input_mask'] = batch.pop('padding_mask')
-        return self.encoder(batch)['hidden_states']
+        batch['input'] = batch['token_ids']
+
+        self.encoder.attention_state.configure_for_input(batch)
+        return self.encoder(batch)
 
     # Get a tighter estimate for the negative log likelihood of some input using Monte Carlo importance sampling
-    def get_nll_monte_carlo(self, batch: Dict[str, Tensor], num_samples: int = 10):
+    def get_nll_monte_carlo(self, batch: Dict[str, Any], num_samples: int = 10):
         batch_size = batch['token_ids'].shape[0]
         batch['return_log_probs'] = True
 
@@ -144,7 +148,7 @@ class Autoencoder(pl.LightningModule):
 
         # Average over the Monte Carlo samples
         log_marginal_prob = torch.stack(marginal_prob_list, dim=0)
-        avg_log_prob = log_marginal_prob.logsumexp(dim=0) - torch.tensor(num_samples * batch_size).log()
+        avg_log_prob = log_marginal_prob.logsumexp(dim=0).sub(math.log(num_samples * batch_size))
         return -avg_log_prob
 
     def sample(self, max_length: int, count: int = 1, top_k: int = 1, return_latents: bool = False,
@@ -187,15 +191,7 @@ class Autoencoder(pl.LightningModule):
             if temp != 1.0:
                 stddev *= temp
 
-            dist = torch.distributions.Normal(mu, stddev)
-            if layer_out.get('return_log_probs'):
-                sample_log_prob = dist.log_prob(x).sum()
-
-                # Marginalize over successive layers of latent variables
-                running_total = layer_out.get(name) or torch.zeros_like(sample_log_prob)
-                layer_out[name] = running_total + sample_log_prob
-
-            return dist
+            return torch.distributions.Normal(mu, stddev)
 
         prior = get_distribution_for_input('p(z)', layer_out['kv'])
 
@@ -207,13 +203,21 @@ class Autoencoder(pl.LightningModule):
             posterior = get_distribution_for_input('q(z|x)', q_input)
             z = posterior.rsample()
 
+            if layer_out.get('return_log_probs'):
+                for dist, name in ((prior, 'p(z)'), (posterior, 'q(z|x)')):
+                    sample_log_prob = dist.log_prob(z).sum()
+
+                    # Marginalize over successive layers of latent variables
+                    running_total = layer_out.get(name) or torch.zeros_like(sample_log_prob)
+                    layer_out[name] = running_total + sample_log_prob
+
             if self.training:
                 # Update the running totals of the KL divergences and the number of nonpadding positions.
                 kl_tensor = torch.distributions.kl_divergence(prior, posterior)
 
                 # Gives us the appropriately scaled mask for the current block
-                padding_mask = self.decoder.attention_state.input_mask
-                kl_tensor.masked_fill_(padding_mask, 0.0)  # Ignore KL divergences for padding positions
+                padding_mask = self.decoder.attention_state.get_padding_mask().unsqueeze(-1)
+                kl_tensor = kl_tensor.masked_fill(padding_mask, 0.0)  # Ignore KL divergences for padding positions
 
                 kl_running_total = layer_out.get('total_kl') or kl_tensor.new_zeros([])
                 num_pos_running_total = layer_out.get('total_nonpadding') or padding_mask.new_zeros([])
@@ -224,27 +228,30 @@ class Autoencoder(pl.LightningModule):
         else:
             clamped = layer_out.get('clamped_latents')
             z = clamped.get(layer_index) if clamped else None
-            if not z:
+            if z is None:
                 prior.rsample()
 
         if layer_out.get('return_latents'):
             layer_out['latents'] = layer_out.get('latents', []) + [z]
 
         reconstruction = self.latent_upsample[layer_index]
-        layer_out['kv'] += reconstruction(z)
+        layer_out['kv'] = layer_out['kv'] + reconstruction(z)
 
         return layer_out
 
     # Runs a forward pass through the encoder and the decoder and returns a dict with the KL and reconstruction loss
     def reconstruct(self, batch: Dict[str, Any], loss_only: bool = True) -> Dict[str, Tensor]:
         batch['keep_masks'] = True
-        encoder_states = self(batch)
+        batch = self(batch)  # Encoder forward pass
 
-        seed = self.decoder_seed.expand_as(encoder_states[-1])
-        decoder_input = dict(input=seed, encoder_states=encoder_states)
-        output = self.decoder(decoder_input)
+        encoder_states = batch.pop('hidden_states')
+        batch['input'] = self.decoder_seed.expand_as(encoder_states[-1])
+        batch['encoder_states'] = encoder_states
 
-        output['nll'] = F.nll_loss(output['logits'], target=batch['token_ids'], ignore_index=0)
+        self.decoder.attention_state.upsampling = True
+        output = self.decoder(batch)
+
+        output['nll'] = F.nll_loss(output['logits'].transpose(-2, -1), target=batch['token_ids'], ignore_index=0)
         if loss_only:
             del output['logits']
 

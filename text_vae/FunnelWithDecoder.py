@@ -14,8 +14,8 @@ class FunnelWithDecoder(nn.Module):
         self.encoder = FunnelTransformer(hparams)
         self.decoder = FunnelBlock(hparams, num_decoder_layers)
 
-    def forward(self, x: Tensor, input_mask: Tensor = None) -> Dict[str, Any]:
-        result = self.encoder({'input': x, 'input_mask': input_mask, 'keep_masks': True})
+    def forward(self, x: Tensor, padding_mask: Tensor = None) -> Dict[str, Any]:
+        result = self.encoder({'input': x, 'padding_mask': padding_mask, 'keep_masks': True})
 
         # Residual connection
         total_scaling = np.prod(self.encoder.hparams.scaling_factors)

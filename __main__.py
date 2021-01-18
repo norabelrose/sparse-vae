@@ -1,9 +1,9 @@
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
-from .text_vae import Autoencoder, AutoencoderHparams
-from .text_vae import FunnelForPreTraining, FunnelTransformerHparams
-from .text_vae import TextVaeDataModule, TextVaeDataModuleHparams
-from .text_vae import FunnelPreTrainingDataModule
+from text_vae import Autoencoder, AutoencoderHparams
+from text_vae import FunnelForPreTraining, FunnelTransformerHparams
+from text_vae import TextVaeDataModule, TextVaeDataModuleHparams
+from text_vae import FunnelPreTrainingDataModule
 import sys
 import torch
 
@@ -12,13 +12,14 @@ if __name__ == "__main__":
     args = sys.argv
     command = args[1]
 
+    # torch.autograd.set_detect_anomaly(True)
     gpu_available = torch.cuda.is_available()
     config = OmegaConf.create({
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
             'auto_select_gpus': gpu_available,
             'gpus': int(gpu_available),
-            'precision': 16
+            'precision': 32
         }
     })
     if command == 'finetune-funnel':
