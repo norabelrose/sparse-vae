@@ -139,6 +139,7 @@ class RelativePositionalAttention(nn.Module):
         
     def forward(self, q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState) -> Tensor:
         input_q = q  # Save for residual connection
+
         q = self.q_head(q)
         k = self.k_head(k)
         v = self.v_head(v)
@@ -227,7 +228,10 @@ class RelativePositionalAttention(nn.Module):
 
             # Funnel Transformer paper, page 13
             scores = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
-            
+            print(attn_state.current_block)
+            print(attn_state.upsampling)
+            print(scores.shape)
+
             # Do the "relative shift"
             target_shape1 = list(scores.shape)
             target_shape2 = target_shape1.copy()

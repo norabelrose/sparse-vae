@@ -38,7 +38,14 @@ class AttentionState:
         return id(self)
 
     def get_attention_mask(self) -> Tensor:
-        input_mask = self.input_mask if not self.current_block else self.scaled_input_mask_for_block(self.current_block)
+        block = self.current_block
+        if not block:
+            input_mask = self.input_mask
+        else:
+            if self.upsampling:
+                block = -1 - block
+            input_mask = self.scaled_input_mask_for_block(block)
+        
         return None if input_mask is None else input_mask[:, None, :, None]
 
     def get_positional_encodings(self) -> Union[Tensor, List[Tensor]]:
@@ -54,6 +61,9 @@ class AttentionState:
         data = x['input']
         self.input_seq_len, self.input_dtype, self.input_device = data.shape[1], data.dtype, data.device
         self.input_mask = x.get('input_mask')
+        self.upsampling = x.get('upsampling', False)
+        if self.upsampling:
+            self.current_block = 0
 
     # Mask which is 0 where a position is [CLS], 1 otherwise
     def get_not_cls_mask(self) -> Optional[Tensor]:
@@ -82,6 +92,7 @@ class AttentionState:
         hparams = self.hparams
         factors = hparams.scaling_factors
         if self.upsampling and count_from_end:
+            breakpoint()
             factors = factors[::-1]  # Count from the last block when upsampling
 
         q_stride = int(prod(factors[:block_index]))
@@ -92,10 +103,11 @@ class AttentionState:
 
     # This method is wrapped in a functools.lru_cache() object in __post_init__, with the maxsize set dynamically
     def scaled_input_mask_for_block(self, block_index: int):
-        prev_mask = self.input_mask if block_index == 1 else self.scaled_input_mask_for_block(block_index - 1)
+        factors = self.hparams.scaling_factors
+        prev_mask = self.input_mask if block_index % len(factors) == 1 else self.scaled_input_mask_for_block(block_index - 1)
 
         # Do min pooling so that we make sure we don't include any padding tokens when we downsample
-        return self._scale_tensor(prev_mask, self.hparams.scaling_factors[block_index - 1], mode="min")
+        return self._scale_tensor(prev_mask, factors[block_index - 1], mode="min")
 
     # This method should be called at the end of a forward pass
     def reset(self):
@@ -108,6 +120,9 @@ class AttentionState:
     def scale_input(self, x: Tensor) -> Tensor:
         hparams = self.hparams
         factors = hparams.scaling_factors
+        if self.upsampling:
+            breakpoint()
+            factors = factors[::-1]
 
         # Sanity check
         assert self.current_block < len(factors), \
@@ -217,8 +232,8 @@ class AttentionState:
             else:
                 raise NotImplementedError
         else:
-            # For now we only support nearest-neighbor interpolation
-            x = F.interpolate(x, scale_factor=scaling_factor, mode='nearest')
+            x = x.repeat_interleave(scaling_factor, dim=-2)
+            breakpoint()
 
         return x.squeeze(1)
 

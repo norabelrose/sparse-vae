@@ -192,7 +192,7 @@ class Autoencoder(pl.LightningModule):
                 sample_log_prob = dist.log_prob(x).sum()
 
                 # Marginalize over successive layers of latent variables
-                running_total = layer_out.get(name, torch.zeros_like(sample_log_prob))
+                running_total = layer_out.get(name) or torch.zeros_like(sample_log_prob)
                 layer_out[name] = running_total + sample_log_prob
 
             return dist
@@ -201,8 +201,8 @@ class Autoencoder(pl.LightningModule):
 
         # Sample conditioned on the encoder state
         if states := layer_out.get('encoder_states'):
-            encoder_state = states[block_index]
-            q_input = torch.cat([layer_out, encoder_state], dim=-1)
+            encoder_state = states[-1 - block_index]  # Traverse the list of encoder states backwards
+            q_input = torch.cat([layer_out['q'], encoder_state], dim=-1)
 
             posterior = get_distribution_for_input('q(z|x)', q_input)
             z = posterior.rsample()
@@ -215,8 +215,8 @@ class Autoencoder(pl.LightningModule):
                 padding_mask = self.decoder.attention_state.input_mask
                 kl_tensor.masked_fill_(padding_mask, 0.0)  # Ignore KL divergences for padding positions
 
-                kl_running_total = layer_out.get('total_kl', kl_tensor.new_zeros([]))
-                num_pos_running_total = layer_out.get('total_nonpadding', padding_mask.new_zeros([]))
+                kl_running_total = layer_out.get('total_kl') or kl_tensor.new_zeros([])
+                num_pos_running_total = layer_out.get('total_nonpadding') or padding_mask.new_zeros([])
                 layer_out['total_kl'] = kl_running_total + kl_tensor.sum()
                 layer_out['total_nonpadding'] = num_pos_running_total + (~padding_mask).sum()
 
