@@ -83,6 +83,7 @@ class FunnelTransformer(nn.Module):
             )
 
         self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
+        self.attention_state = None  # Lazily loaded
 
     def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
         hparams = self.hparams
@@ -96,7 +97,7 @@ class FunnelTransformer(nn.Module):
 
         # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
         # for the current input, because that could result in it getting configured twice
-        elif not attn_state.shared:
+        if not attn_state.shared:
             attn_state.configure_for_input(x)
 
         x.update(q=x['input'], kv=x.pop('input'), attn_state=attn_state, hidden_states=[])
