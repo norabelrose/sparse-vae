@@ -3,6 +3,7 @@ import os
 import torch
 import unittest
 from contextlib import nullcontext
+from pytorch_lightning.trainer import seed_everything
 from pytorch_lightning.utilities import AttributeDict
 from text_vae import FunnelTransformer, FunnelTransformerHparams
 
@@ -21,6 +22,8 @@ class TestFunnelTransformer(unittest.TestCase):
                   f" you've downloaded it (see https://github.com/laiguokun/Funnel-Transformer) and then set the"
                   f" TEXT_VAE_PATH_TO_FUNNEL_TRANSFORMERS environment variable appropriately. Skipping test for now.")
             return
+
+        seed_everything(7295)
 
         # Load the ops.py file- it doesn't import any other Funnel-Transformer file and
         # modeling.py needs it
