@@ -204,7 +204,7 @@ class RelativePositionalAttention(nn.Module):
             scores = q_r_1 @ enc_k_1.transpose(-2, -1) + q_r_2 @ enc_k_2.transpose(-2, -1)
 
         elif self.positional_encoding_type == "rel_shift":
-            shift = 1 + attn_state.block_begin_flag
+            shift = 1 + (attn_state.block_begin_flag and attn_state.current_block > 0)
 
             # Funnel Transformer paper, page 13
             scores = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer

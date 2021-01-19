@@ -276,6 +276,7 @@ class FunnelBlock(nn.Module):
             x['attn_state'].block_begin_flag = (i == 0)  # Let AttentionState know we're starting a new block
             x = layer(x)
             x['attn_state'].block_begin_flag = False
+            x['q'] = x['kv']
 
         # With ReZero, we introduce an additional residual connection between blocks, where the output of each
         # block is multiplied by a parameter alpha that is initialized to zero. When alpha == 0, the block has
