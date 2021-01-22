@@ -1,15 +1,13 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import chain, islice
 from omegaconf import OmegaConf
 from pathlib import Path
 from tokenizers import BertWordPieceTokenizer
 from torch import Tensor
 from torch.utils.data import DataLoader
-from typing import *
 from .Utilities import *
-import datasets
-import math
-import multiprocessing
+from datasets import load_dataset
+from multiprocessing import cpu_count
 import os
 import pytorch_lightning as pl
 import torch
@@ -47,119 +45,110 @@ class TextVaeDataModule(pl.LightningDataModule):
 
     # Subclass hook
     def create_dataset(self):
-        self.dataset = datasets.load_dataset(self.hparams.dataset_name, split='train')
+        self.dataset = load_dataset(self.hparams.dataset_name, split='train', cache_dir=self.hparams.dataset_save_dir)
 
     def prepare_data(self, *args, **kwargs):
-        # Check if we already have the dataset
-        processed_path = os.path.join(self.hparams.dataset_save_dir, self.hparams.dataset_name)
-        if os.path.exists(processed_path):
-            self.dataset = datasets.load_from_disk(str(processed_path))
-            return
-
         self.create_dataset()   # Download or load a big file from disk
         assert self.dataset
-
-        # Flattens large lists faster than list(itertools.chain.from_iterable(x))
-        def fast_flatten(original, delimiter=None):
-            # Pre-allocate memory
-            total_size = sum(len(x) for x in original)
-            if delimiter:
-                total_size += len(original) - 1
-            output = [0] * total_size
-
-            cur_idx = 0
-            for x in original:
-                next_idx = cur_idx + len(original)
-                output[cur_idx:next_idx] = x
-                if delimiter:
-                    output[next_idx] = delimiter
-                    cur_idx = next_idx + 1
-                else:
-                    cur_idx = next_idx
-
-            return output
-
-        # Order of magnitude faster than list(iter(list(islice(x, chunk_size)), []))
-        def fast_flatten_and_chunk(original, chunk_size, delimiter):
-            total_size = sum(len(x) for x in original) + len(original) - 1
-            num_chunks = int(math.ceil(total_size / chunk_size))
-
-            # Use our SizedIterator wrapper which implements __length_hint__ to avoid a bunch of copies and reallocs
-            chained_iter = chain.from_iterable(original)
-            def chunk_getter():
-                chunk = list(SizedIterator(islice(chained_iter, chunk_size - 1), chunk_size))
-                if chunk:
-                    chunk += [delimiter]
-                return chunk
-
-            return list(SizedIterator(iter(chunk_getter, []), num_chunks))
-
-        # Accumulates elements from an iterable into a list until a predicate, called on the list, is True
-        def accumulate_until(iterable, predicate):
-            accumulated_elems = []
-
-            for elem in iterable:
-                old_elems = accumulated_elems
-                accumulated_elems = old_elems + [elem]
-
-                if predicate(accumulated_elems):
-                    accumulated_elems = []
-                    yield old_elems
-
-        if self.hparams.chunking_strategy == 'sentence':
-            # The NLTK Punkt tokenizer is actually a fancy learned model that needs to be downloaded
-            import nltk.data
-
-            punkt_dir = os.getcwd()
-            nltk.download('punkt', download_dir=punkt_dir)
-
-            sent_tokenizer = nltk.data.load(os.path.join(punkt_dir, 'tokenizers/punkt/english.pickle'))
-            max_sents = self.hparams.max_sentences_per_sample or int(1e9)
-
-            def sentence_tokenize(batch: Dict[str, list]) -> Dict[str, list]:
-                sentences = sent_tokenizer.tokenize_sents(batch['text'])
-                sentences = fast_flatten(sentences)  # Chain lists of sentences together from different samples
-                return {'text', sentences}
-
-            self.dataset = self.dataset.map(sentence_tokenize, batched=True)
 
         max_tokens = self.hparams.max_tokens_per_sample
         sep_token: int = self.tokenizer.get_vocab()['[SEP]']
 
-        #def chunk_sentences():
-# This code is currently causing weird crashes from inside dill, a HuggingFace datasets dependency, ostensibly due to the fact that
-# we are using closures inside the function. Needs to be rewritten to get around this dill bug.
-#                sent_list_iter = accumulate_until(
-#                    # Take off the [SEP] at the end of each sentence- we only want one [SEP] at the end of each batch
-#                    map(lambda sentence: sentence[:-1], iter(encoded_sentences)),
-#                    # Take the last list of full sentences that isn't too long
-#                    lambda sents: len(sents) > max_sents or sum(len(x) for x in sents) > max_tokens
-#                )
-#                # Flatten the lists of sentences into lists of tokens
-#                batch_iter = map(lambda sents: fast_flatten(sents, delimiter=sep_token), sent_list_iter)
-#                return {'text': list(batch_iter)}
-        
+        nontext_cols = self.dataset.column_names
+        nontext_cols.remove('text')
+
+        # Convert text into WordPiece tokens
         def tokenize(batch: Dict[str, list]) -> Dict[str, list]:
             encodings = [x.ids for x in self.tokenizer.encode_batch(batch['text'])]
             return {'text': encodings}
 
-        def chunk(batch: Dict[str, list]) -> Dict[str, list]:
-            return {'text': fast_flatten_and_chunk(batch['text'], max_tokens, delimiter=sep_token)}
+        # We're either generating single-sentence samples, or multi-sentence samples that respect sentence boundaries
+        if self.hparams.chunking_strategy == 'sentence':
+            # The NLTK Punkt tokenizer is actually a fancy learned model that needs to be downloaded
+            import nltk.data
 
-        nontext_cols = self.dataset.column_names
-        nontext_cols.remove('text')
+            nltk_dir = os.path.join(os.getcwd(), 'text-vae-pretrained/nltk/')
+            os.makedirs(nltk_dir, exist_ok=True)
 
-        # Tokenize, chunk, and save
-        print(f"Tokenizing '{self.hparams.dataset_name}'...")
-        self.dataset = self.dataset.map(tokenize, batched=True, remove_columns=nontext_cols)
-        os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Silence annoying warnings after we spawn DataLoader processes
-        
-        print(f"Chunking '{self.hparams.dataset_name}'...")
-        self.dataset = self.dataset.map(chunk, batched=True)
+            if not os.path.exists(os.path.join(nltk_dir, 'tokenizers/punkt/')):
+                nltk.download('punkt', download_dir=nltk_dir)
+
+            sent_tokenizer = nltk.data.load(os.path.join(nltk_dir, 'tokenizers/punkt/english.pickle'))
+            max_sents = self.hparams.max_sentences_per_sample or int(1e9)
+
+            # Flattens large lists faster than list(itertools.chain.from_iterable(x))
+            def fast_flatten(original):
+                # Pre-allocate memory
+                total_size = sum(len(x) for x in original)
+                output = [None] * total_size
+
+                cur_idx = 0
+                for x in original:
+                    next_idx = cur_idx + len(x)
+                    output[cur_idx:next_idx] = x
+                    cur_idx = next_idx
+
+                return output
+
+            def sentence_split(batch: Dict[str, list]) -> Dict[str, list]:
+                sentences = sent_tokenizer.tokenize_sents(batch['text'])
+                return {'text': fast_flatten(sentences)}  # Chain lists of sentences together from different samples
+
+            print(f"Finding sentence boundaries for '{self.hparams.dataset_name}'...")
+            self.dataset = self.dataset.map(sentence_split, batched=True, remove_columns=nontext_cols)
+
+            print(f"Tokenizing '{self.hparams.dataset_name}'...")
+            self.dataset = self.dataset.map(tokenize, batched=True, batch_size=1000 * min(5, cpu_count()))
+
+            # This is for when we're generating batches of multiple full sentences
+            if max_sents > 1:
+                def chunk_getter(batch: Dict[str, list]):
+                    current_batch = []
+                    current_length = 0
+
+                    for sentence in batch['text']:
+                        next_length = len(sentence)
+
+                        # This sentence is so long it exceeds the max length by itself, so skip it
+                        if next_length > max_tokens:
+                            continue
+
+                        # Adding this sentence would make the current batch too long, so yield the current batch,
+                        # start a new batch and add this sentence too it
+                        elif next_length + current_length > max_tokens or len(current_batch) >= max_sents:
+                            chunk_to_yield = fast_flatten(current_batch)
+                            current_batch.clear()
+                            current_batch.append(sentence)
+
+                            yield chunk_to_yield
+                        else:
+                            current_batch.append(sentence)
+
+                print(f"Grouping '{self.hparams.dataset_name}' into batches...")
+                self.dataset = self.dataset.map(lambda batch: {'text': list(chunk_getter(batch))}, batched=True)
+
+        # We're ignoring sentence boundaries
+        else:
+            print(f"Tokenizing '{self.hparams.dataset_name}'...")
+            self.dataset = self.dataset.map(tokenize, batched=True, remove_columns=nontext_cols)
+
+            # Split large samples into smaller chunks, and group smaller samples together
+            def chunk(batch: Dict[str, list]) -> Dict[str, list]:
+                chained_iter = chain.from_iterable(batch['text'])
+
+                def chunk_getter():
+                    while chunk := list(islice(chained_iter, max_tokens - 1)):
+                        yield chunk + [sep_token]
+
+                return {'text': list(chunk_getter())}
+
+            print(f"Grouping '{self.hparams.dataset_name}' into batches...")
+            self.dataset = self.dataset.map(chunk, batched=True)
+
+        # Silence annoying warnings from the tokenizers package after we spawn DataLoader processes
+        os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
         self.dataset.rename_column_('text', 'token_ids')
-
-        print(f"Saving '{self.hparams.dataset_name}'...")
-        self.dataset.save_to_disk(os.path.join(self.hparams.dataset_save_dir, self.hparams.dataset_name))
 
     def setup(self, stage: Optional[str] = None):
         self.dataset = self.dataset.train_test_split(test_size=0.05, shuffle=True)

@@ -2,21 +2,6 @@ from copy import deepcopy
 from typing import *
 
 
-class SizedIterator:
-    def __init__(self, raw_iter, size: int):
-        self.raw_iter = iter(raw_iter)
-        self.size = size
-
-    def __iter__(self):
-        return self
-    
-    def __length_hint__(self):
-        return self.size
-    
-    def __next__(self):
-        return next(self.raw_iter)
-
-
 # Get a new dictionary with a subset of the keys
 T = TypeVar('T', bound=Mapping)
 def select(source_dict: T, *keys: str) -> T:

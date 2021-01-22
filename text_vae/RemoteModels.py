@@ -36,8 +36,7 @@ def remote_model_url_for_hparams(hparams, suffix: str="") -> str:
 
 # Returns the path to the local file once downloaded
 def load_remote_model(url: str) -> Path:
-    cache_dir = Path(os.getenv('XDG_CACHE_HOME', '~/.cache'))
-    models_dir = cache_dir.expanduser() / 'text_vae' / 'models'
+    models_dir = Path.cwd() / 'text-vae-pretrained'
     models_dir.mkdir(parents=True, exist_ok=True)
 
     # Check if we've already downloaded it

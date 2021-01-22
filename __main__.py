@@ -1,5 +1,6 @@
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
+from benchmarks.LSTMAutoencoder import LSTMAutoencoder, LSTMAutoencoderHparams
 from text_vae import Autoencoder, AutoencoderHparams
 from text_vae import FunnelForPreTraining, FunnelTransformerHparams
 from text_vae import TextVaeDataModule, TextVaeDataModuleHparams
@@ -8,8 +9,7 @@ import sys
 import torch
 
 
-if __name__ == "__main__":
-    args = sys.argv
+def main(args):
     command = args[1]
 
     # torch.autograd.set_detect_anomaly(True)
@@ -22,26 +22,40 @@ if __name__ == "__main__":
             'precision': 32
         }
     })
+    data_class = TextVaeDataModule
+
     if command == 'finetune-funnel':
         print("Finetuning a pretrained Funnel Transformer for Performer attention...")
-        config.data = OmegaConf.structured(TextVaeDataModuleHparams)
-        config.funnel = OmegaConf.structured(FunnelTransformerHparams)
-        config.merge_with_dotlist(args[2:])  # Skip both the application name and the subcommand
 
-        data = FunnelPreTrainingDataModule(hparams=config.data)
-        model = FunnelForPreTraining(config.funnel)
+        data_class = FunnelPreTrainingDataModule
+        hparam_class = FunnelTransformerHparams
+        model_class = FunnelForPreTraining
 
     elif command == 'train':
         print("Training a Text VAE...")
 
-        config.data = OmegaConf.structured(TextVaeDataModuleHparams)
-        config.vae = OmegaConf.structured(AutoencoderHparams)
-        config.merge_with_dotlist(args[2:])
+        hparam_class = AutoencoderHparams
+        model_class = Autoencoder
 
-        data = TextVaeDataModule(hparams=config.data)
-        model = Autoencoder(config.vae)
+    elif command == 'train-lstm':
+        print("Training an LSTM VAE...")
+
+        hparam_class = LSTMAutoencoderHparams
+        model_class = LSTMAutoencoder
+
     else:
         raise NotImplementedError
 
+    config.data = OmegaConf.structured(TextVaeDataModuleHparams)
+    config.model = OmegaConf.structured(hparam_class)
+    config.merge_with_dotlist(args[2:])
+
+    data = data_class(hparams=config.data)
+    model = model_class(config.model)
+
     trainer = Trainer(**config.trainer)
     trainer.fit(model, datamodule=data)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

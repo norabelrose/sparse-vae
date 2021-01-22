@@ -117,7 +117,7 @@ class Autoencoder(pl.LightningModule):
             return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
 
         weight_decay, lr = self.hparams.weight_decay, self.hparams.lr
-        adam = torch.optim.AdamW(weight_decay=weight_decay, lr=lr, params=self.encoder.parameters())
+        adam = torch.optim.AdamW(weight_decay=weight_decay, lr=lr, params=self.parameters())
         scheduler = torch.optim.lr_scheduler.LambdaLR(adam, cosine_with_warmup)
 
         return [adam], [scheduler]
