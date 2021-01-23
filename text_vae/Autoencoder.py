@@ -17,18 +17,15 @@ import torch
 @dataclass
 class AutoencoderHparams:
     encoder: FunnelTransformerHparams = FunnelTransformerHparams(
-        block_sizes=(4, 4, 4, 2, 2),  # Number of layers in each encoder block; reversed for the decoder
-        scaling_factors=(2, 2, 4, 4)  # How much the hidden state is downsampled between each encoder block
+        block_sizes=(4, 4, 4),  # Number of layers in each encoder block; reversed for the decoder
+        scaling_factors=(2, 2)  # How much the hidden state is downsampled between each encoder block
     )
     latent_depth: int = 16  # Depth of the latent tensors (dimensionality per token)
     use_pretrained_encoder: bool = True
     copy_encoder_weights_to_decoder: bool = True
     use_autoregressive_decoding: bool = False
 
-    # Update encoder parameters more frequently than those of the decoder until the mutual information between
-    # z and x stops going up (from "Lagging Inference Networks and Posterior Collapse in Variational Autoencoders")
-    aggressive_encoder_training: bool = False
-    encoder_updates_per_decoder_update: int = 1
+    batch_size: int = 0    # This is here just for compatibility with pl.Trainer's auto_scale_batch_size feature
     grad_clip_threshold: float = 200.0
     grad_skip_threshold: float = 400.0
     kl_warmup_steps: int = 0  # For KL annealing
@@ -263,13 +260,6 @@ class Autoencoder(pl.LightningModule):
 
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
-        # If we're doing aggressive encoder training then we will often skip updating the parameters on the decoder
-        if self.hparams.aggressive_encoder_training:
-            update_decoder = getattr(self, 'aggressive_training_finished', False)
-
-            self.decoder.requires_grad_(update_decoder)
-            self.latent_upsample.requires_grad_(update_decoder)
-
         result = self.reconstruct(batch)
 
         self.log_dict(select(result, 'kl', 'nll'))

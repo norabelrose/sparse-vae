@@ -1,9 +1,9 @@
 from datasets import concatenate_datasets
-from .Datasets import *
+from .AutoencoderDataModule import *
 
 
 # noinspection PyAbstractClass
-class FunnelPreTrainingDataModule(TextVaeDataModule):
+class FunnelPreTrainingDataModule(AutoencoderDataModule):
     dataset_name: ClassVar[str] = 'funnel_pretraining'
 
     def create_dataset(self):

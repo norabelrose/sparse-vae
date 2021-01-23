@@ -3,6 +3,7 @@ import torch
 import pytorch_lightning as pl
 from dataclasses import dataclass
 from omegaconf import OmegaConf
+from text_vae import MutualInformation
 from torch import Tensor
 from typing import *
 from .LSTMDecoder import LSTMDecoder
@@ -22,62 +23,83 @@ class LSTMAutoencoderHparams:
     cls_id: int = 101
     sep_id: int = 102
 
+    batch_size: int = 10  # This is just for compatibility with pl.Trainer's auto_scale_batch_size feature
+    grad_clip_threshold: float = 5.0
+    max_steps: int = 1000
+    momentum: float = 0.9
+
 
 class LSTMAutoencoder(pl.LightningModule):
     """VAE with normal prior"""
     def __init__(self, hparams: OmegaConf):
         super(LSTMAutoencoder, self).__init__()
+
         self.encoder = LSTMEncoder(hparams)
         self.decoder = LSTMDecoder(hparams)
         self.save_hyperparameters(hparams)
 
         self.nz = hparams.nz
 
-        loc = torch.zeros(self.nz)
-        scale = torch.ones(self.nz)
+        # Makes sure the distribution gets moved to the right devices
+        self.register_buffer('prior_mu', torch.zeros(self.nz))
+        self.register_buffer('prior_sigma', torch.ones(self.nz))
 
-        self.prior = torch.distributions.normal.Normal(loc, scale)
+        self.mutual_info = MutualInformation()
+
+    # Workaround for the fact that Distribution objects don't have a .to() method
+    def get_prior(self):
+        return torch.distributions.Normal(self.prior_mu, self.prior_sigma)
 
     def configure_optimizers(self):
         sgd = torch.optim.SGD(self.parameters(), lr=1e-2, momentum=self.hparams.momentum)
-        schedule = torch.optim.lr_scheduler.LambdaLR(sgd, lambda cur_step: min(0.0, cur_step / self.hparams.max_steps))
+        schedule = torch.optim.lr_scheduler.StepLR(sgd, step_size=1, gamma=0.1)
         return [sgd], [schedule]
 
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
-        z, kl_divergence = self.encode(batch['token_ids'], 1)
-        reconstruct_err = self.decoder.reconstruct_error(batch['token_ids'], z).mean(dim=1)
+    def training_step(self, batch: Dict[str, Tensor], batch_index: int, log_mi: bool = False) -> Optional[Tensor]:
+        # (batch_size, nz)
+        posterior = self.encoder(batch['token_ids'])
+        z = posterior.rsample([1]).movedim(source=1, destination=0)
+        kl = torch.distributions.kl_divergence(self.get_prior(), posterior).mean()
+
+        reconstruct_err = self.decoder.reconstruct_error(batch['token_ids'], z).mean()
+        self.log('kl', kl)
+        self.log('nll', reconstruct_err)
 
         kl_weight = batch.get('kl_weight', 1.0)
-        return reconstruct_err + kl_weight * kl_divergence
+        loss = reconstruct_err + kl_weight * kl
+        self.log('train_loss', loss)
+
+        if log_mi:
+            self.mutual_info(posterior, z)
+            self.log('mutual_info', self.mutual_info, on_epoch=True)
+
+        if loss.isnan():
+            self.print("Skipping NaN loss at step ", batch_index)
+            return None
+        else:
+            return loss
+
+    def on_after_backward(self):
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
+        self.log('grad_norm', grad_norm, on_step=True)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
-        return self.training_step(batch, batch_index)
+        return self.training_step(batch, batch_index, log_mi=True)
 
-    def validation_epoch_end(self, losses: List[Tensor]):
-        self.log('val_loss', torch.mean(torch.stack(losses)))
-
-    def encode(self, x, nsamples=1):
-        """
-        Returns: Tensor1, Tensor2
-            Tensor1: the tensor latent z with shape [batch, nsamples, nz]
-            Tensor2: the tenor of KL for each x with shape [batch]
-        """
-        return self.encoder.encode(x, nsamples)
-
-    def decode(self, z, strategy, K=5):
+    def decode(self, z, strategy, k=5):
         """generate samples from z given strategy
 
         Args:
             z: [batch, nsamples, nz]
             strategy: "beam" or "greedy" or "sample"
-            K: the beam width parameter
+            k: the beam width parameter
 
         Returns: List1
             List1: a list of decoded word sequence
         """
 
         if strategy == "beam":
-            return self.decoder.beam_search_decode(z, K)
+            return self.decoder.beam_search_decode(z, k)
         elif strategy == "greedy":
             return self.decoder.greedy_decode(z)
         elif strategy == "sample":
@@ -85,20 +107,20 @@ class LSTMAutoencoder(pl.LightningModule):
         else:
             raise ValueError("the decoding strategy is not supported")
 
-    def reconstruct(self, x, decoding_strategy="greedy", K=5):
+    def reconstruct(self, x, decoding_strategy="greedy", k=5):
         """reconstruct from input x
 
         Args:
             x: (batch, *)
             decoding_strategy: "beam" or "greedy" or "sample"
-            K: the beam width parameter (if applicable)
+            k: the beam width parameter (if applicable)
 
         Returns: List1
             List1: a list of decoded word sequence
         """
         z = self.sample_from_inference(x).squeeze(1)
 
-        return self.decode(z, decoding_strategy, K)
+        return self.decode(z, decoding_strategy, k)
 
     def nll_iw(self, x, nsamples, ns=100):
         """compute the importance weighting estimate of the log-likelihood
@@ -119,11 +141,11 @@ class LSTMAutoencoder(pl.LightningModule):
         for _ in range(int(nsamples / ns)):
             # [batch, ns, nz]
             # param is the parameters required to evaluate q(z|x)
-            z, param = self.encoder.sample(x, ns)
+            z, distribution = self.encoder.sample(x, ns)
 
             # [batch, ns]
             log_comp_ll = self.eval_complete_ll(x, z)
-            log_infer_ll = self.eval_inference_dist(x, z, param)
+            log_infer_ll = distribution.log_prob(z)
 
             tmp.append(log_comp_ll - log_infer_ll)
 
@@ -140,7 +162,7 @@ class LSTMAutoencoder(pl.LightningModule):
         """
 
         # (k^2)
-        return self.prior.log_prob(zrange).sum(dim=-1)
+        return self.get_prior().log_prob(zrange).sum(dim=-1)
 
     def eval_complete_ll(self, x, z):
         """compute log p(z,x)
@@ -177,10 +199,7 @@ class LSTMAutoencoder(pl.LightningModule):
             Tensor: the log posterior distribution log p(z|x) with
                     shape [batch_size, K^2]
         """
-        try:
-            batch_size = x.size(0)
-        except:
-            batch_size = x[0].size(0)
+        batch_size = x[0].size(0) if isinstance(x, tuple) else x.size(0)
 
         # (batch_size, k^2, nz)
         grid_z = grid_z.unsqueeze(0).expand(batch_size, *grid_z.size()).contiguous()
@@ -199,7 +218,7 @@ class LSTMAutoencoder(pl.LightningModule):
         Returns: Tensor
             Tensor: samples from prior with shape (nsamples, nz)
         """
-        return self.prior.sample((nsamples,))
+        return self.get_prior().sample((nsamples,))
 
     def sample_from_inference(self, x, nsamples=1):
         """perform sampling from inference net
@@ -277,20 +296,19 @@ class LSTMAutoencoder(pl.LightningModule):
 
         return mean
 
-    def eval_inference_dist(self, x, z, param=None):
-        """
-        Returns: Tensor
-            Tensor: the posterior density tensor with
-                shape (batch_size, nsamples)
-        """
-        return self.encoder.eval_inference_dist(x, z, param)
-
-    def calc_mi_q(self, x):
+    def calc_mi(self, x):
         """Approximate the mutual information between x and z
         under distribution q(z|x)
 
         Args:
             x: [batch_size, *]. The sampled data to estimate mutual info
         """
+        mi = 0
+        num_examples = 0
+        for batch_data in x:
+            batch_size = batch_data.size(0)
+            num_examples += batch_size
+            mutual_info = self.encoder.calc_mi(batch_data)
+            mi += mutual_info * batch_size
 
-        return self.encoder.calc_mi(x)
+        return mi / num_examples

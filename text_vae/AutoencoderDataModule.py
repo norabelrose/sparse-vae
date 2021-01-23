@@ -1,25 +1,27 @@
 from dataclasses import dataclass
+from datasets import load_dataset
 from itertools import chain, islice
+from multiprocessing import cpu_count
 from omegaconf import OmegaConf
 from pathlib import Path
 from tokenizers import BertWordPieceTokenizer
 from torch import Tensor
 from torch.utils.data import DataLoader
 from .Utilities import *
-from datasets import load_dataset
-from multiprocessing import cpu_count
 import os
+import numpy as np
 import pytorch_lightning as pl
 import torch
 import warnings
 
 
 @dataclass
-class TextVaeDataModuleHparams:
+class AutoencoderDataModuleHparams:
     batch_size: int = 10
     chunking_strategy: str = 'token'  # 'sentence' or 'token'
     dataset_name: str = 'pg19'
     max_sentences_per_sample: Optional[int] = None
+    min_tokens_per_sample: int = 10
     max_tokens_per_sample: int = 512
     split: str = 'train'    # Any string of the format supported by the HuggingFace datasets library
     dataset_save_dir: str = os.path.join(os.getcwd(), 'text-vae-datasets')
@@ -27,13 +29,16 @@ class TextVaeDataModuleHparams:
 
 # Base class for Text VAE data modules- takes care of boilerplate
 # noinspection PyAbstractClass
-class TextVaeDataModule(pl.LightningDataModule):
+class AutoencoderDataModule(pl.LightningDataModule):
     def __init__(self, hparams: OmegaConf):
-        super(TextVaeDataModule, self).__init__()
+        super(AutoencoderDataModule, self).__init__()
 
         # These warnings are spurious and seem to pop up due to a bug in PyTorch which was fixed in PR #47160
         warnings.filterwarnings('ignore', message='The given NumPy array is not writeable')
+        warnings.filterwarnings('ignore', message='Loading cached dataset')
 
+        # This is just for compatibility with pl.Trainer's auto_scale_batch_size feature
+        self.batch_size = hparams.batch_size
         self.hparams = hparams
         self.dataset = None     # HuggingFace Dataset object, possibly with both train and test splits
 
@@ -43,6 +48,18 @@ class TextVaeDataModule(pl.LightningDataModule):
         # Make sure dataset save dir exists
         os.makedirs(self.hparams.dataset_save_dir, exist_ok=True)
 
+    # Finds a reasonable (per thread) batch size given the average length of the samples
+    def get_reasonable_preprocessing_batch_size(self, num_samples: int = 10):
+        prng = np.random.default_rng(seed=7295)  # Make this deterministic
+
+        # Get Monte Carlo estimate of the average sample length without actually iterating through the whole dataset
+        indices = prng.choice(len(self.dataset), num_samples, replace=False)
+        elements = [self.dataset[int(i)] for i in indices]
+        avg_len_estimate = sum(len(x['text']) for x in elements) / len(elements)
+
+        # 1,000 for 1,000 character samples
+        return round(1e6 / avg_len_estimate)
+
     # Subclass hook
     def create_dataset(self):
         self.dataset = load_dataset(self.hparams.dataset_name, split='train', cache_dir=self.hparams.dataset_save_dir)
@@ -51,6 +68,7 @@ class TextVaeDataModule(pl.LightningDataModule):
         self.create_dataset()   # Download or load a big file from disk
         assert self.dataset
 
+        min_tokens = self.hparams.min_tokens_per_sample
         max_tokens = self.hparams.max_tokens_per_sample
         sep_token: int = self.tokenizer.get_vocab()['[SEP]']
 
@@ -58,22 +76,14 @@ class TextVaeDataModule(pl.LightningDataModule):
         nontext_cols.remove('text')
 
         # Convert text into WordPiece tokens
+        tokenizer = self.tokenizer  # Seems to help the datasets library hash this function and cache the results
         def tokenize(batch: Dict[str, list]) -> Dict[str, list]:
-            encodings = [x.ids for x in self.tokenizer.encode_batch(batch['text'])]
+            encodings = [x.ids for x in tokenizer.encode_batch(batch['text'])
+                         if min_tokens <= len(x.ids) <= max_tokens]
             return {'text': encodings}
 
         # We're either generating single-sentence samples, or multi-sentence samples that respect sentence boundaries
         if self.hparams.chunking_strategy == 'sentence':
-            # The NLTK Punkt tokenizer is actually a fancy learned model that needs to be downloaded
-            import nltk.data
-
-            nltk_dir = os.path.join(os.getcwd(), 'text-vae-pretrained/nltk/')
-            os.makedirs(nltk_dir, exist_ok=True)
-
-            if not os.path.exists(os.path.join(nltk_dir, 'tokenizers/punkt/')):
-                nltk.download('punkt', download_dir=nltk_dir)
-
-            sent_tokenizer = nltk.data.load(os.path.join(nltk_dir, 'tokenizers/punkt/english.pickle'))
             max_sents = self.hparams.max_sentences_per_sample or int(1e9)
 
             # Flattens large lists faster than list(itertools.chain.from_iterable(x))
@@ -90,15 +100,27 @@ class TextVaeDataModule(pl.LightningDataModule):
 
                 return output
 
+            # The NLTK Punkt tokenizer is actually a fancy learned model that needs to be downloaded
+            import nltk.data
+            nltk_dir = os.path.join(os.getcwd(), 'text-vae-pretrained/nltk/')
+            punkt_dir = os.path.join(nltk_dir, 'tokenizers/punkt/english.pickle')
+            os.makedirs(nltk_dir, exist_ok=True)
+
+            if not os.path.exists(os.path.join(nltk_dir, 'tokenizers/punkt/')):
+                nltk.download('punkt', download_dir=nltk_dir)
+
             def sentence_split(batch: Dict[str, list]) -> Dict[str, list]:
+                sent_tokenizer = nltk.data.load(punkt_dir, cache=True)
                 sentences = sent_tokenizer.tokenize_sents(batch['text'])
                 return {'text': fast_flatten(sentences)}  # Chain lists of sentences together from different samples
 
+            batch = self.get_reasonable_preprocessing_batch_size()
+
             print(f"Finding sentence boundaries for '{self.hparams.dataset_name}'...")
-            self.dataset = self.dataset.map(sentence_split, batched=True, remove_columns=nontext_cols)
+            self.dataset = self.dataset.map(sentence_split, batched=True, batch_size=batch, remove_columns=nontext_cols)
 
             print(f"Tokenizing '{self.hparams.dataset_name}'...")
-            self.dataset = self.dataset.map(tokenize, batched=True, batch_size=1000 * min(5, cpu_count()))
+            self.dataset = self.dataset.map(tokenize, batched=True, batch_size=batch * max(10, cpu_count()))
 
             # This is for when we're generating batches of multiple full sentences
             if max_sents > 1:
@@ -161,12 +183,12 @@ class TextVaeDataModule(pl.LightningDataModule):
         return {'token_ids': inputs, 'padding_mask': inputs.eq(0).float()}
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
-        return DataLoader(self.dataset['train'], batch_size=self.hparams.batch_size, shuffle=True,
-                          collate_fn=self.collate, num_workers=multiprocessing.cpu_count(), pin_memory=True)
+        return DataLoader(self.dataset['train'], batch_size=self.batch_size, shuffle=True,
+                          collate_fn=self.collate, num_workers=cpu_count(), pin_memory=True)
 
     def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
-        return DataLoader(self.dataset['test'], batch_size=self.hparams.batch_size, collate_fn=self.collate,
-                          num_workers=multiprocessing.cpu_count(), pin_memory=True)
+        return DataLoader(self.dataset['test'], batch_size=self.batch_size, collate_fn=self.collate,
+                          num_workers=cpu_count(), pin_memory=True)
 
     def test_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return self.val_dataloader()

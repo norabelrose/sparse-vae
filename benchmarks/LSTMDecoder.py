@@ -31,8 +31,6 @@ class LSTMDecoder(nn.Module):
     def __init__(self, hparams):
         super(LSTMDecoder, self).__init__()
 
-        torch._use_cudnn_rnn_flatten_weight = lambda: False
-
         self.ni = hparams.ni
         self.nh = hparams.dec_nh
         self.nz = hparams.nz
