@@ -52,16 +52,15 @@ class AttentionState:
                                                      self.input_device)
 
     # This method should be called before any other AttentionState methods are called in a forward pass
-    def configure_for_input(self, x: Dict[str, Any]):
+    def configure_for_input(self, x: Tensor, padding_mask: Tensor):
         # Clean up from the previous forward pass
         self.current_block = 0
         self.scaled_padding_mask_for_stride.cache_clear()
         self.upsampling = False
 
         # Save information about the input for calls to, i.e., get_positional_encoding()
-        data = x['input']
-        self.max_seq_len, self.input_dtype, self.input_device = data.shape[1], data.dtype, data.device
-        self.padding_mask = x.get('padding_mask')
+        self.max_seq_len, self.input_dtype, self.input_device = x.shape[1], x.dtype, x.device
+        self.padding_mask = padding_mask
 
     @property
     def upsampling(self) -> bool:
@@ -111,7 +110,7 @@ class AttentionState:
         return self._scale_tensor(prev_mask, stride // prev_stride, mode="min")
 
     # Either downsample or upsample the tensor, whichever is appropriate for the current block.
-    def scale_input(self, x: Tensor) -> Tensor:
+    def maybe_scale_input(self, x: Tensor) -> Tensor:
         # Sanity check
         num_factors = len(self.scaling_factors)
         assert self.current_block < num_factors + 1, \
@@ -121,7 +120,7 @@ class AttentionState:
         if self.current_block == num_factors:
             return x
 
-        # We assume that scale_input() will only be called once at the end of each block
+        # We assume that maybe_scale_input() will only be called once at the end of each block
         scaling_factor = self.scaling_factors[self.current_block]
         self.current_block += 1
 

@@ -12,13 +12,14 @@ import os
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 import warnings
 
 
 @dataclass
 class AutoencoderDataModuleHparams:
-    batch_size: int = 10
-    chunking_strategy: str = 'token'  # 'sentence' or 'token'
+    batch_size: int = 32
+    chunking_strategy: str = 'token'  # 'sentence', 'token', or 'none'
     dataset_name: str = 'pg19'
     max_sentences_per_sample: Optional[int] = None
     min_tokens_per_sample: int = 10
@@ -62,7 +63,8 @@ class AutoencoderDataModule(pl.LightningDataModule):
 
     # Subclass hook
     def create_dataset(self):
-        self.dataset = load_dataset(self.hparams.dataset_name, split='train', cache_dir=self.hparams.dataset_save_dir)
+        self.dataset = load_dataset(self.hparams.dataset_name, split=self.hparams.split,
+                                    cache_dir=self.hparams.dataset_save_dir)
 
     def prepare_data(self, *args, **kwargs):
         self.create_dataset()   # Download or load a big file from disk
@@ -82,8 +84,9 @@ class AutoencoderDataModule(pl.LightningDataModule):
                          if min_tokens <= len(x.ids) <= max_tokens]
             return {'text': encodings}
 
+        chunk_strategy = self.hparams.chunking_strategy
         # We're either generating single-sentence samples, or multi-sentence samples that respect sentence boundaries
-        if self.hparams.chunking_strategy == 'sentence':
+        if chunk_strategy == 'sentence':
             max_sents = self.hparams.max_sentences_per_sample or int(1e9)
 
             # Flattens large lists faster than list(itertools.chain.from_iterable(x))
@@ -155,17 +158,20 @@ class AutoencoderDataModule(pl.LightningDataModule):
             self.dataset = self.dataset.map(tokenize, batched=True, remove_columns=nontext_cols)
 
             # Split large samples into smaller chunks, and group smaller samples together
-            def chunk(batch: Dict[str, list]) -> Dict[str, list]:
-                chained_iter = chain.from_iterable(batch['text'])
+            if chunk_strategy == 'token':
+                def chunk(batch: Dict[str, list]) -> Dict[str, list]:
+                    chained_iter = chain.from_iterable(batch['text'])
 
-                def chunk_getter():
-                    while chunk := list(islice(chained_iter, max_tokens - 1)):
-                        yield chunk + [sep_token]
+                    def chunk_getter():
+                        while chunk := list(islice(chained_iter, max_tokens - 1)):
+                            yield chunk + [sep_token]
 
-                return {'text': list(chunk_getter())}
+                    return {'text': list(chunk_getter())}
 
-            print(f"Grouping '{self.hparams.dataset_name}' into batches...")
-            self.dataset = self.dataset.map(chunk, batched=True)
+                print(f"Grouping '{self.hparams.dataset_name}' into batches...")
+                self.dataset = self.dataset.map(chunk, batched=True)
+            elif chunk_strategy != 'none':
+                raise ValueError(f"Invalid chunk_strategy '{chunk_strategy}'")
 
         # Silence annoying warnings from the tokenizers package after we spawn DataLoader processes
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -176,10 +182,13 @@ class AutoencoderDataModule(pl.LightningDataModule):
         self.dataset = self.dataset.train_test_split(test_size=0.05, shuffle=True)
         self.dataset.set_format('torch')
 
-    @staticmethod
-    def collate(inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        # Combine into a single batched and padded tensor
+    def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+        # Combine into a single batched and padded tensorh
         inputs = torch.nn.utils.rnn.pad_sequence([x['token_ids'] for x in inputs], batch_first=True)
+        padding_needed = self.hparams.max_tokens_per_sample - inputs.shape[1]
+        if padding_needed > 0:
+            inputs = F.pad(inputs, (0, padding_needed))
+
         return {'token_ids': inputs, 'padding_mask': inputs.eq(0).float()}
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:

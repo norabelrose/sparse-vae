@@ -33,7 +33,7 @@ class LSTMDecoder(nn.Module):
 
         self.ni = hparams.ni
         self.nh = hparams.dec_nh
-        self.nz = hparams.nz
+        self.nz = hparams.latent_depth
         self.vocab_size = hparams.vocab_size
         self.cls_id = hparams.cls_id
         self.sep_id = hparams.sep_id
@@ -45,10 +45,10 @@ class LSTMDecoder(nn.Module):
         self.dropout_out = nn.Dropout(hparams.dec_dropout_out)
 
         # for initializing hidden state and cell
-        self.trans_linear = nn.Linear(hparams.nz, hparams.dec_nh, bias=False)
+        self.trans_linear = nn.Linear(hparams.latent_depth, hparams.dec_nh, bias=False)
 
         # concatenate z with input
-        self.lstm = nn.LSTM(input_size=hparams.ni + hparams.nz,
+        self.lstm = nn.LSTM(input_size=hparams.ni + hparams.latent_depth,
                             hidden_size=hparams.dec_nh,
                             num_layers=1,
                             batch_first=True)

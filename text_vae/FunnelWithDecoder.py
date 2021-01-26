@@ -12,10 +12,13 @@ class FunnelWithDecoder(nn.Module):
             hparams.block_outputs_to_return = [0]
 
         self.encoder = FunnelTransformer(hparams)
-        self.decoder = FunnelBlock(hparams, num_decoder_layers)
+        self.decoder = nn.Sequential(**[  # noqa
+            FunnelLayer(hparams)
+            for _ in range(num_decoder_layers)
+        ])
 
     def forward(self, x: Tensor, padding_mask: Tensor = None) -> Dict[str, Any]:
-        result = self.encoder({'input': x, 'padding_mask': padding_mask, 'keep_masks': True})
+        result = self.encoder({'input': x, 'padding_mask': padding_mask})
 
         # Residual connection
         total_scaling = np.prod(self.encoder.hparams.scaling_factors)

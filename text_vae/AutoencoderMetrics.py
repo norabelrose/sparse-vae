@@ -1,5 +1,6 @@
 from pytorch_lightning.metrics import Metric
 from torch import Tensor
+from torch.distributions import Normal
 import math
 import torch
 
@@ -14,7 +15,7 @@ class MutualInformation(Metric):
     def compute(self):
         return self.running_total / self.denominator
 
-    def update(self, posterior: torch.distributions.Normal, z: Tensor):  # noqa
+    def update(self, posterior: Normal, z: Tensor):  # noqa
         mu, logvar = posterior.mean, posterior.variance.log()
         x_batch, nz = mu.size()
 
@@ -23,7 +24,7 @@ class MutualInformation(Metric):
 
         # [1, x_batch, nz]
         mu, logvar = mu.unsqueeze(0), logvar.unsqueeze(0)
-        var = posterior.variance
+        var = posterior.variance.unsqueeze(0)
 
         # (z_batch, x_batch, nz)
         dev = z - mu

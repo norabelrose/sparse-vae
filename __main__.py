@@ -1,11 +1,7 @@
-from omegaconf import OmegaConf
 from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.callbacks import EarlyStopping
 from benchmarks.LSTMAutoencoder import LSTMAutoencoder, LSTMAutoencoderHparams
-from text_vae import AggressiveEncoderTraining
-from text_vae import Autoencoder, AutoencoderHparams
-from text_vae import FunnelForPreTraining, FunnelTransformerHparams
-from text_vae import AutoencoderDataModule, AutoencoderDataModuleHparams
-from text_vae import FunnelPreTrainingDataModule
+from text_vae import *
 import sys
 import torch
 
@@ -22,8 +18,7 @@ def main(args):
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
             'auto_select_gpus': gpu_available,
-            'gpus': int(gpu_available),
-            'precision': 32
+            'gpus': int(gpu_available)
         }
     })
     data_class = AutoencoderDataModule
@@ -38,15 +33,14 @@ def main(args):
     elif command == 'train':
         print("Training a Text VAE...")
 
-        hparam_class = AutoencoderHparams
-        model_class = Autoencoder
+        hparam_class = HierarchicalAutoencoderHparams
+        model_class = HierarchicalAutoencoder
 
     elif command == 'train-lstm':
         print("Training an LSTM VAE...")
 
         hparam_class = LSTMAutoencoderHparams
         model_class = LSTMAutoencoder
-
     else:
         raise NotImplementedError
 
@@ -54,10 +48,24 @@ def main(args):
     config.model = OmegaConf.structured(hparam_class)
     config.merge_with_dotlist(args[2:])
 
+    if ckpt_name := config.get('from_checkpoint'):
+        ckpt_path = Path.cwd() / "lightning_logs" / ckpt_name / "checkpoints"
+        try:
+            # Open the most recent checkpoint
+            ckpt = max(ckpt_path.glob('*.ckpt'), key=lambda file: file.lstat().st_mtime)
+        except ValueError:
+            print(f"Couldn't find checkpoint at path {ckpt_path}")
+            exit(1)
+        else:
+            config.trainer.resume_from_checkpoint = str(ckpt)
+
     data = data_class(hparams=config.data)
     model = model_class(config.model)
 
-    callbacks = None if not config.aggressive_encoder_training else [AggressiveEncoderTraining()]
+    callbacks = [EarlyStopping(monitor='val_loss'), UnconditionalSampler()]
+    if config.aggressive_encoder_training:
+        callbacks.append(AggressiveEncoderTraining())
+
     trainer = Trainer(**config.trainer, callbacks=callbacks)
 
     # Find the appropriate batch size for this machine and task

@@ -32,12 +32,13 @@ class FunnelTransformerHparams:
     num_classes: int = 0
 
     positional_encoding_type: str = 'rel_shift'  # 'absolute', 'absolute_decoupled', 'rel_shift' or 'factorized'
-    rezero_nonpretrained_blocks: bool = False
 
     # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of
     # selected blocks will be returned.
     block_outputs_to_return: Sequence[int] = field(default_factory=list)
+    use_convolutions: bool = False
     use_performer_attention: bool = False
+    use_initialization_scaling: bool = False
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
     def __post_init__(self):
@@ -82,14 +83,22 @@ class FunnelTransformer(nn.Module):
                 nn.LogSoftmax(dim=-1)
             )
 
-        self.blocks = nn.ModuleList([FunnelBlock(hparams, size) for size in hparams.block_sizes])
+        self.layers = nn.ModuleList([FunnelLayer(hparams) for _ in range(sum(hparams.block_sizes))])
         self.attention_state = None  # Lazily loaded
 
-    def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
+    # Vanilla function wrapper for hidden_state_coroutine()
+    def forward(self, x: Tensor, padding_mask: Tensor) -> Dict[str, Any]:
+        coroutine = self.hidden_state_coroutine(x, padding_mask)
+        return next(coroutine)[-1]
+
+    # Yields specified hidden states as they are generated while processing the input x, along with the absolute indices
+    # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
+    # versions of these hidden states, which are then used as the input to the next layer in the Transformer.
+    def hidden_state_coroutine(self, x: Tensor, padding_mask: Tensor, *, states_to_yield: Optional[List[int]] = None):
         hparams = self.hparams
 
         if not hparams.upsampling:
-            x['input'] = self.input_layer(x['input'])  # x.shape == (batch, length, d_model)
+            x = self.input_layer(x)  # x.shape == (batch, length, d_model)
 
         # This lazy loading allows the user to give us a pre-initialized, possibly shared AttentionState object
         if not (attn_state := self.attention_state):
@@ -98,38 +107,65 @@ class FunnelTransformer(nn.Module):
         # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
         # for the current input, because that could result in it getting configured twice
         if not attn_state.shared:
-            attn_state.configure_for_input(x)
+            attn_state.configure_for_input(x, padding_mask)
 
-        x.update(q=x['input'], kv=x.pop('input'), attn_state=attn_state, hidden_states=[])
-        for i, block in enumerate(self.blocks):
-            x = block(x)
+        hidden_states = {}
+        layer_iter = iter(enumerate(self.layers))
+        q = kv = x
 
-            # Cache intermediate hidden states if indicated
-            if i in hparams.block_outputs_to_return:
-                x['hidden_states'].append(x['kv'])
+        for block_idx, block_size in enumerate(self.hparams.block_sizes):
+            for rel_layer_idx in range(block_size):
+                # Let AttentionState know we're starting a new block
+                attn_state.block_begin_flag = (rel_layer_idx == 0)
+                abs_layer_idx, layer = next(layer_iter)
 
+                if states_to_yield and abs_layer_idx in states_to_yield:
+                    maybe_transformed_x = yield block_idx, abs_layer_idx, q
+
+                    # The consumer of this generator may or may not send us anything
+                    if maybe_transformed_x is not None:
+                        q = kv = maybe_transformed_x
+                        yield  # Don't return anything from the .send() method
+
+                q = kv = layer(q, kv, attn_state)
+                attn_state.block_begin_flag = False
+
+            q = attn_state.maybe_scale_input(kv)
+
+            # When we're upsampling, there's no stage where we pool Q but don't pool K and V.
+            if self.hparams.upsampling:
+                kv = q
+
+            # Cache block outputs if indicated
+            if block_idx in hparams.block_outputs_to_return:
+                hidden_states[block_idx] = kv
+
+        output = {}
         if hparams.upsampling:
             # Non-autoregressively generate a softmax distribution over words
-            x['logits'] = self.output_layer(x.pop('q'))
+            output['logits'] = self.output_layer(q)
         else:
-            x['output'] = x.pop('q')
+            output['output'] = q
 
-        del x['attn_state'], x['kv']
+        # Last thing we yield is the final output
+        yield -1, -1, output
 
-        return x
-    
-    def enumerate_layers(self) -> Iterator:
-        absolute_index = 0
-        for block in self.blocks:
-            for layer in block.layers:
-                yield absolute_index, layer
-                absolute_index += 1
+    # Gives you both the block and (absolute) layer indices while iterating
+    def enumerate_blocks_and_layers(self) -> Iterator:
+        abs_layer_idx = 0
+        layer_iter = iter(self.layers)
+        for block_idx, block_size in enumerate(self.hparams.block_sizes):
+            for _ in range(block_size):
+                layer = next(layer_iter)
+                yield block_idx, abs_layer_idx, layer
+
+                abs_layer_idx += 1
 
     # Convenient method for loading old checkpoints
     def enumerate_parameters_by_layer(self) -> Iterator[Tuple[str, torch.nn.Parameter, int]]:
-        for index, layer in self.enumerate_layers():
+        for block_idx, abs_layer_idx, layer in self.enumerate_blocks_and_layers():
             for var_name, param in layer.named_parameters():
-                yield var_name, param, index
+                yield var_name, param, abs_layer_idx
 
     def path_to_pretrained_checkpoint(self) -> Path:
         url = remote_model_url_for_hparams(self.hparams, suffix="-PT")
@@ -216,7 +252,10 @@ class FunnelLayer(nn.Module):
         super().__init__()
 
         d_model = hparams.d_model
-        if hparams.positional_encoding_type == 'absolute':
+        if hparams.use_convolutions:
+            self.attention = nn.Conv1d(d_model, d_model, 3)
+
+        elif hparams.positional_encoding_type == 'absolute':
             # Softmax attention with absolute, sinusoidal positional encodings
             if not hparams.use_performer_attention:
                 raw_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=hparams.num_heads)
@@ -242,52 +281,13 @@ class FunnelLayer(nn.Module):
         self.feedforward = PositionwiseFFN(hparams.d_model, hparams.d_model * 4, hparams.dropout, hparams.ffn_dropout,
                                            layer_norm_eps=hparams.layer_norm_eps)
 
-        # A Callable (e.g. a Module) that will be called with the output of this layer. The output of
-        # *this transform* will then be passed on to the next layer. This makes it possible to add extra information
-        # (possibly stochastically) to the upsampling process.
-        self.output_transform: Optional[Callable] = None
-
     # Q is different from K and V right after pooling; K and V are always the same
-    def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
+    def forward(self, q: Tensor, kv: Tensor, attn_state: AttentionState) -> Tensor:
         # These custom attention and feedforward layers have built-in residual connections
-        x['kv'] = self.attention(x['q'], x['kv'], x['kv'], x['attn_state'])
-        x['kv'] = self.feedforward(x['kv'])
+        if isinstance(self.attention, nn.Conv1d):
+            kv = self.attention(kv.transpose(-2, -1)).transpose(-2, -1)  # Channels are dim 1
+        else:
+            kv = self.attention(q, kv, kv, attn_state)
 
-        if self.output_transform:
-            # The transform may add or mutate its own keys in the dictionary (see i.e. Autoencoder)
-            x = self.output_transform(x)
-
-        return x
-
-
-class FunnelBlock(nn.Module):
-    def __init__(self, hparams, num_layers: int):
-        super().__init__()
-
-        self.layers = nn.ModuleList([FunnelLayer(hparams) for _ in range(num_layers)])
-        self.rezero_alpha = None
-        self.upsampling = hparams.upsampling
-
-    def activate_rezero(self):
-        self.rezero_alpha = nn.Parameter(torch.tensor(0))
-
-    def forward(self, x: Dict[str, Any]) -> Dict[str, Any]:
-        for i, layer in enumerate(self.layers):
-            x['attn_state'].block_begin_flag = (i == 0)  # Let AttentionState know we're starting a new block
-            x = layer(x)
-            x['attn_state'].block_begin_flag = False
-            x['q'] = x['kv']
-
-        # With ReZero, we introduce an additional residual connection between blocks, where the output of each
-        # block is multiplied by a parameter alpha that is initialized to zero. When alpha == 0, the block has
-        # 'no effect' and simply outputs an average pooled version of its input.
-        if self.rezero_alpha is not None:
-            x['kv'] = x['q'] + (x['kv'] * self.rezero_alpha)
-
-        x['q'] = x['attn_state'].scale_input(x['kv'])
-
-        # When we're upsampling, there's no stage where we pool Q but don't pool K and V.
-        if self.upsampling:
-            x['kv'] = x['q']
-
-        return x
+        kv = self.feedforward(kv)
+        return kv

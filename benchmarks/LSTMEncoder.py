@@ -8,7 +8,7 @@ class LSTMEncoder(nn.Module):
         super(LSTMEncoder, self).__init__()
         self.ni = hparams.ni
         self.nh = hparams.enc_nh
-        self.nz = hparams.nz
+        self.nz = hparams.latent_depth
 
         self.embed = nn.Embedding(hparams.vocab_size, hparams.ni)
 
@@ -19,7 +19,7 @@ class LSTMEncoder(nn.Module):
                             dropout=0)
 
         # dimension transformation to z (mean and logvar)
-        self.linear = nn.Linear(hparams.enc_nh, 2 * hparams.nz, bias=False)
+        self.linear = nn.Linear(hparams.enc_nh, 2 * hparams.latent_depth, bias=False)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -60,4 +60,4 @@ class LSTMEncoder(nn.Module):
         _, (last_state, last_cell) = self.lstm(word_embed)
 
         mean, logvar = self.linear(last_state).chunk(2, -1)
-        return torch.distributions.Normal(mean.squeeze(0), logvar.squeeze(0).exp())
+        return Normal(mean.squeeze(0), logvar.squeeze(0).exp())

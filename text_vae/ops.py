@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import numpy as np
 from einops import rearrange
 from torch import nn
@@ -226,4 +224,3 @@ class RelativePositionalAttention(nn.Module):
             scores *= not_cls
 
         return scores
-

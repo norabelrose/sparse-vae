@@ -1,9 +1,8 @@
 import math
 import torch
-import pytorch_lightning as pl
 from dataclasses import dataclass
 from omegaconf import OmegaConf
-from text_vae import MutualInformation
+from text_vae import Autoencoder, AutoencoderHparams, MutualInformation
 from torch import Tensor
 from typing import *
 from .LSTMDecoder import LSTMDecoder
@@ -11,55 +10,37 @@ from .LSTMEncoder import LSTMEncoder
 
 
 @dataclass
-class LSTMAutoencoderHparams:
+class LSTMAutoencoderHparams(AutoencoderHparams):
     enc_nh: int = 1024  # Dimensionality of the encoder's LSTM hidden state
     dec_nh: int = 1024  # Dimensionality of the decoder's LSTM hidden state
     dec_dropout_in: float = 0.5
     dec_dropout_out: float = 0.5
     ni: int = 512  # Dimensionality of the input embedding vectors
-    nz: int = 32  # Dimensionality of the latent variable vector
+    latent_depth: int = 32  # Dimensionality of the latent variable vector
 
     vocab_size: int = 30522
     cls_id: int = 101
     sep_id: int = 102
 
-    batch_size: int = 10  # This is just for compatibility with pl.Trainer's auto_scale_batch_size feature
-    grad_clip_threshold: float = 5.0
-    max_steps: int = 1000
-    momentum: float = 0.9
 
-
-class LSTMAutoencoder(pl.LightningModule):
+class LSTMAutoencoder(Autoencoder):
     """VAE with normal prior"""
     def __init__(self, hparams: OmegaConf):
-        super(LSTMAutoencoder, self).__init__()
+        super(LSTMAutoencoder, self).__init__(hparams)
 
         self.encoder = LSTMEncoder(hparams)
         self.decoder = LSTMDecoder(hparams)
-        self.save_hyperparameters(hparams)
-
-        self.nz = hparams.nz
-
-        # Makes sure the distribution gets moved to the right devices
-        self.register_buffer('prior_mu', torch.zeros(self.nz))
-        self.register_buffer('prior_sigma', torch.ones(self.nz))
 
         self.mutual_info = MutualInformation()
 
-    # Workaround for the fact that Distribution objects don't have a .to() method
-    def get_prior(self):
-        return torch.distributions.Normal(self.prior_mu, self.prior_sigma)
+    def decoder_requires_grad_(self, requires_grad: bool):
+        self.decoder.requires_grad_(requires_grad)
 
-    def configure_optimizers(self):
-        sgd = torch.optim.SGD(self.parameters(), lr=1e-2, momentum=self.hparams.momentum)
-        schedule = torch.optim.lr_scheduler.StepLR(sgd, step_size=1, gamma=0.1)
-        return [sgd], [schedule]
-
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int, log_mi: bool = False) -> Optional[Tensor]:
+    def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Optional[Tensor]:
         # (batch_size, nz)
         posterior = self.encoder(batch['token_ids'])
         z = posterior.rsample([1]).movedim(source=1, destination=0)
-        kl = torch.distributions.kl_divergence(self.get_prior(), posterior).mean()
+        kl = torch.distributions.kl_divergence(self.get_base_prior(), posterior).mean()
 
         reconstruct_err = self.decoder.reconstruct_error(batch['token_ids'], z).mean()
         self.log('kl', kl)
@@ -67,15 +48,17 @@ class LSTMAutoencoder(pl.LightningModule):
 
         kl_weight = batch.get('kl_weight', 1.0)
         loss = reconstruct_err + kl_weight * kl
-        self.log('train_loss', loss)
 
-        if log_mi:
+        if val:
             self.mutual_info(posterior, z)
-            self.log('mutual_info', self.mutual_info, on_epoch=True)
+            self.log('mutual_info', self.mutual_info, on_epoch=True, on_step=False)
+            self.log('val_loss', loss, on_epoch=True, on_step=False)
+        else:
+            self.log('train_loss', loss)
 
         if loss.isnan():
-            self.print("Skipping NaN loss at step ", batch_index)
-            return None
+            self.print(f"Encountered NaN loss at step {batch_index}. Halting training.")
+            raise KeyboardInterrupt
         else:
             return loss
 
@@ -84,7 +67,11 @@ class LSTMAutoencoder(pl.LightningModule):
         self.log('grad_norm', grad_norm, on_step=True)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
-        return self.training_step(batch, batch_index, log_mi=True)
+        return self.training_step(batch, batch_index, val=True)
+
+    def sample(self, max_length: int, count: int = 1, **kwargs):
+        latents = self.get_base_prior().sample([count])
+
 
     def decode(self, z, strategy, k=5):
         """generate samples from z given strategy
@@ -97,7 +84,6 @@ class LSTMAutoencoder(pl.LightningModule):
         Returns: List1
             List1: a list of decoded word sequence
         """
-
         if strategy == "beam":
             return self.decoder.beam_search_decode(z, k)
         elif strategy == "greedy":
@@ -153,17 +139,6 @@ class LSTMAutoencoder(pl.LightningModule):
 
         return -ll_iw
 
-    def eval_prior_dist(self, zrange):
-        """perform grid search to calculate the true posterior
-        Args:
-            zrange: tensor
-                different z points that will be evaluated, with
-                shape (k^2, nz), where k=(zmax - zmin)/space
-        """
-
-        # (k^2)
-        return self.get_prior().log_prob(zrange).sum(dim=-1)
-
     def eval_complete_ll(self, x, z):
         """compute log p(z,x)
         Args:
@@ -176,16 +151,10 @@ class LSTMAutoencoder(pl.LightningModule):
         """
 
         # [batch, nsamples]
-        log_prior = self.eval_prior_dist(z)
-        log_gen = self.eval_cond_ll(x, z)
+        log_prior = self.get_base_prior().log_prob(z).sum(dim=-1)
+        log_gen = self.decoder.log_probability(x, z)
 
         return log_prior + log_gen
-
-    def eval_cond_ll(self, x, z):
-        """compute log p(x|z)
-        """
-
-        return self.decoder.log_probability(x, z)
 
     def eval_log_model_posterior(self, x, grid_z):
         """perform grid search to calculate the true posterior
@@ -211,14 +180,6 @@ class LSTMAutoencoder(pl.LightningModule):
         log_posterior = log_comp - log_comp.logsumexp(dim=1, keepdim=True)
 
         return log_posterior
-
-    def sample_from_prior(self, nsamples):
-        """sampling from prior distribution
-
-        Returns: Tensor
-            Tensor: samples from prior with shape (nsamples, nz)
-        """
-        return self.get_prior().sample((nsamples,))
 
     def sample_from_inference(self, x, nsamples=1):
         """perform sampling from inference net
@@ -266,35 +227,6 @@ class LSTMAutoencoder(pl.LightningModule):
                 samples.append(cur.unsqueeze(1))
 
         return torch.cat(samples, dim=1)
-
-    def calc_model_posterior_mean(self, x, grid_z):
-        """compute the mean value of model posterior, i.e. E_{z ~ p(z|x)}[z]
-        Args:
-            grid_z: different z points that will be evaluated, with
-                    shape (k^2, nz), where k=(zmax - zmin)/pace
-            x: [batch, *]
-
-        Returns: Tensor1
-            Tensor1: the mean value tensor with shape [batch, nz]
-
-        """
-
-        # [batch, K^2]
-        log_posterior = self.eval_log_model_posterior(x, grid_z)
-        posterior = log_posterior.exp()
-
-        # [batch, nz]
-        return torch.mul(posterior.unsqueeze(2), grid_z.unsqueeze(0)).sum(1)
-
-    def calc_infer_mean(self, x):
-        """
-        Returns: Tensor1
-            Tensor1: the mean of inference distribution, with shape [batch, nz]
-        """
-
-        mean, logvar = self.encoder.forward(x)
-
-        return mean
 
     def calc_mi(self, x):
         """Approximate the mutual information between x and z
