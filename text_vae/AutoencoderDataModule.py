@@ -183,7 +183,7 @@ class AutoencoderDataModule(pl.LightningDataModule):
         self.dataset.set_format('torch')
 
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        # Combine into a single batched and padded tensorh
+        # Combine into a single batched and padded tensor
         inputs = torch.nn.utils.rnn.pad_sequence([x['token_ids'] for x in inputs], batch_first=True)
         padding_needed = self.hparams.max_tokens_per_sample - inputs.shape[1]
         if padding_needed > 0:
@@ -193,11 +193,11 @@ class AutoencoderDataModule(pl.LightningDataModule):
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
         return DataLoader(self.dataset['train'], batch_size=self.batch_size, shuffle=True,
-                          collate_fn=self.collate, num_workers=cpu_count(), pin_memory=True)
+                          collate_fn=self.collate, num_workers=min(20, cpu_count()), pin_memory=True)
 
     def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return DataLoader(self.dataset['test'], batch_size=self.batch_size, collate_fn=self.collate,
-                          num_workers=cpu_count(), pin_memory=True)
+                          num_workers=min(20, cpu_count()), pin_memory=True)
 
     def test_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return self.val_dataloader()

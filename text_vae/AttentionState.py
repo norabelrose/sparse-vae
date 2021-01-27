@@ -52,14 +52,20 @@ class AttentionState:
                                                      self.input_device)
 
     # This method should be called before any other AttentionState methods are called in a forward pass
-    def configure_for_input(self, x: Tensor, padding_mask: Tensor):
+    def configure_for_input(self,
+                            seq_len: int,
+                            dtype: torch.dtype,
+                            device: torch.device,
+                            padding_mask: Tensor,
+                            upsampling: bool = False
+                            ):
         # Clean up from the previous forward pass
         self.current_block = 0
         self.scaled_padding_mask_for_stride.cache_clear()
-        self.upsampling = False
+        self.upsampling = upsampling
 
         # Save information about the input for calls to, i.e., get_positional_encoding()
-        self.max_seq_len, self.input_dtype, self.input_device = x.shape[1], x.dtype, x.device
+        self.max_seq_len, self.input_dtype, self.input_device = seq_len, dtype, device
         self.padding_mask = padding_mask
 
     @property
@@ -164,9 +170,8 @@ class AttentionState:
 
                 return [query_enc1, query_enc2, key_enc1, key_enc2]
 
-    # Given a block index and a flag indicating whether the queries have a larger stride than the keys, return a Tensor
-    # or a list of Tensors containing positional encodings appropriate for that stage of computation. At runtime this
-    # function is wrapped with functools.lru_cache() with the maxsize parameter determined dynamically.
+    # Returns a Tensor or a list of Tensors containing positional encodings appropriate for the given strides. At
+    # runtime this function is wrapped with functools.lru_cache() with the maxsize parameter determined dynamically.
     def positional_encodings_for_strides(self, q_stride: int, k_stride: int, seq_len: int,
                                          dtype: torch.dtype, device: torch.device) -> Union[Tensor, List[Tensor]]:
         # Either a Tensor or a list of Tensors

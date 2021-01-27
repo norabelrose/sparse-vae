@@ -107,7 +107,7 @@ class FunnelTransformer(nn.Module):
         # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
         # for the current input, because that could result in it getting configured twice
         if not attn_state.shared:
-            attn_state.configure_for_input(x, padding_mask)
+            attn_state.configure_for_input(x.shape[1], x.dtype, x.device, padding_mask)
 
         hidden_states = {}
         layer_iter = iter(enumerate(self.layers))

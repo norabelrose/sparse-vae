@@ -95,7 +95,8 @@ class HierarchicalAutoencoder(Autoencoder):
             self.encoder.load_pretrained_weights()
 
     def forward(self, batch: Dict[str, Any]) -> List[Tensor]:
-        self.encoder.attention_state.configure_for_input(batch['token_ids'], batch['padding_mask'])
+        x = batch['token_ids']
+        self.encoder.attention_state.configure_for_input(x.shape[1], x.dtype, x.device, batch['padding_mask'])
         return self.encoder(batch['token_ids'], padding_mask=batch['padding_mask'])
 
     # Returns the loss
@@ -116,14 +117,18 @@ class HierarchicalAutoencoder(Autoencoder):
         self.log('grad_norm', grad_norm, on_step=True)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
-        nll = self.get_loss_monte_carlo(batch)
-        self.log('val_loss', nll)
-        return nll
+        result = self.reconstruct(batch)
+
+        neg_elbo = result['kl'] + result['nll']  # Negative ELBO (evidence lower bound)
+        self.log_dict({'val_kl': result['kl'], 'val_nll': result['nll'], 'val_loss': neg_elbo})
+        return neg_elbo
 
     def test_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
-        nll = self.get_loss_monte_carlo(batch, num_samples=100)
-        self.log('test_loss', nll)
-        return nll
+        result = self.reconstruct(batch)
+
+        neg_elbo = result['kl'] + result['nll']  # Negative ELBO (evidence lower bound)
+        self.log_dict({'test_kl': result['kl'], 'test_nll': result['nll'], 'test_loss': neg_elbo})
+        return neg_elbo
 
     # Runs a forward pass through the encoder and the decoder and returns a dict with the KL and NLL per token
     def reconstruct(self, batch: Dict[str, Any], return_logits: bool = False, **kwargs) -> Dict[str, Tensor]:
@@ -234,7 +239,7 @@ class HierarchicalAutoencoder(Autoencoder):
             stats['q(z|x)'] += posterior.log_prob(z).sum(dim=(1, 2))
 
         # Update the running totals of the KL divergences
-        if self.training:
+        if posterior:
             kl_tensor = torch.distributions.kl_divergence(prior, posterior)
 
             if not self.hparams.include_padding_positions:
@@ -276,10 +281,17 @@ class HierarchicalAutoencoder(Autoencoder):
                clamped_latents: Optional[Mapping[int, Tensor]] = None,
                temperature: float = 1.0) -> Tensor:
         # Find the sequence length dimension that the seed should have in order to generate the desired output length
-        funnel_hparams = self.hparams.encoder_hparams
-        seed_length = max_length // prod(funnel_hparams.scaling_factors)
+        funnel_hparams = self.hparams.encoder
+        total_scaling = prod(funnel_hparams.scaling_factors)
+        seed_length = max_length // total_scaling
 
         # (batch, seq_len, vocab_size)
+        self.decoder.attention_state.configure_for_input(
+            seq_len=total_scaling * seed_length,  # May not be the same as max_length if it doesn't divide evenly
+            dtype=torch.long,
+            device=self.device,
+            padding_mask=None
+        )
         output_logits: Tensor = self.decoder_forward(
             x=None,
             padding_mask=None,
@@ -288,9 +300,9 @@ class HierarchicalAutoencoder(Autoencoder):
             return_latents=return_latents,
             temperature=temperature
         )['logits']
-        output_ids = output_logits.topk(top_k, dim=-1)
+        output_ids = output_logits.topk(top_k, dim=-1).indices
 
-        return output_ids
+        return output_ids.squeeze()
 
     def decoder_requires_grad_(self, requires_grad: bool):
         self.decoder.requires_grad_(requires_grad)

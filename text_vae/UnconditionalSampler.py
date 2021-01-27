@@ -2,14 +2,14 @@ from .Autoencoder import Autoencoder
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from pytorch_lightning.callbacks.base import Callback
-from tokenizers import BertWordPieceTokenizer
+from tokenizers import BertWordPieceTokenizer   # noqa
 from typing import *
 
 
 @dataclass
 class UnconditionalSampler(Callback):
     num_samples: int = 5
-    sample_max_len: int = 200
+    sample_max_len: int = 192
     sampling_temperature: float = 0.85  # Taken from Very Deep VAEs paper
 
     def on_load_checkpoint(self, checkpointed_state: Dict[str, Any]):
