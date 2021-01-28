@@ -33,10 +33,8 @@ class FunnelTransformerHparams:
 
     positional_encoding_type: str = 'rel_shift'  # 'absolute', 'absolute_decoupled', 'rel_shift' or 'factorized'
 
-    # Whether to return the pre-pooling output of each block on forward(). If a Sequence, then only the output of
-    # selected blocks will be returned.
-    block_outputs_to_return: Sequence[int] = field(default_factory=list)
-    use_convolutions: bool = False
+    # Whether to return the pre-pooling output of each block
+    return_block_outputs: bool = False
     use_performer_attention: bool = False
     use_initialization_scaling: bool = False
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
@@ -109,7 +107,7 @@ class FunnelTransformer(nn.Module):
         if not attn_state.shared:
             attn_state.configure_for_input(x.shape[1], x.dtype, x.device, padding_mask)
 
-        hidden_states = {}
+        hidden_states = []
         layer_iter = iter(enumerate(self.layers))
         q = kv = x
 
@@ -137,10 +135,12 @@ class FunnelTransformer(nn.Module):
                 kv = q
 
             # Cache block outputs if indicated
-            if block_idx in hparams.block_outputs_to_return:
-                hidden_states[block_idx] = kv
+            if hparams.return_block_outputs:
+                hidden_states.append(kv)
 
         output = {}
+        if hidden_states:
+            output['hidden_states'] = hidden_states
         if hparams.upsampling:
             # Non-autoregressively generate a softmax distribution over words
             output['logits'] = self.output_layer(q)
@@ -252,10 +252,7 @@ class FunnelLayer(nn.Module):
         super().__init__()
 
         d_model = hparams.d_model
-        if hparams.use_convolutions:
-            self.attention = nn.Conv1d(d_model, d_model, 3)
-
-        elif hparams.positional_encoding_type == 'absolute':
+        if hparams.positional_encoding_type == 'absolute':
             # Softmax attention with absolute, sinusoidal positional encodings
             if not hparams.use_performer_attention:
                 raw_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=hparams.num_heads)
@@ -284,10 +281,6 @@ class FunnelLayer(nn.Module):
     # Q is different from K and V right after pooling; K and V are always the same
     def forward(self, q: Tensor, kv: Tensor, attn_state: AttentionState) -> Tensor:
         # These custom attention and feedforward layers have built-in residual connections
-        if isinstance(self.attention, nn.Conv1d):
-            kv = self.attention(kv.transpose(-2, -1)).transpose(-2, -1)  # Channels are dim 1
-        else:
-            kv = self.attention(q, kv, kv, attn_state)
-
+        kv = self.attention(q, kv, kv, attn_state)
         kv = self.feedforward(kv)
         return kv

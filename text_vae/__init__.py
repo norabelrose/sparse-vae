@@ -3,6 +3,7 @@ from .Utilities import *
 from .RemoteModels import *
 from .AggressiveEncoderTraining import *
 from .AutoencoderMetrics import *
+from .KLAnnealing import *
 from .UnconditionalSampler import UnconditionalSampler
 from .Performers import *
 from .ops import *

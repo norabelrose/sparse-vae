@@ -7,20 +7,13 @@ from torch import Tensor
 from typing import *
 from .LSTMDecoder import LSTMDecoder
 from .LSTMEncoder import LSTMEncoder
+from .LSTMLanguageModel import LSTMLanguageModelHparams
 
 
 @dataclass
-class LSTMAutoencoderHparams(AutoencoderHparams):
+class LSTMAutoencoderHparams(AutoencoderHparams, LSTMLanguageModelHparams):
     enc_nh: int = 1024  # Dimensionality of the encoder's LSTM hidden state
-    dec_nh: int = 1024  # Dimensionality of the decoder's LSTM hidden state
-    dec_dropout_in: float = 0.5
-    dec_dropout_out: float = 0.5
-    ni: int = 512  # Dimensionality of the input embedding vectors
     latent_depth: int = 32  # Dimensionality of the latent variable vector
-
-    vocab_size: int = 30522
-    cls_id: int = 101
-    sep_id: int = 102
 
 
 class LSTMAutoencoder(Autoencoder):

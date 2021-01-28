@@ -8,8 +8,7 @@ class FunnelWithDecoder(nn.Module):
 
         # Make sure the first block's output is returned from the encoder so that we can
         # use it in the residual connection for the decoder
-        if not hparams.block_outputs_to_return:
-            hparams.block_outputs_to_return = [0]
+        hparams.return_block_outputs = True
 
         self.encoder = FunnelTransformer(hparams)
         self.decoder = nn.Sequential(**[  # noqa

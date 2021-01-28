@@ -65,6 +65,7 @@ class HierarchicalAutoencoder(Autoencoder):
         # Whether we should feed selected encoder states into the decoder to help it along
         overt_depth, latent_depth = encoder_hparams.d_model, hparams.latent_depth
         if self.hparams.use_encoder_residual_connections:
+            self.encoder.hparams.return_block_outputs = True
             posterior_input_depth = overt_depth * 2  # Concatenate the encoder and decoder states depthwise
         else:
             posterior_input_depth = overt_depth  # Just the decoder state
@@ -103,10 +104,11 @@ class HierarchicalAutoencoder(Autoencoder):
     def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         result = self.reconstruct(batch)
 
-        neg_elbo = result['kl'] + result['nll']  # Negative ELBO (evidence lower bound)
-        self.log_dict({'kl': result['kl'], 'nll': result['nll'], 'train_loss': neg_elbo})
-        # setattr(self, 'last_loss', neg_elbo.detach())  # Hack
-        return neg_elbo
+        # When the KL weight is at its default 1.0 setting, this is equal to the negative ELBO (evidence lower bound)
+        loss = self.hparams.kl_weight * result['kl'] + result['nll']
+        self.log_dict({'kl': result['kl'], 'nll': result['nll'], 'train_loss': loss})
+        setattr(self, 'last_loss', loss.detach())  # Hack
+        return loss
 
     # Implements gradient skipping to stabilize training as described in 'Very Deep VAEs'
     def on_after_backward(self):
@@ -153,7 +155,7 @@ class HierarchicalAutoencoder(Autoencoder):
             return output['logits']
 
         nll_target = output['logits'].transpose(-2, -1)  # nll_loss wants the dimensions permuted for some reason
-        raw_nll = F.nll_loss(nll_target, target=batch['token_ids'], ignore_index=ignore_idx, reduction='none')
+        raw_nll = F.cross_entropy(nll_target, target=batch['token_ids'], ignore_index=ignore_idx, reduction='none')
         output['nll'] = raw_nll.sum(dim=-1)
         del output['logits']
 
@@ -180,26 +182,32 @@ class HierarchicalAutoencoder(Autoencoder):
         num_blocks = len(self.decoder.hparams.block_sizes)
         stats = defaultdict(float)
 
-        for block_idx, layer_idx, hidden_state in coroutine:
+        for block_idx, layer_idx, decoder_state in coroutine:
             # Final output- hidden_state is a dict here
             if block_idx == -1:
-                hidden_state.update(stats)
-                return hidden_state
+                decoder_state.update(stats)
+                return decoder_state
 
             # In the first stochastic layer, the prior is just a standard diagonal Gaussian:
             if not latents:
                 # Sampling unconditionally
-                if hidden_state is not None:
-                    batch_dims = list(hidden_state.shape[:2])
+                if decoder_state is not None:
+                    batch_dims = list(decoder_state.shape[:2])
 
                 new_shape = batch_dims + [self.hparams.latent_depth]
                 prior = self.get_base_prior().expand(new_shape)  # noqa
 
             # But in subsequent layers, it is conditioned on the previous layer of latent variables:
             else:
-                prior = self.get_distribution_for_tensor('p(z)', layer_idx, latents[-1], temperature=temperature)
+                # We may have to upsample the previous latent in order to condition the prior on it
+                prev_latent = latents[-1]
+                if prev_latent.shape != decoder_state.shape:
+                    scale_factor = decoder_state.shape[1] // prev_latent.shape[1]
+                    prev_latent = prev_latent.repeat_interleave(scale_factor, dim=1)
 
-            if encoder_states is None and hidden_state is None:  # Sample unconditionally
+                prior = self.get_distribution_for_tensor('p(z)', layer_idx, prev_latent, temperature=temperature)
+
+            if encoder_states is None and decoder_state is None:  # Sample unconditionally
                 z = clamped_latents.get(layer_idx) if clamped_latents else None
                 if z is None:
                     z = prior.rsample()
@@ -207,14 +215,14 @@ class HierarchicalAutoencoder(Autoencoder):
                 posterior = None
             else:
                 # Corresponding block in the encoder, counting in reverse
-                if encoder_states is not None:
+                if block_idx != 0 and encoder_states is not None:
                     encoder_block_idx = num_blocks - block_idx - 1
                     encoder_state = encoder_states[encoder_block_idx]
-                    posterior_input = torch.cat([x, encoder_state], dim=-1)
+                    posterior_input = torch.cat([decoder_state, encoder_state], dim=-1)
 
                 # We're just given the final output of the encoder
                 else:
-                    posterior_input = hidden_state
+                    posterior_input = torch.cat([torch.zeros_like(decoder_state), decoder_state], dim=-1)
 
                 # Sample conditioned on the input from the encoder
                 posterior = self.get_distribution_for_tensor('q(z|x)', layer_idx, posterior_input,
@@ -227,7 +235,7 @@ class HierarchicalAutoencoder(Autoencoder):
             latents.append(z)
 
             reconstruction = self.latent_upsample[str(layer_idx)](z)
-            out_state = hidden_state + reconstruction if hidden_state is not None else reconstruction
+            out_state = decoder_state + reconstruction if decoder_state is not None else reconstruction
 
             coroutine.send(out_state)
 
@@ -306,4 +314,4 @@ class HierarchicalAutoencoder(Autoencoder):
 
     def decoder_requires_grad_(self, requires_grad: bool):
         self.decoder.requires_grad_(requires_grad)
-        self.distributions.requires_grad_(requires_grad)
+        # self.distributions.requires_grad_(requires_grad)

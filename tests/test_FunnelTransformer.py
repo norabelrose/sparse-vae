@@ -47,7 +47,7 @@ class TestFunnelTransformer(unittest.TestCase):
             for positional_encoding_type in ("factorized", "rel_shift"):
                 new_model = FunnelTransformer(FunnelTransformerHparams(
                     positional_encoding_type=positional_encoding_type,
-                    block_outputs_to_return=list(range(12))
+                    return_block_outputs=True
                 ))
                 new_model.load_pretrained_weights()
                 new_model.eval()

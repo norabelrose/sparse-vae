@@ -15,6 +15,7 @@ def main(args):
     gpu_available = torch.cuda.is_available()
     config = OmegaConf.create({
         'aggressive_encoder_training': False,
+        'kl_annealing': False,
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
             'auto_select_gpus': gpu_available,
@@ -65,6 +66,8 @@ def main(args):
     callbacks = [EarlyStopping(monitor='val_loss'), UnconditionalSampler()]
     if config.aggressive_encoder_training:
         callbacks.append(AggressiveEncoderTraining())
+    if config.kl_annealing:
+        callbacks.append(KLAnnealing())
 
     trainer = Trainer(**config.trainer, callbacks=callbacks)
 

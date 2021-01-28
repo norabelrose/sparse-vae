@@ -1,5 +1,5 @@
-import torch
 import torch.nn as nn
+from torch.distributions import Normal
 
 
 class LSTMEncoder(nn.Module):
@@ -11,12 +11,7 @@ class LSTMEncoder(nn.Module):
         self.nz = hparams.latent_depth
 
         self.embed = nn.Embedding(hparams.vocab_size, hparams.ni)
-
-        self.lstm = nn.LSTM(input_size=hparams.ni,
-                            hidden_size=hparams.enc_nh,
-                            num_layers=1,
-                            batch_first=True,
-                            dropout=0)
+        self.lstm = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.enc_nh, batch_first=True)
 
         # dimension transformation to z (mean and logvar)
         self.linear = nn.Linear(hparams.enc_nh, 2 * hparams.latent_depth, bias=False)
@@ -28,7 +23,7 @@ class LSTMEncoder(nn.Module):
 
         nn.init.uniform_(self.embed.weight, -0.1, 0.1)
 
-    def sample(self, input, nsamples):
+    def sample(self, inputs, nsamples):
         """sampling from the encoder
         Returns: Tensor1, Tuple
             Tensor1: the tensor latent z with shape [batch, nsamples, nz]
@@ -37,7 +32,7 @@ class LSTMEncoder(nn.Module):
         """
 
         # (batch_size, nz)
-        distribution = self.forward(input)
+        distribution = self.forward(inputs)
 
         # (batch, nsamples, nz)
         z = distribution.rsample([nsamples])

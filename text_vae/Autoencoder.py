@@ -16,6 +16,7 @@ class AutoencoderHparams(ABC):
 
     batch_size: int = 0  # This is here just for compatibility with pl.Trainer's auto_scale_batch_size feature
     grad_clip_threshold: float = 150.0
+    kl_weight: float = 1.0
     lr: float = 1e-4
     lr_decay_steps: Optional[int] = 150_000
     warmup_steps: int = 1000

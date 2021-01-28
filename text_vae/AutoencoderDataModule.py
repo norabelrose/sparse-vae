@@ -4,9 +4,9 @@ from itertools import chain, islice
 from multiprocessing import cpu_count
 from omegaconf import OmegaConf
 from pathlib import Path
-from tokenizers import BertWordPieceTokenizer
+from tokenizers import BertWordPieceTokenizer  # noqa
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader  # noqa
 from .Utilities import *
 import os
 import numpy as np
@@ -117,13 +117,13 @@ class AutoencoderDataModule(pl.LightningDataModule):
                 sentences = sent_tokenizer.tokenize_sents(batch['text'])
                 return {'text': fast_flatten(sentences)}  # Chain lists of sentences together from different samples
 
-            batch = self.get_reasonable_preprocessing_batch_size()
+            b_sz = self.get_reasonable_preprocessing_batch_size()
 
             print(f"Finding sentence boundaries for '{self.hparams.dataset_name}'...")
-            self.dataset = self.dataset.map(sentence_split, batched=True, batch_size=batch, remove_columns=nontext_cols)
+            self.dataset = self.dataset.map(sentence_split, batched=True, batch_size=b_sz, remove_columns=nontext_cols)
 
             print(f"Tokenizing '{self.hparams.dataset_name}'...")
-            self.dataset = self.dataset.map(tokenize, batched=True, batch_size=batch * max(10, cpu_count()))
+            self.dataset = self.dataset.map(tokenize, batched=True, batch_size=b_sz * max(10, cpu_count()))
 
             # This is for when we're generating batches of multiple full sentences
             if max_sents > 1:

@@ -1,5 +1,4 @@
 from .Autoencoder import Autoencoder
-from collections import deque
 from dataclasses import asdict, dataclass, field
 from pytorch_lightning.callbacks.base import Callback
 from torch import Tensor
@@ -17,7 +16,6 @@ class AggressiveEncoderTraining(Callback):
     _last_decoder_update: int = field(default=0, init=False)
     _last_loss: float = field(default=0.0, init=False)
     _last_mutual_info: float = field(default=0.0, init=False)
-    # _loss_history: deque = field(default_factory=lambda: deque(maxlen=10), init=False)
 
     def on_load_checkpoint(self, checkpointed_state: Dict[str, Any]):
         self.__dict__.update(checkpointed_state)
@@ -35,11 +33,13 @@ class AggressiveEncoderTraining(Callback):
     def on_train_start(self, trainer, autoencoder: Autoencoder):
         autoencoder.decoder_requires_grad_(False)
 
-    def on_train_batch_end(self, trainer, autoencoder: Autoencoder, outputs: List, batch, batch_index, dataloader_idx):
+    def on_after_backward(self, trainer, autoencoder: Autoencoder):
         if self._aggressive_stage_complete:
             return
 
-        inner_loop_step = batch_index - self._last_decoder_update
+        cur_step = autoencoder.global_step
+
+        inner_loop_step = cur_step - self._last_decoder_update
         new_loss = _to_scalar(getattr(autoencoder, 'last_loss'))
 
         update_decoder = (
@@ -50,21 +50,29 @@ class AggressiveEncoderTraining(Callback):
         )
         autoencoder.decoder_requires_grad_(update_decoder)
         if update_decoder:
-            self._last_decoder_update = batch_index
+            self._last_decoder_update = cur_step
             self._last_loss = new_loss
 
     def on_validation_end(self, trainer, autoencoder: Autoencoder):
         if self._aggressive_stage_complete:
             return
 
-        new_mutual_info = _to_scalar(trainer.callback_metrics['mutual_info'])
-        if new_mutual_info < self._last_mutual_info:
-            autoencoder.print("Aggressive encoder training complete.")
+        raw_mutual_info = trainer.callback_metrics.get('mutual_info')
+        if raw_mutual_info is None and trainer.current_epoch >= 4:
+            self.end_aggressive_training(autoencoder)
+            return
 
-            self._aggressive_stage_complete = True
-            autoencoder.decoder_requires_grad_(True)
+        new_mutual_info = _to_scalar(raw_mutual_info)
+        if new_mutual_info < self._last_mutual_info:
+            self.end_aggressive_training(autoencoder)
         else:
             self._last_mutual_info = new_mutual_info
+
+    def end_aggressive_training(self, autoencoder: Autoencoder):
+        autoencoder.print("Aggressive encoder training complete.")
+
+        self._aggressive_stage_complete = True
+        autoencoder.decoder_requires_grad_(True)
 
 # Convenience method
 def _to_scalar(x):
