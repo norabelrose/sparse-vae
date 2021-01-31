@@ -2,7 +2,6 @@ import numpy as np
 from einops import rearrange
 from torch import nn
 from .AttentionState import *
-from .Performers import PerformerAttention
 
 BIG_CONST = 1e6
 
@@ -70,6 +69,7 @@ class RelativePositionalAttention(nn.Module):
         d_head = d_model // n_head
 
         self.hparams = hparams
+        self.causal = False
         self.positional_encoding_type = hparams.positional_encoding_type
 
         self.dropout = hparams.dropout
@@ -94,21 +94,6 @@ class RelativePositionalAttention(nn.Module):
         self.normalizer = 1. / np.sqrt(d_head)
         self.reset_parameters()
 
-        if hparams.use_performer_attention:
-            assert hparams.positional_encoding_type == "factorized",\
-                "Performer attention is only compatible with the factorized form of relative positional attention"
-
-            content_attn = PerformerAttention(d_model=d_model, num_heads=n_head, use_linear_layers=False)
-            self.performer_attentions = nn.ModuleList([
-                content_attn,
-
-                # For the positional attention- we actually just use a single attention head for this
-                PerformerAttention(d_model=d_model, num_heads=1, num_random_features=content_attn.num_random_features,
-                                   use_linear_layers=False),
-                PerformerAttention(d_model=d_model, num_heads=1, num_random_features=content_attn.num_random_features,
-                                   use_linear_layers=False)
-            ])
-
     def reset_parameters(self):
         nn.init.uniform_(self.r_w_bias, b=0.1)
         nn.init.uniform_(self.r_r_bias, b=0.1)
@@ -124,59 +109,32 @@ class RelativePositionalAttention(nn.Module):
 
         q, k, v = (rearrange(x, 'b l h d -> b h l d') for x in (q, k, v))
 
-        if self.hparams.use_performer_attention:
-            # "Funnel Transformers" page 13, formula 8 and page 14, final formula of section A.2
-            q_i = (q + self.r_r_bias) @ self.r_kernel.transpose(-2, -1)
+        # Content based attention score
+        content_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * self.normalizer
+        pos_term = self._attn_pos_term(q, k.size(-2), attn_state)
 
-            # See the trigonometric identities in the paper on page 14
-            phi_i, pi_i, psi_j, omega_j = attn_state.get_positional_encodings()
+        # Merge attention scores
+        attn_score = content_score + pos_term
 
-            # This is my own derivation. Basically, the exp(A^{content} + A^{position}) in relative positional attention
-            # can be decomposed into the elementwise product exp(A^{content}) * exp(A^{position}), and with the
-            # factorized formulation, exp(A^{position}) can be decomposed into another product of exponentials. We then
-            # have the product of three exponentials of dot products, and each can be approximated with a Performer
-            # attention kernel function with O(n) time and space complexity. In order to have an unbiased estimate,
-            # though, we need to draw the random features for each term independently, hence the three separate
-            # PerformerAttention objects.
-            pos_q1, pos_q2, pos_k1, pos_k2 = q_i * phi_i, psi_j[None, None], q_i * pi_i, omega_j[None, None]
-            qk_pairs = [(q, k), (pos_q1, pos_k1), (pos_q2, pos_q2)]
-            norm = self.normalizer ** 0.5   # We multiply both Q and K by the 4th root of d_model, not Q by its sqrt
+        # Precision safety
+        dtype = attn_score.dtype
+        attn_score = attn_score.float()
 
-            # Get the elementwise products of all the Q', K', and denominators
-            q_prime_prod, k_prime_prod, denom_prod = norm, norm, 1.0
-            for attn, (query, key) in zip(self.performer_attentions, qk_pairs):
-                q_prime, k_prime = attn.get_projected_queries_and_keys(query, key)
-                denom = attn.denominator_for_projected_queries_and_keys(q_prime, k_prime.transpose(-2, -1))
+        # Perform masking
+        attn_mask = attn_state.get_attention_mask()
+        if self.causal:
+            causal_mask = torch.ones_like(attn_score)
+            causal_mask.triu_(1)
+            attn_mask = causal_mask if attn_mask is None else attn_mask * causal_mask
 
-                q_prime_prod *= q_prime
-                k_prime_prod *= k_prime
-                denom_prod *= denom
+        if attn_mask is not None:
+            attn_score = attn_score - BIG_CONST * attn_mask
 
-            k_prime_prod = self.att_drop(k_prime_prod)
-            output = q_prime_prod @ (k_prime_prod.transpose(-2, -1) @ v) / denom_prod
-
-        else:
-            # Content based attention score
-            content_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * self.normalizer
-            pos_term = self._attn_pos_term(q, k.size(-2), attn_state)
-
-            # Merge attention scores
-            attn_score = content_score + pos_term
-
-            # Precision safety
-            dtype = attn_score.dtype
-            attn_score = attn_score.float()
-
-            # Perform masking
-            attn_mask = attn_state.get_attention_mask()
-            if attn_mask is not None:
-                attn_score = attn_score - BIG_CONST * attn_mask
-
-            # Attention distribution
-            attn_dist = torch.softmax(attn_score, dim=-1)
-            attn_dist = attn_dist.type(dtype)
-            attn_dist = self.att_drop(attn_dist)
-            output = attn_dist @ v
+        # Attention distribution
+        attn_dist = torch.softmax(attn_score, dim=-1)
+        attn_dist = attn_dist.type(dtype)
+        attn_dist = self.att_drop(attn_dist)
+        output = attn_dist @ v
         
         output = rearrange(output, "b h l d -> b l h d")
 

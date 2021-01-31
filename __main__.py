@@ -1,9 +1,10 @@
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import EarlyStopping
-from benchmarks.LSTMAutoencoder import LSTMAutoencoder, LSTMAutoencoderHparams
+from benchmarks import *
 from text_vae import *
 import sys
 import torch
+from hparam_search import run_hparam_search
 
 
 def main(args):
@@ -14,11 +15,12 @@ def main(args):
     # torch.autograd.set_detect_anomaly(True)
     gpu_available = torch.cuda.is_available()
     config = OmegaConf.create({
-        'aggressive_encoder_training': False,
-        'kl_annealing': False,
+        'kl_annealing': True,
+        'posterior_collapse_early_stopping': True,
+        'unconditional_sampler': True,
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
-            'auto_select_gpus': gpu_available,
+            # 'auto_select_gpus': gpu_available,
             'gpus': int(gpu_available)
         }
     })
@@ -42,6 +44,16 @@ def main(args):
 
         hparam_class = LSTMAutoencoderHparams
         model_class = LSTMAutoencoder
+
+    elif command == 'train-lstm-lm':
+        print("Training a vanilla LSTM language model...")
+
+        hparam_class = LSTMLanguageModelHparams
+        model_class = LSTMLanguageModel
+
+    elif command == 'tune':
+        run_hparam_search(OmegaConf.from_dotlist(args[2:]))
+        return
     else:
         raise NotImplementedError
 
@@ -60,14 +72,15 @@ def main(args):
         else:
             config.trainer.resume_from_checkpoint = str(ckpt)
 
-    data = data_class(hparams=config.data)
     model = model_class(config.model)
+    data = data_class(hparams=config.data, tokenizer=model.tokenizer)
 
-    callbacks = [EarlyStopping(monitor='val_loss'), UnconditionalSampler()]
-    if config.aggressive_encoder_training:
-        callbacks.append(AggressiveEncoderTraining())
-    if config.kl_annealing:
-        callbacks.append(KLAnnealing())
+    # Automatically add all the callbacks included in the config file by their snake_case names
+    callbacks = []  # [EarlyStopping(monitor='val_loss')]
+    if issubclass(model_class, Autoencoder):
+        for name, callback_class in AutoencoderCallbackRegistry.items():
+            if config.get(name):
+                callbacks.append(callback_class())
 
     trainer = Trainer(**config.trainer, callbacks=callbacks)
 

@@ -1,14 +1,12 @@
-from .Autoencoder import Autoencoder
-from dataclasses import asdict, dataclass, field
-from pytorch_lightning.callbacks.base import Callback
 from torch import Tensor
-from typing import *
+from ..Autoencoder import Autoencoder
+from .AutoencoderCallback import *
 
 
 # Update encoder parameters more frequently than those of the decoder until the mutual information between
 # z and x stops going up (from "Lagging Inference Networks and Posterior Collapse in Variational Autoencoders")
 @dataclass
-class AggressiveEncoderTraining(Callback):
+class AggressiveEncoderTraining(AutoencoderCallback):
     min_inner_loop_steps: int = 10
     max_inner_loop_steps: int = 100    # Maximum number of encoder updates before we update the decoder
 
@@ -16,12 +14,6 @@ class AggressiveEncoderTraining(Callback):
     _last_decoder_update: int = field(default=0, init=False)
     _last_loss: float = field(default=0.0, init=False)
     _last_mutual_info: float = field(default=0.0, init=False)
-
-    def on_load_checkpoint(self, checkpointed_state: Dict[str, Any]):
-        self.__dict__.update(checkpointed_state)
-
-    def on_save_checkpoint(self, trainer, pl_module) -> Dict[str, Any]:
-        return asdict(self)
 
     # Don't check the mutual information metric during the validation sanity check
     def on_sanity_check_start(self, trainer, autoencoder: Autoencoder):

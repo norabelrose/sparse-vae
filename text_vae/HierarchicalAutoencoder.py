@@ -1,11 +1,9 @@
 from collections import defaultdict, deque
+from dataclasses import asdict
 from numpy import prod
-from torch import nn
-from torch import Tensor
-from .Utilities import *
-from .AttentionState import AttentionState
 from .Autoencoder import *
-from .FunnelTransformer import FunnelTransformer, FunnelTransformerHparams
+from .FunnelTransformer import *
+from .GenerationUtils import *
 import math
 import torch.nn.functional as F
 import torch
@@ -14,38 +12,41 @@ import torch
 @dataclass
 class HierarchicalAutoencoderHparams(AutoencoderHparams):
     encoder: FunnelTransformerHparams = FunnelTransformerHparams(
-        block_sizes=(4, 4, 4),  # Number of layers in each encoder block; reversed for the decoder
-        scaling_factors=(2, 2)  # How much the hidden state is downsampled between each encoder block
+        block_sizes=(10, 10, 10, 4, 2),  # Number of layers in each encoder block; reversed for the decoder
+        scaling_factors=(2, 2, 4, 4),    # How much the hidden state is downsampled between each encoder block
+        d_model=256,                     # This is small to save on parameters while having a deep model
+        num_heads=4
     )
-    # Indicates how many layers of latent variables should be conditioned on one another, and the Transformer layer
-    # indices after which each latent variable will be sampled. If None, the stochastic depth will be set equal to the
-    # number of Transformer layers in the encoder.
-    stochastic_layers: Optional[List[int]] = None
+    # Indicates how many groups of latent variables should be used. If None, the number will be set equal to
+    # the number of Transformer layers in the encoder.
+    num_latent_groups: Optional[int] = None
+    tie_embedding_weights: bool = True
+    use_autoregressive_decoder: bool = False
     use_encoder_residual_connections: bool = True
-    use_pretrained_encoder: bool = True
+    use_pretrained_encoder: bool = False
 
-    grad_skip_threshold: float = 400.0
     include_padding_positions: bool = True
 
 
 class HierarchicalAutoencoder(Autoencoder):
-    def __init__(self, hparams: OmegaConf):
+    def __init__(self, hparams: DictConfig):
         super().__init__(hparams)
-
-        # save_hyperparameters() stores the hparams in self.hparams and ensures they are saved to disk during training.
-        self.save_hyperparameters(hparams)
 
         encoder_hparams = hparams.encoder
         num_layers = sum(encoder_hparams.block_sizes)
-        stochastic_layers = hparams.stochastic_layers
+        num_latent_groups = hparams.num_latent_groups
 
-        if not stochastic_layers:
-            stochastic_layers = list(range(num_layers))
+        if not num_latent_groups:
+            num_latent_groups = hparams.num_latent_groups = num_layers
         else:
-            assert len(stochastic_layers) <= num_layers, \
-                "Number of stochastic layers must not exceed the number of Transformer layers in the encoder"
+            assert 1 <= num_latent_groups <= num_layers
 
-            stochastic_layers.sort()
+        # Evenly space the latent groups to the extent possible, biasing them toward higher resolutions
+        stride, leftover = divmod(num_layers, num_latent_groups)
+        self.latent_groups = list(range(0, num_layers - leftover, stride))
+
+        # save_hyperparameters() stores the hparams in self.hparams and ensures they are saved to disk during training.
+        self.save_hyperparameters(hparams)
 
         # The encoder and decoder share an AttentionState object, which caches positional encodings and the
         # padding mask for each scale
@@ -62,6 +63,22 @@ class HierarchicalAutoencoder(Autoencoder):
         self.encoder.attention_state = attn_state
         self.decoder.attention_state = attn_state
 
+        if hparams.tie_embedding_weights:
+            self.decoder.output_layer[0].weight = self.encoder.input_layer[0].weight
+
+        if hparams.use_autoregressive_decoder:
+            hidden_size = hparams.encoder.d_model * 2
+
+            # This is used to upsample one of the latent tensors to be the same dimensionality as the RNN hidden state
+            # so we can use it as the *initial* hidden state of the RNN
+            self.rnn_latent_upsample = nn.Linear(hparams.latent_depth, hidden_size)
+            self.rnn_output_downsample = nn.Linear(hidden_size, hparams.encoder.d_model)
+            self.rnn_decoder = nn.RNN(
+                input_size=hparams.encoder.d_model + hparams.latent_depth,
+                hidden_size=hidden_size,
+                batch_first=True
+            )
+
         # Whether we should feed selected encoder states into the decoder to help it along
         overt_depth, latent_depth = encoder_hparams.d_model, hparams.latent_depth
         if self.hparams.use_encoder_residual_connections:
@@ -73,6 +90,7 @@ class HierarchicalAutoencoder(Autoencoder):
         def get_linear_with_gelu(input_dim, output_dim, zero_initialized: bool = False):
             linear = nn.Linear(input_dim, output_dim)
             if zero_initialized:
+                linear.bias.data.zero_()
                 linear.weight.data.zero_()
 
             return nn.Sequential(nn.GELU(), linear)
@@ -86,81 +104,96 @@ class HierarchicalAutoencoder(Autoencoder):
         self.distributions = nn.ModuleDict({
             # Output contains mu & log sigma. Note that initializing the weights of the prior to zero means that at
             # the start of training, it will output 0 mean, 0 log sigma (i.e. 1 sigma) independent of the input
-            'p(z)': linears_with_gelu(latent_depth, latent_depth * 2, stochastic_layers[1:], zero_initialized=True),
-            'q(z|x)': linears_with_gelu(posterior_input_depth, latent_depth * 2, stochastic_layers)
+            'p(z)': linears_with_gelu(latent_depth, latent_depth * 2, self.latent_groups[1:], zero_initialized=True),
+            'q(z|x)': linears_with_gelu(posterior_input_depth, latent_depth * 2, self.latent_groups)
         })
-        self.latent_upsample = linears_with_gelu(latent_depth, overt_depth, stochastic_layers)
+        self.latent_upsample = linears_with_gelu(latent_depth, overt_depth, self.latent_groups)
 
         # Load pretrained weights
         if hparams.use_pretrained_encoder:
             self.encoder.load_pretrained_weights()
 
-    def forward(self, batch: Dict[str, Any]) -> List[Tensor]:
+    def forward(self, batch: Dict[str, Any], **kwargs) -> FunnelTransformerOutput:
         x = batch['token_ids']
         self.encoder.attention_state.configure_for_input(x.shape[1], x.dtype, x.device, batch['padding_mask'])
-        return self.encoder(batch['token_ids'], padding_mask=batch['padding_mask'])
+        return self.encoder(batch['token_ids'], padding_mask=batch['padding_mask'], **kwargs)
+
+    def compute_loss_for_step(self, result: Dict[str, Tensor], step: str):
+        # Figure out the correct denominator for the loss
+        if self.hparams.include_padding_positions:
+            num_tokens = result['logits'].shape[1]
+        else:
+            # Each sample in the batch will have a different number of nonpadding tokens
+            num_tokens = self.decoder.attention_state.padding_mask.sum(dim=-1)
+
+        # Normalize the KL, NLL, and p(x) and q(z|x) terms by dividing them by the number of tokens in the input.
+        # Then take the average over all samples in the batch.
+        for key, value in result.items():
+            if key in ('kl', 'nll', 'p(z)', 'q(z|x)', 'loss'):
+                result[key] = (value / num_tokens).mean()
+
+        # When the KL weight is at its default 1.0 setting, this is equal to the negative ELBO (evidence lower bound)
+        loss = self.hparams.kl_weight * result['kl'] + result['nll']
+        self.log_dict({'kl': result['kl'], 'nll': result['nll'], step + '_loss': loss})
+        return loss
 
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         result = self.reconstruct(batch)
+        return self.compute_loss_for_step(result, 'train')
 
-        # When the KL weight is at its default 1.0 setting, this is equal to the negative ELBO (evidence lower bound)
-        loss = self.hparams.kl_weight * result['kl'] + result['nll']
-        self.log_dict({'kl': result['kl'], 'nll': result['nll'], 'train_loss': loss})
-        setattr(self, 'last_loss', loss.detach())  # Hack
-        return loss
-
-    # Implements gradient skipping to stabilize training as described in 'Very Deep VAEs'
     def on_after_backward(self):
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
-        # if grad_norm > self.hparams.grad_skip_threshold:
-        #    self.zero_grad()
-
         self.log('grad_norm', grad_norm, on_step=True)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         result = self.reconstruct(batch)
-
-        neg_elbo = result['kl'] + result['nll']  # Negative ELBO (evidence lower bound)
-        self.log_dict({'val_kl': result['kl'], 'val_nll': result['nll'], 'val_loss': neg_elbo})
-        return neg_elbo
+        self.log('iw_loss', self.get_loss_monte_carlo(batch))
+        return self.compute_loss_for_step(result, 'val')
 
     def test_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         result = self.reconstruct(batch)
+        return self.compute_loss_for_step(result, 'test')
 
-        neg_elbo = result['kl'] + result['nll']  # Negative ELBO (evidence lower bound)
-        self.log_dict({'test_kl': result['kl'], 'test_nll': result['nll'], 'test_loss': neg_elbo})
-        return neg_elbo
-
-    # Runs a forward pass through the encoder and the decoder and returns a dict with the KL and NLL per token
+    # Runs a forward pass through the encoder and the decoder and returns a dict with the sum total KL and NLL
+    # for each sample in the batch. Note that these tensors must be normalized before computing the loss.
     def reconstruct(self, batch: Dict[str, Any], return_logits: bool = False, **kwargs) -> Dict[str, Tensor]:
-        # Figure out the correct denominator for the loss
-        if self.hparams.include_padding_positions:
-            ignore_idx = -100
-            num_tokens = batch['token_ids'].shape[-1]
-        else:
-            # Each sample in the batch will have a different number of nonpadding tokens
-            ignore_idx = 0
-            num_tokens = batch['padding_mask'].sum(dim=-1)
-
         # Encoder forward pass
-        encoder_out = self(batch)
+        is_autoregressive = self.hparams.use_autoregressive_decoder
+        encoder_out = self.forward(batch, return_embedded_input=is_autoregressive, return_logits=not is_autoregressive)
 
         # Help out the decoder by giving it some of the states of the encoder
         if self.hparams.use_encoder_residual_connections:
-            kwargs['encoder_states'] = encoder_out.pop('hidden_states')
+            kwargs['encoder_states'] = encoder_out.hidden_states
 
-        output = self.decoder_forward(encoder_out['output'], **kwargs)
+        output = self.decoder_forward(
+            encoder_out.final_state,
+            return_latents=is_autoregressive,
+            **kwargs
+        )
+        # If we're using autoregressive decoding, now is the time to run the RNN
+        if is_autoregressive:
+            # Use the last low-resolution latent group as the initial hidden state for the RNN
+            low_res_latent = min(reversed(output['latents']), key=lambda z: z.shape[1]).mean(dim=1)
+            last_latent = output['latents'][-1]
+            rnn_input = torch.cat([encoder_out.embedded_input, last_latent], dim=-1)
+            rnn_input = rnn_input[:, :-1]  # Remove [SEP] token to keep the input the same length as the expected output
+
+            rnn_states, _ = self.rnn_decoder(rnn_input, self.rnn_latent_upsample(low_res_latent).unsqueeze(0))
+            output['logits'] = self.decoder.output_layer(self.rnn_output_downsample(rnn_states))
+            ce_target = batch['token_ids'][:, 1:]  # Remove [CLS] token, thereby shifting everything to the left
+        else:
+            ce_target = batch['token_ids']
+
         if return_logits:
             return output['logits']
 
-        nll_target = output['logits'].transpose(-2, -1)  # nll_loss wants the dimensions permuted for some reason
-        raw_nll = F.cross_entropy(nll_target, target=batch['token_ids'], ignore_index=ignore_idx, reduction='none')
+        nll_target = output['logits'].transpose(-2, -1)  # cross_entropy wants the dimensions permuted for some reason
+        ignore_idx = -100 if self.hparams.include_padding_positions else 0
+        raw_nll = F.cross_entropy(nll_target, target=ce_target, ignore_index=ignore_idx, reduction='none')
         output['nll'] = raw_nll.sum(dim=-1)
-        del output['logits']
 
-        # Divide by the number of tokens and then average over samples in the batch
-        return {name: (stat / num_tokens).mean() for name, stat in output.items()}
+        return output
 
     # Called both by reconstruct() and sample()
     def decoder_forward(self, x: Optional[Tensor],
@@ -175,18 +208,25 @@ class HierarchicalAutoencoder(Autoencoder):
         # We use a coroutine so that we can unobtrusively insert ourselves into Funnel Transformer's forward pass
         # and replace its hidden state with samples from our prior or posterior distributions
         self.decoder.attention_state.upsampling = True
-        coroutine = self.decoder.hidden_state_coroutine(x, padding_mask=padding_mask,
-                                                        states_to_yield=self.hparams.stochastic_layers)
+        coroutine = self.decoder.forward_coroutine(
+            x,
+            padding_mask=padding_mask,
+            return_logits=not self.hparams.use_autoregressive_decoder,
+            states_to_yield=self.latent_groups
+        )
 
         latents = deque(maxlen=None if return_latents else 1)
         num_blocks = len(self.decoder.hparams.block_sizes)
         stats = defaultdict(float)
 
         for block_idx, layer_idx, decoder_state in coroutine:
-            # Final output- hidden_state is a dict here
+            # Final output- decoder_state is a FunnelTransformerOutput here
             if block_idx == -1:
-                decoder_state.update(stats)
-                return decoder_state
+                output = {**decoder_state.__dict__, **stats}
+                if return_latents:
+                    output['latents'] = list(latents)
+
+                return output
 
             # In the first stochastic layer, the prior is just a standard diagonal Gaussian:
             if not latents:
@@ -235,9 +275,12 @@ class HierarchicalAutoencoder(Autoencoder):
             latents.append(z)
 
             reconstruction = self.latent_upsample[str(layer_idx)](z)
-            out_state = decoder_state + reconstruction if decoder_state is not None else reconstruction
+            if decoder_state is not None:
+                out_state = decoder_state + reconstruction
 
-            coroutine.send(out_state)
+                coroutine.send(out_state)
+            else:
+                coroutine.send(reconstruction)
 
     def update_stats_dict(self, prior: Normal, posterior: Normal, z: Tensor, stats: Dict[str, Any],
                           return_log_probs: bool = False):
@@ -270,7 +313,7 @@ class HierarchicalAutoencoder(Autoencoder):
 
     # Get a tighter estimate for the KL and NLL of some input using Monte Carlo importance sampling
     def get_loss_monte_carlo(self, batch: Dict[str, Any], num_samples: int = 10):
-        batch_size = batch['token_ids'].shape[0]
+        batch_size, seq_len = batch['token_ids'].shape
 
         marginal_prob_list = []
         for _ in range(num_samples):
@@ -283,7 +326,7 @@ class HierarchicalAutoencoder(Autoencoder):
         # Average over the Monte Carlo samples
         log_marginal_prob = torch.stack(marginal_prob_list, dim=0)
         avg_log_prob = log_marginal_prob.logsumexp(dim=0).sub(math.log(num_samples * batch_size))
-        return -avg_log_prob
+        return (-avg_log_prob / seq_len).mean()
 
     def sample(self, max_length: int, count: int = 1, top_k: int = 1, return_latents: bool = False,
                clamped_latents: Optional[Mapping[int, Tensor]] = None,
@@ -300,17 +343,30 @@ class HierarchicalAutoencoder(Autoencoder):
             device=self.device,
             padding_mask=None
         )
-        output_logits: Tensor = self.decoder_forward(
+        is_autoregressive = self.hparams.use_autoregressive_decoder
+        decoder_output = self.decoder_forward(
             x=None,
             padding_mask=None,
             batch_dims=[count, seed_length],
             clamped_latents=clamped_latents or {},  # Allow for style transfer-type experiments
-            return_latents=return_latents,
+            return_latents=return_latents or is_autoregressive,
             temperature=temperature
-        )['logits']
-        output_ids = output_logits.topk(top_k, dim=-1).indices
+        )
 
-        return output_ids.squeeze()
+        if is_autoregressive:
+            low_res_latent = min(reversed(decoder_output['latents']), key=lambda z: z.shape[1]).mean(dim=1)
+
+            return autoregressive_decode(
+                strategy=GenerationStrategy.Greedy,
+                rnn=self.rnn_decoder,
+                z=decoder_output['final_state'],
+                embedding=self.encoder.input_layer[0],
+                logit_callable=lambda x: self.decoder.output_layer(self.rnn_output_downsample(x)),
+                initial_hidden_state=self.rnn_latent_upsample(low_res_latent),
+                max_length=max_length
+            )
+        else:
+            return nonautoregressive_decode(decoder_output['logits'])
 
     def decoder_requires_grad_(self, requires_grad: bool):
         self.decoder.requires_grad_(requires_grad)

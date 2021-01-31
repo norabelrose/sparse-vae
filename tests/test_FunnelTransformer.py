@@ -71,7 +71,7 @@ class TestFunnelTransformer(unittest.TestCase):
                 
                 output_old = old_model(inputs)
                 output_new = new_model({'input': inputs})
-                mean_err = torch.mean(abs(output_old[0][-1] - output_new['output']))
+                mean_err = torch.mean(abs(output_old[0][-1] - output_new.final_state))
         
                 print('Mean absolute error: ', mean_err.item())
                 print('Old output: ', output_old[0][4::4])

@@ -233,7 +233,7 @@ class AttentionState:
             cls_token = x.narrow(-2, 0, 1)           # The [CLS] token across all batches etc.
 
             shift = scaling_factor - 1               # We're magnifying [CLS] by scaling_factor
-            x = x.roll(shift, -2).clone()            # Roll to the right to make room for the bigger [CLS] token
+            x = x.roll(shift, -2)                    # Roll to the right to make room for the bigger [CLS] token
             x.narrow(-2, 0, shift).copy_(cls_token)  # Overwrite the last few tokens with [CLS]
 
         return x

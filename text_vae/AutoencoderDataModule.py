@@ -3,8 +3,7 @@ from datasets import load_dataset
 from itertools import chain, islice
 from multiprocessing import cpu_count
 from omegaconf import OmegaConf
-from pathlib import Path
-from tokenizers import BertWordPieceTokenizer  # noqa
+from tokenizers import Tokenizer
 from torch import Tensor
 from torch.utils.data import DataLoader  # noqa
 from .Utilities import *
@@ -31,7 +30,7 @@ class AutoencoderDataModuleHparams:
 # Base class for Text VAE data modules- takes care of boilerplate
 # noinspection PyAbstractClass
 class AutoencoderDataModule(pl.LightningDataModule):
-    def __init__(self, hparams: OmegaConf):
+    def __init__(self, hparams: OmegaConf, tokenizer: Tokenizer):
         super(AutoencoderDataModule, self).__init__()
 
         # These warnings are spurious and seem to pop up due to a bug in PyTorch which was fixed in PR #47160
@@ -42,9 +41,7 @@ class AutoencoderDataModule(pl.LightningDataModule):
         self.batch_size = hparams.batch_size
         self.hparams = hparams
         self.dataset = None     # HuggingFace Dataset object, possibly with both train and test splits
-
-        vocab_path = Path(__file__).parent / 'resources' / 'pretrained-vocab.txt'
-        self.tokenizer = BertWordPieceTokenizer.from_file(str(vocab_path), lowercase=True)
+        self.tokenizer = tokenizer
 
         # Make sure dataset save dir exists
         os.makedirs(self.hparams.dataset_save_dir, exist_ok=True)

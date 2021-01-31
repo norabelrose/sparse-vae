@@ -16,17 +16,17 @@ class FunnelWithDecoder(nn.Module):
             for _ in range(num_decoder_layers)
         ])
 
-    def forward(self, x: Tensor, padding_mask: Tensor = None) -> Dict[str, Any]:
+    def forward(self, x: Tensor, padding_mask: Tensor = None) -> FunnelTransformerOutput:
         result = self.encoder({'input': x, 'padding_mask': padding_mask})
 
         # Residual connection
         total_scaling = np.prod(self.encoder.hparams.scaling_factors)
-        scaled_output = result['output'].repeat_interleave(total_scaling, dim=-2)
-        decoder_input = scaled_output + result['hidden_states'][0]
+        scaled_output = result.final_state.repeat_interleave(total_scaling, dim=-2)
+        decoder_input = scaled_output + result.hidden_states[0]
 
         attn_state = self.encoder.attention_state
         attn_state.current_block = 0  # For the decoder, rewind to the stride that we were at in the first block
 
-        result['output'] = self.decoder({'q': decoder_input, 'kv': decoder_input, 'attn_state': attn_state})['q']
+        result.final_state = self.decoder({'q': decoder_input, 'kv': decoder_input, 'attn_state': attn_state})['q']
         attn_state.reset()
         return result

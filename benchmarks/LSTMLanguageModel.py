@@ -1,13 +1,13 @@
 from dataclasses import dataclass
-from omegaconf import OmegaConf
+from omegaconf import DictConfig
 from torch import nn, Tensor
 from typing import *
-import pytorch_lightning as pl
 import torch.nn.functional as F
+from text_vae import LanguageModel, LanguageModelHparams
 
 
 @dataclass
-class LSTMLanguageModelHparams:
+class LSTMLanguageModelHparams(LanguageModelHparams):
     dec_nh: int = 1024  # Dimensionality of the LSTM hidden state
     dec_dropout_in: float = 0.5
     dec_dropout_out: float = 0.5
@@ -18,9 +18,9 @@ class LSTMLanguageModelHparams:
     sep_id: int = 102
 
 
-class LSTMLanguageModel(pl.LightningModule):
-    def __init__(self, hparams: OmegaConf):
-        super(LSTMLanguageModel, self).__init__()
+class LSTMLanguageModel(LanguageModel):
+    def __init__(self, hparams: DictConfig):
+        super(LSTMLanguageModel, self).__init__(hparams)
         self.save_hyperparameters(hparams)
 
         self.embed = nn.Embedding(hparams.vocab_size, hparams.ni)
@@ -29,15 +29,18 @@ class LSTMLanguageModel(pl.LightningModule):
 
     # Returns [batch, seq_len, vocab_size] tensor of logits
     def forward(self, batch: Dict[str, Tensor]) -> Tensor:
-        x = batch['token_ids']
+        x = batch['token_ids'][:, :-1]  # Remove final [SEP] token
         x = self.embed(x)
         x, _ = self.decoder(x)
         return self.logit_linear(x)
 
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Tensor:
         logits = self.forward(batch)
-        loss = F.cross_entropy(input=logits, target=batch['token_ids'])
-        self.log('train_loss' if not val else 'val_loss', loss)
+        loss = F.cross_entropy(
+            input=logits,
+            target=batch['token_ids'][:, 1:]    # Remove initial [CLS] token
+        )
+        self.log('train_loss' if not val else 'val_loss', loss, on_step=not val, on_epoch=val)
         return loss
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:

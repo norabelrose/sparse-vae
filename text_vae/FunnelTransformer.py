@@ -16,10 +16,10 @@ import torch.nn as nn
 
 @dataclass
 class FunnelTransformerHparams:
-    block_sizes: Tuple[int, ...] = (4, 4, 4)
+    block_sizes: Sequence[int] = (4, 4, 4)
     d_model: int = 768
     num_heads: int = 12
-    scaling_factors: Tuple[int, ...] = (2, 2)
+    scaling_factors: Sequence[int] = (2, 2)
 
     # If None, d_embedding is set to equal d_model. For the generator in ELECTRA pretraining they are different.
     d_embedding: Optional[int] = None
@@ -40,14 +40,21 @@ class FunnelTransformerHparams:
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
     def __post_init__(self):
-        assert 1 not in self.scaling_factors, "Blocks with unitary scaling factors are not supported. Try simply"\
-                                              "making the preceding block larger with block_sizes."
+        assert self.d_model % self.num_heads == 0, "num_heads must divide d_model evenly"
         if self.use_performer_attention:
             assert self.positional_encoding_type not in ('rel_shift', 'factorized'),\
                 "Performer attention not supported with relative positional encodings"
 
         if not self.d_embedding:
             self.d_embedding = self.d_model
+
+# Returned by FunnelTransformer.forward()
+@dataclass
+class FunnelTransformerOutput:
+    final_state: Optional[Tensor] = None
+    embedded_input: Optional[Tensor] = None
+    hidden_states: List[Tensor] = field(default_factory=list)  # May be empty list
+    logits: Optional[Tensor] = None
 
 
 class FunnelTransformer(nn.Module):
@@ -81,18 +88,24 @@ class FunnelTransformer(nn.Module):
                 nn.LogSoftmax(dim=-1)
             )
 
-        self.layers = nn.ModuleList([FunnelLayer(hparams) for _ in range(sum(hparams.block_sizes))])
+        self.layers = nn.ModuleList([
+            FunnelLayer(hparams)
+            for _ in range(sum(hparams.block_sizes))
+        ])
         self.attention_state = None  # Lazily loaded
 
-    # Vanilla function wrapper for hidden_state_coroutine()
-    def forward(self, x: Tensor, padding_mask: Tensor) -> Dict[str, Any]:
-        coroutine = self.hidden_state_coroutine(x, padding_mask)
+    # Vanilla function wrapper for forward_coroutine()
+    def forward(self, x: Tensor, padding_mask: Tensor, **kwargs) -> FunnelTransformerOutput:
+        coroutine = self.forward_coroutine(x, padding_mask, **kwargs)
         return next(coroutine)[-1]
 
     # Yields specified hidden states as they are generated while processing the input x, along with the absolute indices
     # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
     # versions of these hidden states, which are then used as the input to the next layer in the Transformer.
-    def hidden_state_coroutine(self, x: Tensor, padding_mask: Tensor, *, states_to_yield: Optional[List[int]] = None):
+    def forward_coroutine(self, x: Tensor, padding_mask: Tensor, *,
+                          return_embedded_input: bool = False,
+                          return_logits: bool = True,
+                          states_to_yield: Optional[List[int]] = None):
         hparams = self.hparams
 
         if not hparams.upsampling:
@@ -116,21 +129,27 @@ class FunnelTransformer(nn.Module):
                 # Let AttentionState know we're starting a new block
                 attn_state.block_begin_flag = (rel_layer_idx == 0)
                 abs_layer_idx, layer = next(layer_iter)
+                cross_attn_keys = None
 
                 if states_to_yield and abs_layer_idx in states_to_yield:
                     maybe_transformed_x = yield block_idx, abs_layer_idx, q
 
                     # The consumer of this generator may or may not send us anything
                     if maybe_transformed_x is not None:
+                        # The consumer may have sent us a tuple of the form (qkv, cross attention target)
+                        if isinstance(maybe_transformed_x, tuple):
+                            cross_attn_keys = maybe_transformed_x[1]
+                            maybe_transformed_x = maybe_transformed_x[0]
+
                         q = kv = maybe_transformed_x
                         yield  # Don't return anything from the .send() method
 
-                q = kv = layer(q, kv, attn_state)
+                q = kv = layer(q, kv, attn_state, cross_attn_keys=cross_attn_keys)
                 attn_state.block_begin_flag = False
 
             q = attn_state.maybe_scale_input(kv)
 
-            # When we're upsampling, there's no stage where we pool Q but don't pool K and V.
+            # When we're upsampling, there's no stage where we scale Q but don't scale K and V.
             if self.hparams.upsampling:
                 kv = q
 
@@ -138,14 +157,16 @@ class FunnelTransformer(nn.Module):
             if hparams.return_block_outputs:
                 hidden_states.append(kv)
 
-        output = {}
-        if hidden_states:
-            output['hidden_states'] = hidden_states
-        if hparams.upsampling:
+        output = FunnelTransformerOutput(
+            final_state=q,
+            hidden_states=hidden_states
+        )
+        if return_embedded_input:
+            output.embedded_input = x
+        if return_logits:
+            assert hasattr(self, 'output_layer'), "Can't return logits if we don't have an output Linear layer"
             # Non-autoregressively generate a softmax distribution over words
-            output['logits'] = self.output_layer(q)
-        else:
-            output['output'] = q
+            output.logits = self.output_layer(q)
 
         # Last thing we yield is the final output
         yield -1, -1, output
@@ -265,8 +286,8 @@ class FunnelLayer(nn.Module):
             # keys, but not to the values, as proposed in the Shortformer paper
             def absolute_pos_attn_func(q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState):
                 q_pos_encodings, k_pos_encodings = attn_state.get_positional_encodings()
-                q += q_pos_encodings
-                k += k_pos_encodings
+                q = q + q_pos_encodings
+                k = k + k_pos_encodings
                 return raw_attn(q, k, v)
 
             self.attention = absolute_pos_attn_func
@@ -275,12 +296,25 @@ class FunnelLayer(nn.Module):
         else:
             self.attention = RelativePositionalAttention(hparams)
 
+        self.cross_attention = None
+        self.hparams = hparams
         self.feedforward = PositionwiseFFN(hparams.d_model, hparams.d_model * 4, hparams.dropout, hparams.ffn_dropout,
                                            layer_norm_eps=hparams.layer_norm_eps)
 
+    @property
+    def use_cross_attention(self) -> bool:
+        return bool(self.cross_attention)
+
+    @use_cross_attention.setter
+    def use_cross_attention(self, value: bool):
+        self.cross_attention = RelativePositionalAttention(self.hparams) if value else None
+
     # Q is different from K and V right after pooling; K and V are always the same
-    def forward(self, q: Tensor, kv: Tensor, attn_state: AttentionState) -> Tensor:
+    def forward(self, q: Tensor, kv: Tensor, attn_state: AttentionState, cross_attn_keys: Tensor = None) -> Tensor:
         # These custom attention and feedforward layers have built-in residual connections
-        kv = self.attention(q, kv, kv, attn_state)
-        kv = self.feedforward(kv)
-        return kv
+        q = self.attention(q, kv, kv, attn_state)
+        if cross_attn_keys is not None:
+            q = self.cross_attention(q, cross_attn_keys, cross_attn_keys, attn_state)
+
+        q = self.feedforward(q)
+        return q

@@ -339,7 +339,7 @@ def _get_kacs_random_walk_chain(batch, num_rows, device=None):
     for n in count():
         # Compute the cosines and sines of the rotations up front
         angles = math.pi * torch.rand(batch, num_rows // 2, 1, device=device)
-        cosines, sines = torch.cos(angles), torch.sin(angles)
+        cosines, sines = torch.cos(angles), torch.sin(angles)  # noqa
 
         # Group the matrix into random, non-overlapping pairs of rows. Because these pairs are non-overlapping, we can
         # perform each set of rotations in parallel.

@@ -1,12 +1,12 @@
 import math
 import torch
 from dataclasses import dataclass
-from omegaconf import OmegaConf
+from omegaconf import DictConfig
 from text_vae import Autoencoder, AutoencoderHparams, MutualInformation
-from torch import Tensor
+from torch import nn, Tensor
+from torch.distributions import Normal
 from typing import *
 from .LSTMDecoder import LSTMDecoder
-from .LSTMEncoder import LSTMEncoder
 from .LSTMLanguageModel import LSTMLanguageModelHparams
 
 
@@ -18,16 +18,34 @@ class LSTMAutoencoderHparams(AutoencoderHparams, LSTMLanguageModelHparams):
 
 class LSTMAutoencoder(Autoencoder):
     """VAE with normal prior"""
-    def __init__(self, hparams: OmegaConf):
+    def __init__(self, hparams: DictConfig):
         super(LSTMAutoencoder, self).__init__(hparams)
 
-        self.encoder = LSTMEncoder(hparams)
-        self.decoder = LSTMDecoder(hparams)
+        self.encoder_embedding = nn.Embedding(hparams.vocab_size, hparams.ni)
+        self.encoder_lstm = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.enc_nh, batch_first=True)
+        self.posterior = nn.Linear(hparams.enc_nh, 2 * hparams.latent_depth, bias=False)
+        self.reset_parameters()
 
+        self.decoder = LSTMDecoder(hparams)
         self.mutual_info = MutualInformation()
+
+    def reset_parameters(self):
+        for param in self.parameters():
+            nn.init.uniform_(param, -0.01, 0.01)
+
+        nn.init.uniform_(self.encoder_embedding.weight, -0.1, 0.1)
 
     def decoder_requires_grad_(self, requires_grad: bool):
         self.decoder.requires_grad_(requires_grad)
+
+    # Get the posterior distribution of the latent variable for an input
+    def forward(self, x):
+        word_embed = self.encoder_embedding(x)
+
+        _, (last_state, last_cell) = self.encoder_lstm(word_embed)
+
+        mean, logvar = self.posterior(last_state).chunk(2, -1)
+        return Normal(mean.squeeze(0), logvar.squeeze(0).exp())
 
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Optional[Tensor]:
         # (batch_size, nz)
@@ -38,9 +56,7 @@ class LSTMAutoencoder(Autoencoder):
         reconstruct_err = self.decoder.reconstruct_error(batch['token_ids'], z).mean()
         self.log('kl', kl)
         self.log('nll', reconstruct_err)
-
-        kl_weight = batch.get('kl_weight', 1.0)
-        loss = reconstruct_err + kl_weight * kl
+        loss = reconstruct_err + self.hparams.kl_weight * kl
 
         if val:
             self.mutual_info(posterior, z)
@@ -65,41 +81,8 @@ class LSTMAutoencoder(Autoencoder):
     def sample(self, max_length: int, count: int = 1, **kwargs):
         latents = self.get_base_prior().sample([count])
 
-
     def decode(self, z, strategy, k=5):
-        """generate samples from z given strategy
-
-        Args:
-            z: [batch, nsamples, nz]
-            strategy: "beam" or "greedy" or "sample"
-            k: the beam width parameter
-
-        Returns: List1
-            List1: a list of decoded word sequence
-        """
-        if strategy == "beam":
-            return self.decoder.beam_search_decode(z, k)
-        elif strategy == "greedy":
-            return self.decoder.greedy_decode(z)
-        elif strategy == "sample":
-            return self.decoder.sample_decode(z)
-        else:
-            raise ValueError("the decoding strategy is not supported")
-
-    def reconstruct(self, x, decoding_strategy="greedy", k=5):
-        """reconstruct from input x
-
-        Args:
-            x: (batch, *)
-            decoding_strategy: "beam" or "greedy" or "sample"
-            k: the beam width parameter (if applicable)
-
-        Returns: List1
-            List1: a list of decoded word sequence
-        """
-        z = self.sample_from_inference(x).squeeze(1)
-
-        return self.decode(z, decoding_strategy, k)
+        return self.decoder.autoregressive_decode(z, strategy=strategy, k=k)
 
     def nll_iw(self, x, nsamples, ns=100):
         """compute the importance weighting estimate of the log-likelihood
@@ -120,7 +103,8 @@ class LSTMAutoencoder(Autoencoder):
         for _ in range(int(nsamples / ns)):
             # [batch, ns, nz]
             # param is the parameters required to evaluate q(z|x)
-            z, distribution = self.encoder.sample(x, ns)
+            distribution = self.encoder(x)
+            z = distribution.rsample([ns])
 
             # [batch, ns]
             log_comp_ll = self.eval_complete_ll(x, z)
@@ -173,67 +157,3 @@ class LSTMAutoencoder(Autoencoder):
         log_posterior = log_comp - log_comp.logsumexp(dim=1, keepdim=True)
 
         return log_posterior
-
-    def sample_from_inference(self, x, nsamples=1):
-        """perform sampling from inference net
-        Returns: Tensor
-            Tensor: samples from infernece nets with
-                shape (batch_size, nsamples, nz)
-        """
-        z, _ = self.encoder.sample(x, nsamples)
-
-        return z
-
-    def sample_from_posterior(self, x, nsamples):
-        """perform MH sampling from model posterior
-        Returns: Tensor
-            Tensor: samples from model posterior with
-                shape (batch_size, nsamples, nz)
-        """
-
-        # use the samples from inference net as initial points
-        # for MCMC sampling. [batch_size, nsamples, nz]
-        cur = self.encoder.sample_from_inference(x, 1)
-        cur_ll = self.eval_complete_ll(x, cur)
-        total_iter = self.hparams.mh_burn_in + nsamples * self.hparams.mh_thin
-        samples = []
-        for iter_ in range(total_iter):
-            next = torch.normal(mean=cur,
-                                std=cur.new_full(size=cur.size(), fill_value=self.hparams.mh_std))
-            # [batch_size, 1]
-            next_ll = self.eval_complete_ll(x, next)
-            ratio = next_ll - cur_ll
-
-            accept_prob = torch.min(ratio.exp(), ratio.new_ones(ratio.size()))
-
-            uniform_t = accept_prob.new_empty(accept_prob.size()).uniform_()
-
-            # [batch_size, 1]
-            mask = (uniform_t < accept_prob).float()
-
-            mask_ = mask.unsqueeze(2)
-
-            cur = mask_ * next + (1 - mask_) * cur
-            cur_ll = mask * next_ll + (1 - mask) * cur_ll
-
-            if iter_ >= self.hparams.mh_burn_in and (iter_ - self.hparams.mh_burn_in) % self.hparams.mh_thin == 0:
-                samples.append(cur.unsqueeze(1))
-
-        return torch.cat(samples, dim=1)
-
-    def calc_mi(self, x):
-        """Approximate the mutual information between x and z
-        under distribution q(z|x)
-
-        Args:
-            x: [batch_size, *]. The sampled data to estimate mutual info
-        """
-        mi = 0
-        num_examples = 0
-        for batch_data in x:
-            batch_size = batch_data.size(0)
-            num_examples += batch_size
-            mutual_info = self.encoder.calc_mi(batch_data)
-            mi += mutual_info * batch_size
-
-        return mi / num_examples

@@ -8,3 +8,6 @@ tqdm>=4.49.0
 requests>=2.24.0
 omegaconf>=2.0.5
 nltk>=3.5
+ray>=1.1.0
+hpbandster
+ConfigSpace
