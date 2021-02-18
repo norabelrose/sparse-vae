@@ -1,42 +1,28 @@
-from .AttentionState import AttentionState
-from .ops import RelativePositionalAttention
-from .ops import PositionwiseFFN
-from .Performers import PerformerAttention
+from .AttentionState import *
+from .ops import AttentionHparams, PositionwiseFFN, RelativePositionalAttention
 from .RemoteModels import *
-from .Utilities import *
+from .core.Utilities import *
 from dataclasses import dataclass, field
 from omegaconf import OmegaConf
 from pytorch_lightning.utilities import AttributeDict
-from torch import Tensor
+from torch import nn, Tensor
 from typing import *
 import logging
 import torch
-import torch.nn as nn
 
 
 @dataclass
-class FunnelTransformerHparams:
+class FunnelTransformerHparams(AttentionHparams):
     block_sizes: Sequence[int] = (4, 4, 4)
-    d_model: int = 768
-    num_heads: int = 12
     scaling_factors: Sequence[int] = (2, 2)
 
     # If None, d_embedding is set to equal d_model. For the generator in ELECTRA pretraining they are different.
     d_embedding: Optional[int] = None
     vocab_size: int = 30522
-    attention_dropout: float = 0.1
-    dropout: float = 0.1
-    ffn_dropout: float = 0.0
-    layer_norm_eps: float = 1e-9
-    separate_cls: bool = True
-    num_classes: int = 0
-
-    positional_encoding_type: str = 'rel_shift'  # 'absolute', 'absolute_decoupled', 'rel_shift' or 'factorized'
 
     # Whether to return the pre-pooling output of each block
-    return_block_outputs: bool = False
+    return_block_outputs: bool = True
     use_performer_attention: bool = False
-    use_initialization_scaling: bool = False
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
     def __post_init__(self):
@@ -45,16 +31,15 @@ class FunnelTransformerHparams:
             assert self.positional_encoding_type not in ('rel_shift', 'factorized'),\
                 "Performer attention not supported with relative positional encodings"
 
-        if not self.d_embedding:
-            self.d_embedding = self.d_model
 
 # Returned by FunnelTransformer.forward()
 @dataclass
 class FunnelTransformerOutput:
-    final_state: Optional[Tensor] = None
-    embedded_input: Optional[Tensor] = None
+    original_ids: Tensor
+    final_state: Tensor
     hidden_states: List[Tensor] = field(default_factory=list)  # May be empty list
-    logits: Optional[Tensor] = None
+
+    embedded_input: Optional[Tensor] = None
 
 
 class FunnelTransformer(nn.Module):
@@ -63,6 +48,9 @@ class FunnelTransformer(nn.Module):
 
         if isinstance(hparams, FunnelTransformerHparams):
             hparams = OmegaConf.structured(hparams)
+
+        if not hparams.d_embedding:
+            hparams.d_embedding = hparams.d_model
 
         self.hparams = hparams
 
@@ -82,17 +70,20 @@ class FunnelTransformer(nn.Module):
                 input_modules.insert(1, input_projection)
 
             self.input_layer = nn.Sequential(*input_modules)
-        else:
-            self.output_layer = nn.Sequential(
-                nn.Linear(hparams.d_model, hparams.vocab_size),
-                nn.LogSoftmax(dim=-1)
-            )
 
         self.layers = nn.ModuleList([
             FunnelLayer(hparams)
             for _ in range(sum(hparams.block_sizes))
         ])
         self.attention_state = None  # Lazily loaded
+
+    # Scale the weights of each layer by 1/sqrt(N) where N is the depth of the layer
+    @torch.no_grad()
+    def scale_parameters(self, *, depth: int = 0):
+        depth = depth or len(self.layers)
+        for i, layer in enumerate(self.layers):  # noqa
+            for param in layer.parameters():
+                param.data *= depth ** -0.5
 
     # Vanilla function wrapper for forward_coroutine()
     def forward(self, x: Tensor, padding_mask: Tensor, **kwargs) -> FunnelTransformerOutput:
@@ -103,13 +94,12 @@ class FunnelTransformer(nn.Module):
     # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
     # versions of these hidden states, which are then used as the input to the next layer in the Transformer.
     def forward_coroutine(self, x: Tensor, padding_mask: Tensor, *,
-                          return_embedded_input: bool = False,
-                          return_logits: bool = True,
                           states_to_yield: Optional[List[int]] = None):
         hparams = self.hparams
 
+        original = x
         if not hparams.upsampling:
-            x = self.input_layer(x)  # x.shape == (batch, length, d_model)
+            x = self.input_layer(x)  # x.shape == (...length, d_model)
 
         # This lazy loading allows the user to give us a pre-initialized, possibly shared AttentionState object
         if not (attn_state := self.attention_state):
@@ -118,7 +108,7 @@ class FunnelTransformer(nn.Module):
         # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
         # for the current input, because that could result in it getting configured twice
         if not attn_state.shared:
-            attn_state.configure_for_input(x.shape[1], x.dtype, x.device, padding_mask)
+            attn_state.configure_for_input(x.shape[-2], x.dtype, x.device, padding_mask)
 
         hidden_states = []
         layer_iter = iter(enumerate(self.layers))
@@ -158,15 +148,11 @@ class FunnelTransformer(nn.Module):
                 hidden_states.append(kv)
 
         output = FunnelTransformerOutput(
+            original_ids=original,
             final_state=q,
+            embedded_input=x,
             hidden_states=hidden_states
         )
-        if return_embedded_input:
-            output.embedded_input = x
-        if return_logits:
-            assert hasattr(self, 'output_layer'), "Can't return logits if we don't have an output Linear layer"
-            # Non-autoregressively generate a softmax distribution over words
-            output.logits = self.output_layer(q)
 
         # Last thing we yield is the final output
         yield -1, -1, output
@@ -242,7 +228,7 @@ class FunnelTransformer(nn.Module):
         return transmute(
             self.hparams,
             attn_type='positional_encoding_type',
-            num_class='num_classes',
+            num_class='0',
             pad_id='None',
             seg_id_cls='2',
             truncate_seq='True'
@@ -269,40 +255,44 @@ class FunnelTransformer(nn.Module):
 
 
 class FunnelLayer(nn.Module):
-    def __init__(self, hparams):
+    def __init__(self, hparams, causal: bool = False, use_cross_attention: bool = False):
         super().__init__()
 
-        d_model = hparams.d_model
-        if hparams.positional_encoding_type == 'absolute':
-            # Softmax attention with absolute, sinusoidal positional encodings
-            if not hparams.use_performer_attention:
-                raw_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=hparams.num_heads)
-
-            # Performer attention with absolute positional embeddings
-            else:
-                raw_attn = PerformerAttention(**select(hparams, 'd_model', 'num_heads'))
-
-            # Wrap the raw attention module with this function that adds the positional encodings to the queries and
-            # keys, but not to the values, as proposed in the Shortformer paper
-            def absolute_pos_attn_func(q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState):
-                q_pos_encodings, k_pos_encodings = attn_state.get_positional_encodings()
-                q = q + q_pos_encodings
-                k = k + k_pos_encodings
-                return raw_attn(q, k, v)
-
-            self.attention = absolute_pos_attn_func
+        # d_model = hparams.d_model
+        if hparams.positional_encoding_type in ('absolute', 'learned'):
+            raise NotImplementedError
+            # raw_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=hparams.num_heads)
+#
+            # # Wrap the raw attention module with this function that adds the positional encodings to the queries and
+            # # keys, but not to the values, as proposed in the Shortformer paper
+            # def absolute_pos_attn_func(q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState):
+            #     q_pos_encodings, k_pos_encodings = attn_state.get_positional_encodings()
+            #     padding_mask = attn_state.get_padding_mask(for_key=True)
+            #     # breakpoint()
+            #     q = q + q_pos_encodings
+            #     k = k + k_pos_encodings
+            #     v = v + k_pos_encodings
+#
+            #     # Annoyingly, MultiheadAttention expects the batch dimension to be at index 1
+            #     q, k, v = (x.permute(1, 0, 2) for x in (q, k, v))
+            #     q, k, v = (x.permute(1, 0, 2) for x in (q, k, v))
+            #     return raw_attn(q, k, v, key_padding_mask=padding_mask, need_weights=False)[0].permute(1, 0, 2)
+#
+            # self.attention = absolute_pos_attn_func
+            # self.raw_attn = raw_attn
 
         # Either softmax or Performer attention with relative positional embeddings
         else:
             self.attention = RelativePositionalAttention(hparams)
 
-        self.cross_attention = None
+        self.causal = causal
+        self.cross_attention = use_cross_attention
         self.hparams = hparams
         self.feedforward = PositionwiseFFN(hparams.d_model, hparams.d_model * 4, hparams.dropout, hparams.ffn_dropout,
                                            layer_norm_eps=hparams.layer_norm_eps)
 
     @property
-    def use_cross_attention(self) -> bool:
+    def use_cross_attention(self):
         return bool(self.cross_attention)
 
     @use_cross_attention.setter
@@ -314,7 +304,7 @@ class FunnelLayer(nn.Module):
         # These custom attention and feedforward layers have built-in residual connections
         q = self.attention(q, kv, kv, attn_state)
         if cross_attn_keys is not None:
-            q = self.cross_attention(q, cross_attn_keys, cross_attn_keys, attn_state)
+            q = self.cross_attention(q, cross_attn_keys, cross_attn_keys, attn_state)  # noqa
 
         q = self.feedforward(q)
         return q

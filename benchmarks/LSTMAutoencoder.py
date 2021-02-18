@@ -1,62 +1,86 @@
-import math
 import torch
 from dataclasses import dataclass
+from einops import rearrange
 from omegaconf import DictConfig
-from text_vae import Autoencoder, AutoencoderHparams, MutualInformation
+from text_vae import (
+    ContinuousAutoencoder, ContinuousAutoencoderHparams, autoregressive_decode, GenerationStrategy, MutualInformation
+)
 from torch import nn, Tensor
 from torch.distributions import Normal
 from typing import *
-from .LSTMDecoder import LSTMDecoder
 from .LSTMLanguageModel import LSTMLanguageModelHparams
 
 
 @dataclass
-class LSTMAutoencoderHparams(AutoencoderHparams, LSTMLanguageModelHparams):
+class LSTMAutoencoderHparams(ContinuousAutoencoderHparams, LSTMLanguageModelHparams):
     enc_nh: int = 1024  # Dimensionality of the encoder's LSTM hidden state
     latent_depth: int = 32  # Dimensionality of the latent variable vector
 
 
-class LSTMAutoencoder(Autoencoder):
-    """VAE with normal prior"""
+class LSTMAutoencoder(ContinuousAutoencoder):
     def __init__(self, hparams: DictConfig):
         super(LSTMAutoencoder, self).__init__(hparams)
 
-        self.encoder_embedding = nn.Embedding(hparams.vocab_size, hparams.ni)
-        self.encoder_lstm = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.enc_nh, batch_first=True)
-        self.posterior = nn.Linear(hparams.enc_nh, 2 * hparams.latent_depth, bias=False)
-        self.reset_parameters()
+        vocab_size = self.tokenizer.get_vocab_size()
+        self.embedding = nn.Embedding(vocab_size, hparams.ni)
+        self.encoder = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.enc_nh, batch_first=True)
+        self.decoder = nn.LSTM(
+            input_size=hparams.ni + hparams.latent_depth,  # concatenate z with input
+            hidden_size=hparams.dec_nh,
+            batch_first=True
+        )
+        self.posterior = nn.Linear(hparams.enc_nh, 2 * hparams.latent_depth)
 
-        self.decoder = LSTMDecoder(hparams)
+        self.dropout_in = nn.Dropout(hparams.dec_dropout_in)
+        self.dropout_out = nn.Dropout(hparams.dec_dropout_out)
+
+        # for initializing hidden state and cell
+        self.trans_linear = nn.Linear(hparams.latent_depth, hparams.dec_nh)
+
+        # prediction layer
+        output_embedding = nn.Linear(hparams.dec_nh, vocab_size)
+        output_embedding.weight = self.embedding.weight
+        self.output_layer = nn.Sequential(
+            nn.Linear(hparams.dec_nh, hparams.ni),
+            nn.GELU(),
+            nn.LayerNorm(hparams.ni),
+            output_embedding
+        )
+        self.loss = nn.CrossEntropyLoss(reduction='none')
+
+        self.reset_parameters()
         self.mutual_info = MutualInformation()
 
     def reset_parameters(self):
         for param in self.parameters():
             nn.init.uniform_(param, -0.01, 0.01)
 
-        nn.init.uniform_(self.encoder_embedding.weight, -0.1, 0.1)
+        nn.init.uniform_(self.embedding.weight, -0.1, 0.1)
 
     def decoder_requires_grad_(self, requires_grad: bool):
         self.decoder.requires_grad_(requires_grad)
 
     # Get the posterior distribution of the latent variable for an input
     def forward(self, x):
-        word_embed = self.encoder_embedding(x)
-
-        _, (last_state, last_cell) = self.encoder_lstm(word_embed)
+        _, (last_state, last_cell) = self.encoder(x)
 
         mean, logvar = self.posterior(last_state).chunk(2, -1)
         return Normal(mean.squeeze(0), logvar.squeeze(0).exp())
 
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Optional[Tensor]:
-        # (batch_size, nz)
-        posterior = self.encoder(batch['token_ids'])
-        z = posterior.rsample([1]).movedim(source=1, destination=0)
-        kl = torch.distributions.kl_divergence(self.get_base_prior(), posterior).mean()
+    def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False):
+        original = batch['token_ids']
 
-        reconstruct_err = self.decoder.reconstruct_error(batch['token_ids'], z).mean()
-        self.log('kl', kl)
-        self.log('nll', reconstruct_err)
-        loss = reconstruct_err + self.hparams.kl_weight * kl
+        x = self.embedding(original)
+        posterior = self.forward(x)
+        z = posterior.rsample().movedim(source=1, destination=0)
+        kl = torch.distributions.kl_divergence(self.get_base_prior(), posterior).sum(dim=-1).mean()
+
+        logits, reconstruct_err = self.reconstruct(x, z, original[:, 1:])
+        reconstruct_err = reconstruct_err.sum(dim=-1).mean()
+
+        self.log('total_kl', kl)
+        self.log('total_nll', reconstruct_err)
+        loss = (reconstruct_err + self.hparams.kl_weight * kl) / x.shape[1]
 
         if val:
             self.mutual_info(posterior, z)
@@ -65,95 +89,50 @@ class LSTMAutoencoder(Autoencoder):
         else:
             self.log('train_loss', loss)
 
-        if loss.isnan():
-            self.print(f"Encountered NaN loss at step {batch_index}. Halting training.")
-            raise KeyboardInterrupt
+        if not loss.isfinite():
+            return None
         else:
-            return loss
+            return {'logits': logits, 'loss': loss}
 
-    def on_after_backward(self):
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
-        self.log('grad_norm', grad_norm, on_step=True)
-
-    def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
+    def validation_step(self, batch: Dict[str, Tensor], batch_index: int):
         return self.training_step(batch, batch_index, val=True)
+
+    def reconstruct(self, x, z, labels):
+        # remove end symbol
+        src = x[:, :-1]
+
+        batch_size, seq_len, _ = src.size()
+
+        # (batch_size, seq_len, ni)
+        word_embed = self.dropout_in(src)
+        z_ = z.unsqueeze(1).expand(batch_size, seq_len, self.hparams.latent_depth)
+
+        word_embed = torch.cat((word_embed, z_), -1)
+
+        z = z.view(batch_size, self.hparams.latent_depth)
+        c_init = self.trans_linear(z).unsqueeze(0)
+        h_init = torch.tanh(c_init)
+        # h_init = self.trans_linear(z).unsqueeze(0)
+        # c_init = h_init.new_zeros(h_init.size())
+        output, _ = self.decoder(word_embed, (h_init, c_init))
+
+        output = self.dropout_out(output)
+
+        output_logits = self.output_layer(output)
+        loss = self.loss(rearrange(output_logits, 'b l v -> b v l'), labels)
+
+        return output_logits, loss
 
     def sample(self, max_length: int, count: int = 1, **kwargs):
         latents = self.get_base_prior().sample([count])
-
-    def decode(self, z, strategy, k=5):
-        return self.decoder.autoregressive_decode(z, strategy=strategy, k=k)
-
-    def nll_iw(self, x, nsamples, ns=100):
-        """compute the importance weighting estimate of the log-likelihood
-        Args:
-            x: if the data is constant-length, x is the data tensor with
-                shape (batch, *). Otherwise x is a tuple that contains
-                the data tensor and length list
-            nsamples: Int
-                the number of samples required to estimate marginal data likelihood
-        Returns: Tensor1
-            Tensor1: the estimate of log p(x), shape [batch]
-        """
-
-        # compute iw every ns samples to address the memory issue
-        # nsamples = 500, ns = 100
-        # nsamples = 500, ns = 10
-        tmp = []
-        for _ in range(int(nsamples / ns)):
-            # [batch, ns, nz]
-            # param is the parameters required to evaluate q(z|x)
-            distribution = self.encoder(x)
-            z = distribution.rsample([ns])
-
-            # [batch, ns]
-            log_comp_ll = self.eval_complete_ll(x, z)
-            log_infer_ll = distribution.log_prob(z)
-
-            tmp.append(log_comp_ll - log_infer_ll)
-
-        ll_iw = torch.cat(tmp, dim=-1).logsumexp(dim=-1) - math.log(nsamples)
-
-        return -ll_iw
-
-    def eval_complete_ll(self, x, z):
-        """compute log p(z,x)
-        Args:
-            x: Tensor
-                input with shape [batch, seq_len]
-            z: Tensor
-                evaluation points with shape [batch, nsamples, nz]
-        Returns: Tensor1
-            Tensor1: log p(z,x) Tensor with shape [batch, nsamples]
-        """
-
-        # [batch, nsamples]
-        log_prior = self.get_base_prior().log_prob(z).sum(dim=-1)
-        log_gen = self.decoder.log_probability(x, z)
-
-        return log_prior + log_gen
-
-    def eval_log_model_posterior(self, x, grid_z):
-        """perform grid search to calculate the true posterior
-         this function computes p(z|x)
-        Args:
-            grid_z: tensor
-                different z points that will be evaluated, with
-                shape (k^2, nz), where k=(zmax - zmin)/pace
-
-        Returns: Tensor
-            Tensor: the log posterior distribution log p(z|x) with
-                    shape [batch_size, K^2]
-        """
-        batch_size = x[0].size(0) if isinstance(x, tuple) else x.size(0)
-
-        # (batch_size, k^2, nz)
-        grid_z = grid_z.unsqueeze(0).expand(batch_size, *grid_z.size()).contiguous()
-
-        # (batch_size, k^2)
-        log_comp = self.eval_complete_ll(x, grid_z)
-
-        # normalize to posterior
-        log_posterior = log_comp - log_comp.logsumexp(dim=1, keepdim=True)
-
-        return log_posterior
+        return autoregressive_decode(
+            strategy=kwargs.get('strategy', GenerationStrategy.Greedy),
+            rnn=self.decoder,
+            z=latents,
+            embedding=self.embedding,
+            logit_callable=self.output_layer,
+            initial_hidden_state=self.trans_linear(latents).unsqueeze(0),
+            max_length=max_length,
+            start_symbol=self.start_token,
+            end_symbol=self.end_token
+        )

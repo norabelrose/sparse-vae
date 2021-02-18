@@ -1,20 +1,23 @@
+from einops import rearrange
 from functools import lru_cache
 from numpy import cumprod
-from omegaconf import OmegaConf
+from omegaconf import DictConfig
 from torch import Tensor
 from typing import *
+import os
 import torch
 import torch.nn.functional as F
 
 
 class AttentionState:
-    def __init__(self, hparams: OmegaConf):
+    def __init__(self, hparams: DictConfig):
         # Transient state
         self.block_begin_flag = False
         self.current_block = 0
         self._upsampling = False
         self.input_device = None
         self.input_dtype = None
+        self.learned_pos_encodings = None
         self.padding_mask = None      # 1 for positions we should ignore (like padding), 0 otherwise
         self.max_seq_len = None
 
@@ -27,11 +30,12 @@ class AttentionState:
         self.shared = False
 
         # Wrap these functions in functools.lru_cache() objects so that we don't compute the same values multiple times
-        num_scales = len(self.scaling_factors) + 1
-        cache_max_size = num_scales * 2 + 1
+        if not os.environ.get('DILL_COMPATIBILITY'):
+            num_scales = len(self.scaling_factors) + 1
+            cache_max = num_scales * 2 + 1
 
-        self.positional_encodings_for_strides = lru_cache(maxsize=cache_max_size)(self.positional_encodings_for_strides)
-        self.scaled_padding_mask_for_stride = lru_cache(maxsize=num_scales)(self.scaled_padding_mask_for_stride)
+            self.positional_encodings_for_strides = lru_cache(maxsize=cache_max)(self.positional_encodings_for_strides)
+            self.scaled_padding_mask_for_stride = lru_cache(maxsize=num_scales)(self.scaled_padding_mask_for_stride)
 
     def __hash__(self):  # Necessary for using functools.lru_cache on instance methods
         return id(self)
@@ -40,33 +44,39 @@ class AttentionState:
         padding_mask = self.scaled_padding_mask_for_stride(self.strides[self.current_block])    # float
         return None if padding_mask is None else padding_mask[:, None, :, None]
 
-    def get_padding_mask(self) -> Tensor:
-        return self.scaled_padding_mask_for_stride(self.strides[self.current_block]).bool()
+    def get_padding_mask(self, for_key: bool = False) -> Tensor:
+        cur_block = self.current_block
+        block = cur_block - 1 if for_key and self.pooled_q_unpooled_k else cur_block
+        return self.scaled_padding_mask_for_stride(self.strides[block]).bool()
 
     def get_positional_encodings(self) -> Union[Tensor, List[Tensor]]:
         assert self.max_seq_len is not None, \
             "configure_for_input() hasn't been called yet, so I don't know how big to make the positional encodings."
 
         q_stride, k_stride = self.query_and_key_strides_for_step(self.current_block, self.block_begin_flag)
-        return self.positional_encodings_for_strides(q_stride, k_stride, self.max_seq_len, self.input_dtype,
-                                                     self.input_device)
+        return self.positional_encodings_for_strides(q_stride, k_stride, self.max_seq_len, self.input_device)
 
     # This method should be called before any other AttentionState methods are called in a forward pass
     def configure_for_input(self,
                             seq_len: int,
                             dtype: torch.dtype,
                             device: torch.device,
-                            padding_mask: Tensor,
+                            padding_mask: Optional[Tensor],
                             upsampling: bool = False
                             ):
         # Clean up from the previous forward pass
         self.current_block = 0
-        self.scaled_padding_mask_for_stride.cache_clear()
         self.upsampling = upsampling
+        if hasattr(self.scaled_padding_mask_for_stride, 'cache_clear'):
+            self.scaled_padding_mask_for_stride.cache_clear()
 
         # Save information about the input for calls to, i.e., get_positional_encoding()
         self.max_seq_len, self.input_dtype, self.input_device = seq_len, dtype, device
         self.padding_mask = padding_mask
+
+    @property
+    def pooled_q_unpooled_k(self) -> bool:
+        return not self.upsampling and self.block_begin_flag and self.current_block > 0
 
     @property
     def upsampling(self) -> bool:
@@ -92,8 +102,7 @@ class AttentionState:
         q_seq_len = self.max_seq_len // q_stride
         k_seq_len = self.max_seq_len // k_stride
 
-        mask = torch.ones([q_seq_len - 1, k_seq_len - 1], dtype=self.input_dtype, device=self.input_device)
-        return F.pad(mask, (1, 0, 1, 0))
+        return get_not_cls_mask(q_seq_len, k_seq_len, self.input_dtype, self.input_device)
 
     # What is the total scaling factor at block N?
     def query_and_key_strides_for_step(self, block_index: int, block_begin_flag: bool) -> Tuple[int, int]:
@@ -107,13 +116,8 @@ class AttentionState:
         if stride == 1 or self.padding_mask is None:
             return self.padding_mask
 
-        ascending_strides = sorted(self.strides)
-        stride_index = ascending_strides.index(stride)
-        prev_stride = ascending_strides[stride_index - 1]
-        prev_mask = self.scaled_padding_mask_for_stride(prev_stride)
-
         # Do min pooling so that we make sure we don't include any padding tokens when we downsample
-        return self._scale_tensor(prev_mask, stride // prev_stride, mode="min")
+        return self._scale_tensor(self.padding_mask, self.max_seq_len // stride, mode="min")
 
     # Either downsample or upsample the tensor, whichever is appropriate for the current block.
     def maybe_scale_input(self, x: Tensor) -> Tensor:
@@ -127,10 +131,10 @@ class AttentionState:
             return x
 
         # We assume that maybe_scale_input() will only be called once at the end of each block
-        scaling_factor = self.scaling_factors[self.current_block]
+        # scaling_factor = self.scaling_factors[self.current_block]
         self.current_block += 1
-
-        return self._scale_tensor(x, scaling_factor)
+        new_stride = self.strides[self.current_block]
+        return self._scale_tensor(x, self.max_seq_len // new_stride)
 
     # Returns one or more Tensors of sinusoidal positional encodings whose sequence length dimension is equal to the
     # initial input sequence length (if _upsampling=False) or the final output length (if _upsampling=True). These
@@ -138,15 +142,17 @@ class AttentionState:
     # sequence lengths. The functools.lru_cache() wrapper automatically caches the result of this method for a given
     # set of parameters- which should be constant within a forward pass, and often across forward passes.
     @lru_cache(maxsize=1)
-    def get_base_positional_encodings(self, seq_len: int, dtype: torch.dtype,
-                                      device: torch.device) -> Union[Tensor, List[Tensor]]:
+    def get_base_positional_encodings(self, seq_len: int, device: torch.device) -> Union[Tensor, List[Tensor]]:
+        if self.learned_pos_encodings is not None:
+            return self.learned_pos_encodings.to(device=device)
+
         # Values and routines used by all three positional encoding types
         d_model_half = self.d_model // 2
-        frequencies = torch.arange(d_model_half, dtype=dtype, device=device)
+        frequencies = torch.arange(d_model_half, dtype=torch.float32, device=device)
         periods = 1 / (10000 ** (frequencies / d_model_half))
 
         def get_sinusoidal_encodings(start: int, stop: int):
-            position_ids = torch.arange(start, stop, 1.0, dtype=dtype, device=device)
+            position_ids = torch.arange(start, stop, 1.0, dtype=torch.float32, device=device)
             angles = position_ids[:, None] * periods[None]  # Outer product
             return torch.sin(angles), torch.cos(angles)
 
@@ -173,9 +179,9 @@ class AttentionState:
     # Returns a Tensor or a list of Tensors containing positional encodings appropriate for the given strides. At
     # runtime this function is wrapped with functools.lru_cache() with the maxsize parameter determined dynamically.
     def positional_encodings_for_strides(self, q_stride: int, k_stride: int, seq_len: int,
-                                         dtype: torch.dtype, device: torch.device) -> Union[Tensor, List[Tensor]]:
+                                         device: torch.device) -> Union[Tensor, List[Tensor]]:
         # Either a Tensor or a list of Tensors
-        base_encodings = self.get_base_positional_encodings(seq_len, dtype, device)
+        base_encodings = self.get_base_positional_encodings(seq_len, device)
         encoding_type = self.positional_encoding_type
 
         if encoding_type == 'rel_shift':
@@ -189,8 +195,8 @@ class AttentionState:
             return base_encodings.gather(0, rel_offsets)
         else:
             # With absolute positional encodings, we have two encoding tensors; one for queries and one for keys
-            if encoding_type == 'absolute':
-                q_encodings = k_encodings = base_encodings
+            if encoding_type in ('absolute', 'learned'):
+                q_encodings = k_encodings = [base_encodings]
             # With factorized relative encodings, we have four encoding tensors; two for queries and two for keys
             elif encoding_type == 'factorized':
                 q_encodings, k_encodings = base_encodings[:2], base_encodings[2:]
@@ -203,29 +209,43 @@ class AttentionState:
             return q_encodings + k_encodings
 
     # Used for scaling input tensors and padding masks
-    def _scale_tensor(self, x: Tensor, scaling_factor: int, mode: str = "mean") -> Optional[Tensor]:
+    def _scale_tensor(self, x: Tensor, new_length: int, mode: str = "mean") -> Optional[Tensor]:
         # Don't do unnecessary work
         if x is None:
             return None
-        if scaling_factor == 1:
+        if new_length == x.shape[1]:
             return x
 
-        if not self._upsampling:
-            x = self._prepare_for_pooling(x, scaling_factor)
+        if x.ndim < 3:
+            has_channels = False
+            x = x.unsqueeze(0)
+        else:
+            has_channels = True
 
-            x.unsqueeze_(1)
+        if not self._upsampling:
+            scaling_factor = x.shape[1] // new_length
+            x = self._prepare_for_pooling(x, scaling_factor)
+            if has_channels:
+                x = rearrange(x, '... l d -> ... d l')
 
             if mode == "mean":
-                stride = (scaling_factor, 1)
-                x = F.avg_pool2d(x, stride, stride=stride, ceil_mode=True)
+                x = F.adaptive_avg_pool1d(x, output_size=new_length)  # noqa
             elif mode == "min":
-                x = -F.max_pool1d(-x, kernel_size=scaling_factor, ceil_mode=True)
+                x = -F.adaptive_max_pool1d(-x, output_size=new_length)
             else:
                 raise NotImplementedError
         else:
-            x = x.repeat_interleave(scaling_factor, dim=-2)
+            if has_channels:
+                x = rearrange(x, '... l d -> ... d l')
 
-        return x.squeeze(1)
+            x = F.interpolate(x, size=new_length)
+
+        if not has_channels:
+            x = x.squeeze(0)
+        else:
+            x = rearrange(x, '... d l -> ... l d')
+
+        return x
 
     def _prepare_for_pooling(self, x: Tensor, scaling_factor: int):
         # Copy the [CLS] token (scaling_factor - 1) times to make sure it doesn't get pooled into the adjacent tokens
@@ -238,3 +258,11 @@ class AttentionState:
 
         return x
 
+
+def not_cls_mask_like(x: Tensor):
+    return get_not_cls_mask(x.shape[1], 1, torch.bool, x.device)
+
+@lru_cache(maxsize=10)
+def get_not_cls_mask(length1: int, length2: int, dtype: torch.dtype, device: torch.device):
+    mask = torch.ones([length1 - 1, length2 - 1], dtype=dtype, device=device)
+    return F.pad(mask, (1, 0, 1, 0))

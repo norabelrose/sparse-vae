@@ -1,6 +1,6 @@
 from .FunnelWithDecoder import *
 from .RemoteModels import *
-from .Utilities import *
+from text_vae.core.Utilities import *
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import *

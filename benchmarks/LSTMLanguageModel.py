@@ -2,8 +2,8 @@ from dataclasses import dataclass
 from omegaconf import DictConfig
 from torch import nn, Tensor
 from typing import *
-import torch.nn.functional as F
-from text_vae import LanguageModel, LanguageModelHparams
+import torch
+from text_vae import LanguageModel, LanguageModelHparams, autoregressive_decode, GenerationStrategy
 
 
 @dataclass
@@ -13,35 +13,45 @@ class LSTMLanguageModelHparams(LanguageModelHparams):
     dec_dropout_out: float = 0.5
     ni: int = 512  # Dimensionality of the input embedding vectors
 
-    vocab_size: int = 30522
-    cls_id: int = 101
-    sep_id: int = 102
-
 
 class LSTMLanguageModel(LanguageModel):
     def __init__(self, hparams: DictConfig):
         super(LSTMLanguageModel, self).__init__(hparams)
         self.save_hyperparameters(hparams)
 
-        self.embed = nn.Embedding(hparams.vocab_size, hparams.ni)
-        self.decoder = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.dec_nh, batch_first=True)
-        self.logit_linear = nn.Linear(in_features=hparams.dec_nh, out_features=hparams.vocab_size)
+        vocab_size = self.tokenizer.get_vocab_size()
+        self.embedding = nn.Embedding(vocab_size, hparams.ni)
+        self.decoder = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.dec_nh, batch_first=True, num_layers=4)
+        self.initial_state = nn.Parameter(torch.randn(4, 1, hparams.dec_nh))
+
+        output_embedding = nn.Linear(hparams.ni, vocab_size)
+        output_embedding.weight = self.embedding.weight
+        self.logit_layer = nn.Sequential(
+            nn.Linear(hparams.dec_nh, hparams.ni),
+            output_embedding
+        )
 
     # Returns [batch, seq_len, vocab_size] tensor of logits
     def forward(self, batch: Dict[str, Tensor]) -> Tensor:
-        x = batch['token_ids'][:, :-1]  # Remove final [SEP] token
-        x = self.embed(x)
-        x, _ = self.decoder(x)
-        return self.logit_linear(x)
+        x = batch['token_ids']
+        batch_size = x.shape[0]
+        c0 = self.initial_state.repeat(1, batch_size, 1)
+        h0 = torch.tanh(c0)
 
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Tensor:
-        logits = self.forward(batch)
-        loss = F.cross_entropy(
-            input=logits,
-            target=batch['token_ids'][:, 1:]    # Remove initial [CLS] token
+        x = self.embedding(x)
+        x, _ = self.decoder(x, (h0, c0))
+        return self.logit_layer(x)
+
+    def sample(self, max_length: int, count: int = 1, **kwargs):
+        return autoregressive_decode(
+            strategy=kwargs.get('strategy', GenerationStrategy.SamplingTopK),
+            rnn=self.decoder,
+            z=None,
+            embedding=self.embedding,
+            logit_callable=self.logit_layer,
+            initial_hidden_state=self.initial_state.repeat(1, count, 1),
+            max_length=max_length,
+            start_symbol=self.start_token,
+            end_symbol=self.end_token,
+            k=10
         )
-        self.log('train_loss' if not val else 'val_loss', loss, on_step=not val, on_epoch=val)
-        return loss
-
-    def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
-        return self.training_step(batch, batch_index, val=True)

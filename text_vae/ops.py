@@ -1,5 +1,6 @@
 import numpy as np
 from einops import rearrange
+from dataclasses import dataclass
 from torch import nn
 from .AttentionState import *
 
@@ -60,12 +61,26 @@ class PositionwiseFFN(nn.Module):
         output = self.layer_norm(inputs + pffn_out)  # Residual connection
         return output
 
+@dataclass
+class AttentionHparams:
+    d_model: int = 768
+    num_heads: int = 12
+
+    attention_dropout: float = 0.1
+    dropout: float = 0.1
+    ffn_dropout: float = 0.0
+    layer_norm_eps: float = 1e-9
+    separate_cls: bool = False
+
+    positional_encoding_type: str = 'rel_shift'  # 'absolute', 'rel_shift' or 'factorized'
+
 
 class RelativePositionalAttention(nn.Module):
     def __init__(self, hparams):
         super(RelativePositionalAttention, self).__init__()
 
-        d_model, n_head = hparams.d_model, hparams.num_heads
+        d_model = hparams.d_model
+        n_head = hparams.num_heads
         d_head = d_model // n_head
 
         self.hparams = hparams
@@ -89,7 +104,7 @@ class RelativePositionalAttention(nn.Module):
         self.r_kernel = nn.Parameter(torch.zeros(n_head, d_model, d_head))
         self.r_s_bias = nn.Parameter(torch.zeros(n_head, d_head))
         
-        self.post_proj = EinsumLayer("blnh,nhd->bld", [n_head, d_head], [d_model])
+        self.post_proj = EinsumLayer("...lnh,nhd->...ld", [n_head, d_head], [d_model])
         self.layer_norm = nn.LayerNorm(d_model, eps=hparams.layer_norm_eps)
         self.normalizer = 1. / np.sqrt(d_head)
         self.reset_parameters()
@@ -107,7 +122,7 @@ class RelativePositionalAttention(nn.Module):
         k = self.k_head(k)
         v = self.v_head(v)
 
-        q, k, v = (rearrange(x, 'b l h d -> b h l d') for x in (q, k, v))
+        q, k, v = (rearrange(x, '... l h d -> ... h l d') for x in (q, k, v))
 
         # Content based attention score
         content_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * self.normalizer
@@ -136,7 +151,7 @@ class RelativePositionalAttention(nn.Module):
         attn_dist = self.att_drop(attn_dist)
         output = attn_dist @ v
         
-        output = rearrange(output, "b h l d -> b l h d")
+        output = rearrange(output, "... h l d -> ... l h d")
 
         # attention output
         attn_out = self.post_proj(output)

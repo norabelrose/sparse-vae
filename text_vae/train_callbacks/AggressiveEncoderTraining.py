@@ -1,5 +1,4 @@
-from torch import Tensor
-from ..Autoencoder import Autoencoder
+from text_vae.core.Autoencoder import *
 from .AutoencoderCallback import *
 
 
@@ -15,24 +14,17 @@ class AggressiveEncoderTraining(AutoencoderCallback):
     _last_loss: float = field(default=0.0, init=False)
     _last_mutual_info: float = field(default=0.0, init=False)
 
-    # Don't check the mutual information metric during the validation sanity check
-    def on_sanity_check_start(self, trainer, autoencoder: Autoencoder):
-        self._aggressive_stage_complete = True
-
-    def on_sanity_check_end(self, trainer, autoencoder: Autoencoder):
-        self._aggressive_stage_complete = False
-
-    def on_train_start(self, trainer, autoencoder: Autoencoder):
+    def on_train_start(self, trainer, autoencoder: ContinuousAutoencoder):
         autoencoder.decoder_requires_grad_(False)
 
-    def on_after_backward(self, trainer, autoencoder: Autoencoder):
+    def on_train_batch_end(self, trainer, autoencoder: ContinuousAutoencoder, outputs, batch, batch_idx, dl_idx):
         if self._aggressive_stage_complete:
             return
 
         cur_step = autoencoder.global_step
 
         inner_loop_step = cur_step - self._last_decoder_update
-        new_loss = _to_scalar(getattr(autoencoder, 'last_loss'))
+        new_loss = _to_scalar(outputs[0][0]['minimize'])
 
         update_decoder = (
             # We've updated the encoder for 10 steps AND
@@ -45,8 +37,8 @@ class AggressiveEncoderTraining(AutoencoderCallback):
             self._last_decoder_update = cur_step
             self._last_loss = new_loss
 
-    def on_validation_end(self, trainer, autoencoder: Autoencoder):
-        if self._aggressive_stage_complete:
+    def on_validation_end(self, trainer, autoencoder: ContinuousAutoencoder):
+        if trainer.running_sanity_check or self._aggressive_stage_complete:
             return
 
         raw_mutual_info = trainer.callback_metrics.get('mutual_info')
@@ -60,7 +52,7 @@ class AggressiveEncoderTraining(AutoencoderCallback):
         else:
             self._last_mutual_info = new_mutual_info
 
-    def end_aggressive_training(self, autoencoder: Autoencoder):
+    def end_aggressive_training(self, autoencoder: ContinuousAutoencoder):
         autoencoder.print("Aggressive encoder training complete.")
 
         self._aggressive_stage_complete = True
