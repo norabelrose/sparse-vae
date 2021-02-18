@@ -1,6 +1,6 @@
 # Sort of in order of how many internal dependencies each file has
 from text_vae.core.Utilities import *
-from .GenerationUtils import *
+from text_vae.core.GenerationUtils import *
 from .RemoteModels import *
 from .AutoencoderMetrics import *
 from .QuantizedAutoencoder import *

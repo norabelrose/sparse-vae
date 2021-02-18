@@ -1,11 +1,10 @@
 from collections import defaultdict
 from torch.distributions import Categorical, kl_divergence
-from numpy import cumsum, prod
+from numpy import prod
 from .core.Autoencoder import *
 from .FunnelTransformer import *
-from .GenerationUtils import *
 from .KNNLookupTable import *
-from . import autoregressive_decode_transformer, ConditionalGaussian
+from .core import Quantizer, ConditionalGaussian
 import math
 import torch
 
@@ -18,14 +17,9 @@ class HierarchicalAutoencoderHparams(ContinuousAutoencoderHparams):
         block_sizes=(2, 2,),   # Number of layers in each encoder block; reversed for the decoder
         scaling_factors=(4,),  # How much the hidden state is downsampled between each encoder block
     )
-    # Indicates how many groups of latent variables should be used. If None, the number will be set equal to
-    # len(encoder.block_sizes) - 1
-    num_latent_groups: Optional[int] = None
-
     codebook_size: int = 0
     decoder_input_dropout: float = 0.5
     tie_embedding_weights: bool = True
-    use_autoregressive_decoder: bool = False
     use_encoder_residual_connections: bool = True
     use_long_latents: bool = True
     use_length_encodings: bool = False
@@ -38,7 +32,7 @@ class HierarchicalAutoencoderState:
     ground_truth: Optional[Tensor] = None
     encoder_output: Optional[FunnelTransformerOutput] = None
     decoder_output: Optional[FunnelTransformerOutput] = None
-    posteriors: Dict[int, Normal] = field(default_factory=dict)  # q(z|x); keys are layer indices
+    posteriors: List[Normal] = field(default_factory=dict)  # q(z|x)
     latents: List[Tensor] = field(default_factory=list)
 
     p_of_x_given_z: Optional[Categorical] = None
@@ -50,17 +44,7 @@ class HierarchicalAutoencoder(ContinuousAutoencoder):
         super().__init__(hparams)
 
         encoder_hparams = hparams.encoder
-        num_layers = sum(encoder_hparams.block_sizes)
-        num_latent_groups = hparams.num_latent_groups
-
-        if not num_latent_groups:
-            self.latent_groups = [0] + list(cumsum(encoder_hparams.block_sizes[:-2]))
-        else:
-            assert 1 <= num_latent_groups <= num_layers
-
-            # Evenly space the latent groups to the extent possible, biasing them toward lower resolutions
-            stride, leftover = divmod(num_layers, num_latent_groups)
-            self.latent_groups = list(range(0, num_layers - leftover, stride))
+        num_latent_scales = len(encoder_hparams.scaling_factors)
 
         # save_hyperparameters() stores the hparams in self.hparams and ensures they are saved to disk during training.
         self.save_hyperparameters(hparams)
@@ -87,44 +71,47 @@ class HierarchicalAutoencoder(ContinuousAutoencoder):
             output_embedding
         )
 
+        overt_depth, latent_depth = encoder_hparams.d_model, hparams.latent_depth
         if hparams.codebook_size:
-            self.codebooks = nn.ModuleList([
-                nn.Embedding(hparams.codebook_size, encoder_hparams.d_model)
-                for _ in range(len(self.latent_groups))
-            ])
+            self.codebook = Quantizer(hparams.codebook_size, encoder_hparams.d_model, num_levels=num_latent_scales)
+            self.priors = None
+        else:
+            def get_distributions(input_dim, output_dim, num_scales: int, zero_initialized: bool = False):
+                return nn.ModuleList([
+                    ConditionalGaussian(input_dim, output_dim,
+                                        reduce_dim=-2 if not hparams.use_long_latents else None,
+                                        zero_initialized=zero_initialized)
+                    for _ in range(num_scales)
+                ])
+
+            # Output is a Normal distribution object. Note initializing the weights of the prior to zero means that
+            # at the start of training, it will output 0 mean, 0 log sigma (i.e. 1 sigma) independent of the input
+            self.codebook = None
+            self.priors = get_distributions(overt_depth, latent_depth, num_latent_scales - 1, zero_initialized=True)
+            self.posteriors = get_distributions(overt_depth, latent_depth, num_latent_scales)
 
         if hparams.encoder.positional_encoding_type == 'learned':
             self.positional_encodings = nn.Embedding(192, encoder_hparams.d_model)
             attn_state.learned_pos_encodings = self.positional_encodings.weight
 
         elif hparams.tie_embedding_weights:
-            self.encoder.input_layer[0].weight.data *= encoder_hparams.d_model * -0.5
-            output_embedding.weight = self.encoder.input_layer[0].weight
+            self.encoder.input_layer[0].codebook.data *= encoder_hparams.d_model * -0.5
+            output_embedding.weight = self.encoder.input_layer[0].codebook
 
-        if hparams.use_autoregressive_decoder:
-            self.ar_decoder = FunnelLayer(hparams, use_cross_attention=True)
-
-        def get_distributions(input_dim, output_dim, layers: List[int], zero_initialized: bool = False):
-            return nn.ModuleDict({
-                str(layer_idx): ConditionalGaussian(input_dim, output_dim, zero_initialized=zero_initialized)
-                for layer_idx in layers
-            })
-
-        overt_depth, latent_depth = encoder_hparams.d_model, hparams.latent_depth
-        # self.decoder_seed = nn.Parameter(torch.zeros())
-        self.distributions = nn.ModuleDict({
-            # Output is a Normal distribution object. Note initializing the weights of the prior to zero means that at
-            # the start of training, it will output 0 mean, 0 log sigma (i.e. 1 sigma) independent of the input
-            'p(z)': get_distributions(overt_depth, latent_depth, self.latent_groups[1:], zero_initialized=True),
-            'q(z|x)': get_distributions(overt_depth, latent_depth, self.latent_groups)
-        })
-        self.latent_upsample = get_distributions(latent_depth, overt_depth, self.latent_groups)
+        self.latent_upsample = nn.ModuleList([
+            nn.Sequential(
+                nn.GELU(),
+                nn.Linear(latent_depth, overt_depth)
+            )
+            for _ in range(num_latent_scales)
+        ])
 
         # Load pretrained weights
         if hparams.use_pretrained_encoder:
             self.encoder.load_pretrained_weights()
         else:
             # Scale the initializations of each layer by 1/sqrt(N) where N is the depth
+            num_layers = sum(encoder_hparams.block_sizes)
             self.encoder.scale_parameters(depth=num_layers * 2)
             self.decoder.scale_parameters(depth=num_layers * 2)
 
@@ -132,22 +119,22 @@ class HierarchicalAutoencoder(ContinuousAutoencoder):
     # (but does not actually sample the latents- you can do that yourself)
     def forward(self, batch: Dict[str, Any], **kwargs) -> HierarchicalAutoencoderState:
         x = batch['token_ids']
-        self.encoder.attention_state.configure_for_input(x.shape[1], x.dtype, x.device, batch['padding_mask'])
+        self.encoder.attention_state.configure_for_input(x.shape[-2], x.dtype, x.device, batch['padding_mask'])
         funnel_out = self.encoder(batch['token_ids'], padding_mask=batch['padding_mask'], **kwargs)
         funnel_state_iter = reversed(funnel_out.hidden_states)
 
         vae_state = HierarchicalAutoencoderState()
         vae_state.encoder_output = funnel_out
-        vae_state.posteriors = {
-            idx: self.get_distribution_for_tensor('q(z|x)', idx, next(funnel_state_iter), 1.0)
-            for idx in self.latent_groups
-        }
+        vae_state.posteriors = [
+            self.posteriors[idx](next(funnel_state_iter), 1.0)
+            for idx in range(len(self.encoder.hparams.scale_factors))
+        ]
         return vae_state
 
     def compute_loss_for_step(self, result: HierarchicalAutoencoderState, step: str):
         # Figure out the correct denominator for the loss
         if self.hparams.include_padding_positions:
-            num_tokens = result.decoder_output.final_state.shape[1]
+            num_tokens = result.decoder_output.final_state.shape[-2]
         else:
             # Each sample in the batch will have a different number of nonpadding tokens
             num_tokens = self.decoder.attention_state.padding_mask.sum(dim=-1)
@@ -213,37 +200,24 @@ class HierarchicalAutoencoder(ContinuousAutoencoder):
         encoder_output = vae_state.encoder_output
         coroutine = self.decoder.forward_coroutine(
             encoder_output.final_state if encoder_output else None,
-            padding_mask=padding_mask,
-            states_to_yield=self.latent_groups
+            padding_mask=padding_mask
         )
 
-        for block_idx, layer_idx, decoder_state in coroutine:
+        for block_idx, _, decoder_state in coroutine:
             # Final output
             if isinstance(decoder_state, FunnelTransformerOutput):
                 vae_state.decoder_output = decoder_state
                 raw_output = decoder_state.final_state
 
-                # If we're using autoregressive decoding, now is the time to run the AR Transformer layer
-                if self.hparams.use_autoregressive_decoder:
-                    raw_output = self.ar_decoder(
-                        # Remove [SEP] token to keep the input the same length as the expected output
-                        vae_state.encoder_output.embedded_input[:, :-1],
-                        cross_attn_keys=raw_output
-                    )
-
                 logits = self.output_layer(raw_output)
                 vae_state.p_of_x_given_z = Categorical(logits=logits)
                 if encoder_output:
-                    # Remove [CLS] token, thereby shifting everything to the left
-                    if self.hparams.use_autoregressive_decoder:
-                        vae_state.ground_truth = encoder_output.original_ids[:, 1:]
-                    else:
-                        vae_state.ground_truth = encoder_output.original_ids
+                    vae_state.ground_truth = encoder_output.original_ids
 
                 return vae_state
 
             # In the first stochastic layer, the prior is just a standard diagonal Gaussian:
-            if layer_idx == 0:
+            if block_idx == 0:
                 # Sampling unconditionally
                 if decoder_state is not None:
                     batch_dims = list(decoder_state.shape[:2])
@@ -253,23 +227,23 @@ class HierarchicalAutoencoder(ContinuousAutoencoder):
 
             # But in subsequent layers, it is conditioned on the state of the previous decoder layer:
             else:
-                prior = self.get_distribution_for_tensor('p(z)', layer_idx, decoder_state, temperature=temperature)
+                prior = self.priors[block_idx - 1](decoder_state, temperature=temperature)
 
             if not vae_state.posteriors:  # Sample unconditionally
-                z = clamped_latents.get(layer_idx)
+                z = clamped_latents.get(block_idx)
                 if z is None:
                     z = prior.rsample()
 
                 posterior = None
             else:
-                posterior = vae_state.posteriors[layer_idx]
+                posterior = vae_state.posteriors[block_idx]
                 z = posterior.rsample()
 
             self.update_stats_dict(prior, posterior, z, vae_state.stats, return_log_probs=return_log_probs)
             if return_latents:
                 vae_state.latents.append(z)
 
-            reconstruction = self.latent_upsample[str(layer_idx)](z)
+            reconstruction = self.latent_upsample[block_idx](z)
             if not self.hparams.use_long_latents:
                 # Replace the [CLS] token with the latent vector in an out-of-place, autograd-friendly way
                 out_state = decoder_state.where(not_cls_mask_like(decoder_state), z.unsqueeze(-2))
@@ -294,11 +268,6 @@ class HierarchicalAutoencoder(ContinuousAutoencoder):
                 kl_tensor.masked_fill_(padding_mask, 0.0)
 
             stats['kl'] += kl_tensor.flatten(start_dim=1).sum(dim=1)  # Sum over seq len and latent dim
-
-    # Used for both the prior 'p(z)' and the posterior 'q(z|x)'
-    def get_distribution_for_tensor(self, name: str, layer_idx: int, x: Tensor, temperature: float) -> Normal:
-        cond_dist = self.distributions[name][str(layer_idx)]
-        return cond_dist(x, reduce_dim=-2 if self.hparams.use_long_latents else None, temperature=temperature)
 
     # Get a tighter estimate for the KL and NLL of some input using Monte Carlo importance sampling
     @torch.no_grad()
@@ -334,7 +303,7 @@ class HierarchicalAutoencoder(ContinuousAutoencoder):
                 Normal(loc=mu, scale=sigma) for mu, sigma, in
                 zip(dist.mean.split(1, dim=0), dist.stddev.split(1, dim=0))
             ]
-            for layer_idx, dist in batched_dists.items()
+            for dist in batched_dists
         ]
         return [list(x) for x in zip(*dists)]  # Transpose the inner and outer lists
 
@@ -361,22 +330,10 @@ class HierarchicalAutoencoder(ContinuousAutoencoder):
             return_latents=return_latents,
             temperature=temperature
         )
-
-        if self.hparams.use_autoregressive_decoder:
-            return autoregressive_decode_transformer(
-                strategy=GenerationStrategy.Greedy,
-                transformer_callable=self.ar_decoder,
-                context=vae_output.decoder_output.final_state,
-                embedding=self.encoder.input_layer,
-                logit_callable=self.output_layer,
-                max_length=max_length,
-                d_model=self.hparams.encoder.hparams,
-                start_symbol=self.start_token,
-                end_symbol=self.end_token
-            )
-        else:
-            return self.decode_logits(vae_output.p_of_x_given_z.logits)
+        return self.decode_logits(vae_output.p_of_x_given_z.logits)
 
     def decoder_requires_grad_(self, requires_grad: bool):
         self.decoder.requires_grad_(requires_grad)
-        # self.distributions.requires_grad_(requires_grad)
+
+    def should_unconditionally_sample(self) -> bool:
+        return self.hparams.codebook_size == 0  # Don't unconditionally sample when we're quantizing

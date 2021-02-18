@@ -17,6 +17,7 @@ class LanguageModelHparams(ABC):
     grad_clip_threshold: float = 150.0
     lr: float = 1e-4
     lr_decay_steps: Optional[int] = 150_000
+    vocab_size: int = 30522
     warmup_steps: int = 1000
     weight_decay: float = 0.01
 

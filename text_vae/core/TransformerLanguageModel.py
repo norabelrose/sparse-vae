@@ -1,6 +1,7 @@
+from .GenerationUtils import GenerationStrategy
 from .LanguageModel import *
-from .. import TransformerLayer, positional_encodings_like, autoregressive_decode_transformer
-from ..GenerationUtils import *
+from .Transformers import TransformerLayer, positional_encodings_like, autoregressive_decode_transformer
+from torch import nn
 
 
 @dataclass

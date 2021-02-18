@@ -10,7 +10,7 @@ class ConditionalDistribution(nn.Module, ABC):
     num_params = 2
     torch_distribution = None
 
-    def __init__(self, in_features: int, out_features: int, zero_initialized: bool = False):
+    def __init__(self, in_features: int, out_features: int, reduce_dim: int = None, zero_initialized: bool = False):
         super(ConditionalDistribution, self).__init__()
 
         linear = nn.Linear(in_features, out_features * self.num_params)
@@ -19,11 +19,12 @@ class ConditionalDistribution(nn.Module, ABC):
             linear.weight.data.zero_()
 
         self.linear = nn.Sequential(nn.GELU(), linear)
+        self.reduce_dim = reduce_dim
 
-    def forward(self, x: Tensor, reduce_dim: int = None, temperature: float = 1.0) -> Normal:
+    def forward(self, x: Tensor, temperature: float = 1.0) -> Normal:
         params = self.linear(x).chunk(2, dim=-1)
-        if reduce_dim is not None:
-            params = [param.mean(dim=reduce_dim) for param in params]
+        if self.reduce_dim is not None:
+            params = [param.mean(dim=self.reduce_dim) for param in params]
 
         params = self.transform_parameters(params, temperature)  # noqa
         return self.torch_distribution(*params)
@@ -65,12 +66,12 @@ class NormalGamma:
         return Normal(loc=mean, scale=precision ** -0.5)
 
 class ConditionalNormalGamma:
-    def __init__(self, in_base_features: int, out_base_features: int, zero_initialized: bool = False):
-        self.mu_distribution = ConditionalGaussian(in_base_features, out_base_features, zero_initialized)
-        self.sigma_distribution = ConditionalGamma(in_base_features, out_base_features, zero_initialized)
+    def __init__(self, in_features: int, out_features: int, reduce_dim: int = None, zero_initialized: bool = False):
+        self.mu_distribution = ConditionalGaussian(in_features, out_features, reduce_dim, zero_initialized)
+        self.sigma_distribution = ConditionalGamma(in_features, out_features, reduce_dim, zero_initialized)
 
-    def forward(self, x: Tensor, reduce_dim: int = None, temperature: float = 1.0) -> NormalGamma:
+    def forward(self, x: Tensor, temperature: float = 1.0) -> NormalGamma:
         return NormalGamma(
-            self.mu_distribution(x, reduce_dim, temperature),
-            self.sigma_distribution(x, reduce_dim, temperature)
+            self.mu_distribution(x, temperature),
+            self.sigma_distribution(x, temperature)
         )

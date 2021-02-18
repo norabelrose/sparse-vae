@@ -4,7 +4,7 @@ from typing import Callable, Optional
 import torch
 from torch import nn, Tensor
 
-from text_vae import GenerationStrategy, decode_next_token_with_context
+from .GenerationUtils import GenerationStrategy, decode_next_token_with_context
 
 
 class TransformerLayer(nn.Module):

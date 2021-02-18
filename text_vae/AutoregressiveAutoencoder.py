@@ -55,7 +55,7 @@ class AutoregressiveAutoencoder(ContinuousAutoencoder):
             nn.Linear(hparams.latent_depth, hparams.d_model)
             for _ in range(hparams.num_scales)
         ])
-        input_embedding = self.encoder.input_layer[0].weight
+        input_embedding = self.encoder.input_layer[0].codebook
         input_embedding.data *= encoder_depth ** -0.5
 
         output_embedding = nn.Linear(encoder_depth, input_embedding.shape[0])

@@ -86,15 +86,14 @@ class FunnelTransformer(nn.Module):
                 param.data *= depth ** -0.5
 
     # Vanilla function wrapper for forward_coroutine()
-    def forward(self, x: Tensor, padding_mask: Tensor, **kwargs) -> FunnelTransformerOutput:
-        coroutine = self.forward_coroutine(x, padding_mask, **kwargs)
+    def forward(self, x: Tensor, padding_mask: Tensor) -> FunnelTransformerOutput:
+        coroutine = self.forward_coroutine(x, padding_mask)
         return next(coroutine)[-1]
 
     # Yields specified hidden states as they are generated while processing the input x, along with the absolute indices
     # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
     # versions of these hidden states, which are then used as the input to the next layer in the Transformer.
-    def forward_coroutine(self, x: Tensor, padding_mask: Tensor, *,
-                          states_to_yield: Optional[List[int]] = None):
+    def forward_coroutine(self, x: Tensor, padding_mask: Tensor):
         hparams = self.hparams
 
         original = x
@@ -111,33 +110,32 @@ class FunnelTransformer(nn.Module):
             attn_state.configure_for_input(x.shape[-2], x.dtype, x.device, padding_mask)
 
         hidden_states = []
-        layer_iter = iter(enumerate(self.layers))
+        cross_attn_keys = None
+        layer_iter = iter(self.layers)
         q = kv = x
 
         for block_idx, block_size in enumerate(self.hparams.block_sizes):
             for rel_layer_idx in range(block_size):
                 # Let AttentionState know we're starting a new block
                 attn_state.block_begin_flag = (rel_layer_idx == 0)
-                abs_layer_idx, layer = next(layer_iter)
-                cross_attn_keys = None
-
-                if states_to_yield and abs_layer_idx in states_to_yield:
-                    maybe_transformed_x = yield block_idx, abs_layer_idx, q
-
-                    # The consumer of this generator may or may not send us anything
-                    if maybe_transformed_x is not None:
-                        # The consumer may have sent us a tuple of the form (qkv, cross attention target)
-                        if isinstance(maybe_transformed_x, tuple):
-                            cross_attn_keys = maybe_transformed_x[1]
-                            maybe_transformed_x = maybe_transformed_x[0]
-
-                        q = kv = maybe_transformed_x
-                        yield  # Don't return anything from the .send() method
+                layer = next(layer_iter)
 
                 q = kv = layer(q, kv, attn_state, cross_attn_keys=cross_attn_keys)
                 attn_state.block_begin_flag = False
 
             q = attn_state.maybe_scale_input(kv)
+
+            # The consumer of this generator may or may not send us anything
+            cross_attn_keys = None
+            maybe_transformed_x = yield block_idx, q
+            if maybe_transformed_x is not None:
+                # The consumer may have sent us a tuple of the form (qkv, cross attention target)
+                if isinstance(maybe_transformed_x, tuple):
+                    cross_attn_keys = maybe_transformed_x[1]
+                    maybe_transformed_x = maybe_transformed_x[0]
+
+                q = kv = maybe_transformed_x
+                yield  # Don't return anything from the .send() method
 
             # When we're upsampling, there's no stage where we scale Q but don't scale K and V.
             if self.hparams.upsampling:
