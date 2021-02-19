@@ -1,5 +1,5 @@
 from .FunnelWithDecoder import *
-from .RemoteModels import *
+from text_vae.funnel_transformers.RemoteModels import *
 from text_vae.core.Utilities import *
 from collections import defaultdict
 from copy import deepcopy
@@ -56,7 +56,7 @@ class FunnelForPreTraining(pl.LightningModule):
             nn.Linear(discriminator_hparams.d_model, 1)
         )
         # Tie the embedding weight matrices
-        self.mlm_head[-2].weight.data = self.generator.encoder.input_layer[0].codebook.data
+        self.mlm_head[-2].weight.data = self.generator.encoder.input_layer[0].quantizer.data
 
         # Freeze the generator weights if indicated
         if not hparams.train_generator:
@@ -221,7 +221,7 @@ class FunnelForPreTraining(pl.LightningModule):
             '1.bias': 'input_projection/bias',
             '1.weight': 'input_projection/kernel'
         })
-        gen_input[0].codebook.data = discr_input[0].codebook.data   # Tie embedding weights
+        gen_input[0].quantizer.data = discr_input[0].quantizer.data   # Tie embedding weights
 
         copy_params_with_mapping(self.mlm_head, prefix='generator/', mapping={
             '0.bias': 'lm_proj/dense/bias',

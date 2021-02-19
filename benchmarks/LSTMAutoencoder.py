@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from einops import rearrange
 from omegaconf import DictConfig
 from text_vae import (
-    ContinuousAutoencoder, ContinuousAutoencoderHparams, autoregressive_decode, GenerationStrategy, MutualInformation
+    ContinuousVAE, ContinuousVAEHparams, autoregressive_decode, GenerationStrategy, MutualInformation
 )
 from torch import nn, Tensor
 from torch.distributions import Normal
@@ -12,12 +12,12 @@ from .LSTMLanguageModel import LSTMLanguageModelHparams
 
 
 @dataclass
-class LSTMAutoencoderHparams(ContinuousAutoencoderHparams, LSTMLanguageModelHparams):
+class LSTMAutoencoderHparams(ContinuousVAEHparams, LSTMLanguageModelHparams):
     enc_nh: int = 1024  # Dimensionality of the encoder's LSTM hidden state
     latent_depth: int = 32  # Dimensionality of the latent variable vector
 
 
-class LSTMAutoencoder(ContinuousAutoencoder):
+class LSTMAutoencoder(ContinuousVAE):
     def __init__(self, hparams: DictConfig):
         super(LSTMAutoencoder, self).__init__(hparams)
 

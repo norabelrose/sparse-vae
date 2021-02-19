@@ -1,4 +1,4 @@
-from text_vae.core.Autoencoder import *
+from text_vae.core.VAE import *
 from .AutoencoderCallback import *
 
 
@@ -8,10 +8,10 @@ class KLAnnealing(AutoencoderCallback):
     kl_weight_end: float = 1.0
     num_annealing_steps: int = 50_000
 
-    def on_train_start(self, trainer, autoencoder: ContinuousAutoencoder):
+    def on_train_start(self, trainer, autoencoder: ContinuousVAE):
         autoencoder.hparams.kl_weight = self.kl_weight_start
 
-    def on_after_backward(self, trainer, autoencoder: ContinuousAutoencoder):
+    def on_after_backward(self, trainer, autoencoder: ContinuousVAE):
         cur_step = autoencoder.global_step
         max_steps = self.num_annealing_steps
         if cur_step > max_steps:

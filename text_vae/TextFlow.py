@@ -6,10 +6,10 @@ from survae.transforms import (
     SequentialTransform,
     Shuffle
 )
-from .AttentionState import AttentionState
+from text_vae.funnel_transformers.AttentionState import AttentionState
 from text_vae.core.LanguageModel import *
 from .EmbeddingSurjection import *
-from .ops import AttentionHparams, RelativePositionalAttention
+from text_vae.funnel_transformers.ops import AttentionHparams, RelativePositionalAttention
 from .Stride import *
 
 

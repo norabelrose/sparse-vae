@@ -47,8 +47,8 @@ def main(args):
         experiment = 'funnel-transformer'
 
     elif model_str == 'hvae':
-        hparam_class = HierarchicalAutoencoderHparams
-        model_class = HierarchicalAutoencoder
+        hparam_class = HierarchicalVAEHparams
+        model_class = HierarchicalVAE
         experiment = 'hierarchical-vae'
 
     elif model_str == 'ar-vae':
@@ -78,16 +78,19 @@ def main(args):
         experiment = 'transformer-lm'
 
     elif model_str == 'vq-vae':
-        hparam_class = QuantizedAutoencoderHparams
-        model_class = QuantizedAutoencoder
+        hparam_class = QuantizedVAEHparams
+        model_class = QuantizedVAE
         experiment = 'vq-vae'
     else:
         exit(1)
 
     # Turn these callbacks on by default for VAEs
-    if issubclass(model_class, ContinuousAutoencoder):
+    if issubclass(model_class, ContinuousVAE):
         config.update(kl_annealing=True)
-    if issubclass(model_class, Autoencoder):
+    else:
+        config.trainer.update(precision=16)  # Any model other than a continuous VAE should be able to handle AMP
+
+    if issubclass(model_class, VAE):
         config.update(reconstruction_sampler=True)
     if issubclass(model_class, LanguageModel):
         config.update(unconditional_sampler=True)
@@ -109,7 +112,7 @@ def main(args):
             config.trainer.resume_from_checkpoint = get_checkpoint_path_for_name(experiment, ckpt_name)
 
     if command == 'extract-posteriors':
-        assert issubclass(model_class, Autoencoder)
+        assert issubclass(model_class, VAE)
         ckpt_name = config.get('from_checkpoint')
         assert ckpt_name, "We need a checkpoint to load a model from"
 

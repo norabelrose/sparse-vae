@@ -90,8 +90,4 @@ class LanguageModel(pl.LightningModule, ABC):
 
     # Called by UnconditionalSampler callback
     def sample(self, max_length: int, count: int = 1, **kwargs):
-        raise NotImplementedError
-
-    # Called by UnconditionalSampler callback; can be overridden by subclasses
-    def should_unconditionally_sample(self) -> bool:
-        return True
+        return None

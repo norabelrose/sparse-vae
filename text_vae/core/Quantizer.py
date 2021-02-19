@@ -48,7 +48,8 @@ class Quantizer(nn.Module):
         # upsampling linear layers but we don't want to actually quantize just yet
         output = QuantizerOutput(soft_codes=x)
         if quantize:
-            output.hard_codes, output.code_indices = torch.cdist(x, self.codebook[level]).min(dim=-1)
+            output.code_indices = torch.cdist(x, self.codebook[level]).argmin(dim=-1)
+            output.hard_codes = F.embedding(output.code_indices, self.codebook[level])
 
             if self.training:
                 output.commitment_loss = F.mse_loss(output.hard_codes.detach(), x)
@@ -74,7 +75,7 @@ class Quantizer(nn.Module):
         num_levels, num_codes, code_depth = best_codebooks.shape
 
         # Make sure this is always a list so that the code below can be generic
-        if isinstance(soft_codes, FloatTensor):
+        if not isinstance(soft_codes, list):
             soft_codes = [soft_codes]
 
         soft_codes = [x.flatten(end_dim=-2) for x in soft_codes]
@@ -97,14 +98,13 @@ class Quantizer(nn.Module):
                 cur_codebooks[level] = x[num_codes * i:num_codes * (i + 1)]
 
             for _ in range(max_iter):
-                cur_codebooks.zero_()
-
                 for level, level_soft_codes in enumerate(soft_codes):
                     cur_codebook = cur_codebooks[level]
                     hard_code_indices = torch.cdist(level_soft_codes, cur_codebook).argmin(dim=-1)
 
                     # Sum together all the soft codes assigned to a cluster, then divide by the number in that cluster
                     counts = hard_code_indices.bincount(minlength=num_codes)
+                    cur_codebook.zero_()
                     cur_codebook.scatter_add_(
                         dim=0,
                         index=hard_code_indices[:, None].repeat(1, code_depth),

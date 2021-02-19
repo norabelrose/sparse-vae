@@ -1,7 +1,7 @@
-from .AttentionState import *
-from .ops import AttentionHparams, PositionwiseFFN, RelativePositionalAttention
-from .RemoteModels import *
-from .core.Utilities import *
+from text_vae.funnel_transformers.AttentionState import *
+from text_vae.funnel_transformers.ops import AttentionHparams, PositionwiseFFN, RelativePositionalAttention
+from text_vae.funnel_transformers.RemoteModels import *
+from text_vae.core.Utilities import *
 from dataclasses import dataclass, field
 from omegaconf import OmegaConf
 from pytorch_lightning.utilities import AttributeDict

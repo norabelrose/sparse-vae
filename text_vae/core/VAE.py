@@ -5,12 +5,12 @@ from .LanguageModel import *
 
 
 @dataclass
-class AutoencoderHparams(LanguageModelHparams, ABC):
+class VAEHparams(LanguageModelHparams, ABC):
     latent_depth: int = 16  # Depth of the latent tensors/vectors
 
-class Autoencoder(LanguageModel, ABC):
+class VAE(LanguageModel, ABC):
     @abstractmethod
-    def compute_posteriors(self, batch: Dict[str, Any]) -> Any:
+    def compute_latents(self, batch: Dict[str, Any]) -> Any:
         raise NotImplementedError
 
     def extract_posteriors_for_dataset(self, datamodule: AutoencoderDataModule):
@@ -21,7 +21,7 @@ class Autoencoder(LanguageModel, ABC):
         def get_posteriors(batch: Dict[str, list]) -> Dict[str, list]:
             batch = [dict(zip(batch, x)) for x in zip(*batch.values())]  # dict of lists -> list of dicts
             batch = datamodule.collate(batch)
-            return {'posteriors': self.compute_posteriors(batch)}
+            return {'posteriors': self.compute_latents(batch)}
 
         print(f"Extracting posteriors over the latent space for dataset '{datamodule.hparams.dataset_name}'...")
         datamodule.dataset = dataset.map(get_posteriors, batched=True, batch_size=batch_sz, load_from_cache_file=False)
@@ -29,12 +29,12 @@ class Autoencoder(LanguageModel, ABC):
 
 # Abstract base classes for autoencoders with continuous latent spaces
 @dataclass
-class ContinuousAutoencoderHparams(AutoencoderHparams, ABC):
+class ContinuousVAEHparams(VAEHparams, ABC):
     kl_weight: float = 1.0
 
-class ContinuousAutoencoder(Autoencoder):
+class ContinuousVAE(VAE):
     def __init__(self, hparams: DictConfig):
-        super(Autoencoder, self).__init__(hparams)
+        super(VAE, self).__init__(hparams)
 
         # Create the standard diagonal Gaussian prior for the first layer
         self.register_buffer('prior_mu', torch.zeros(hparams.latent_depth))

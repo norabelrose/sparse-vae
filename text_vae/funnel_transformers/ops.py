@@ -1,8 +1,7 @@
 import numpy as np
-from einops import rearrange
 from dataclasses import dataclass
 from torch import nn
-from .AttentionState import *
+from text_vae.funnel_transformers.AttentionState import *
 
 BIG_CONST = 1e6
 

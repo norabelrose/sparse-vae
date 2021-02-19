@@ -1,11 +1,11 @@
 from dataclasses import dataclass  # noqa; here to silence PyCharm linter bug
-from .core.Autoencoder import *
+from .core.VAE import *
 from .core.Quantizer import *
 from .core.TransformerLanguageModel import *
 
 
 @dataclass
-class QuantizedAutoencoderHparams(TransformerLanguageModelHparams, AutoencoderHparams):
+class QuantizedVAEHparams(TransformerLanguageModelHparams, VAEHparams):
     codebook_size: int = 512
     beta: float = 0.5
     ema_decay: float = 0.99
@@ -14,9 +14,9 @@ class QuantizedAutoencoderHparams(TransformerLanguageModelHparams, AutoencoderHp
     output_dropout: float = 0.5
 
 
-class QuantizedAutoencoder(TransformerLanguageModel):
+class QuantizedVAE(TransformerLanguageModel):
     def __init__(self, hparams: DictConfig):
-        super(QuantizedAutoencoder, self).__init__(hparams)
+        super(QuantizedVAE, self).__init__(hparams)
 
         num_codes = hparams.codebook_size
         self.quantizer = Quantizer(num_codes, hparams.latent_depth, hparams.d_model)
@@ -113,6 +113,9 @@ class QuantizedAutoencoder(TransformerLanguageModel):
         return batched_codes.split(1, dim=0)
 
     def sample(self, max_length: int, count: int = 1, **kwargs):
+        if self.training and self.trainer.current_epoch == 0:
+            return None
+        
         denom = self.code_frequencies.sum()
         if not denom:
             code_indices = torch.randint(self.hparams.codebook_size, size=[count], device=self.device)
@@ -133,10 +136,7 @@ class QuantizedAutoencoder(TransformerLanguageModel):
         observed_codes = [self.forward(
             {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()},
             quantize=False
-        ).hard_codes for batch in loader]
+        ).soft_codes for batch in loader]
 
         self.quantizer.perform_kmeans_update(torch.cat(observed_codes, dim=0))
         self.code_frequencies.zero_()
-
-    def should_unconditionally_sample(self) -> bool:
-        return self.trainer.current_epoch > 0

@@ -11,10 +11,13 @@ class UnconditionalSampler(AutoencoderCallback):
 
     def on_train_batch_end(self, trainer, langmodel: LanguageModel, outputs, batch, batch_idx, dataloader_idx):
         cur_step = langmodel.global_step
-        if cur_step % self.train_step_interval != 0 or not langmodel.should_unconditionally_sample():
+        if cur_step % self.train_step_interval != 0:
             return
 
         samples = langmodel.sample(self.sample_max_len, self.num_samples, temperature=self.sampling_temperature)
+        if not samples:
+            return
+
         samples = samples.tolist()  # Tensor -> List of lists of ints
         samples = langmodel.tokenizer.decode_batch(samples, skip_special_tokens=True)  # List of strings
 

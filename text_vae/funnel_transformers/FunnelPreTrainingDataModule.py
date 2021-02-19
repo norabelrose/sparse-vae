@@ -1,5 +1,5 @@
 from datasets import concatenate_datasets
-from .AutoencoderDataModule import *
+from text_vae.AutoencoderDataModule import *
 
 
 # noinspection PyAbstractClass

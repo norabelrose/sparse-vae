@@ -1,6 +1,6 @@
 from text_vae.core.TransformerLanguageModel import *
-from text_vae.core.Autoencoder import *
-from .FunnelTransformer import *
+from text_vae.core.VAE import *
+from text_vae.funnel_transformers.FunnelTransformer import *
 from collections import defaultdict
 from einops import rearrange
 from torch.distributions import kl_divergence
@@ -10,7 +10,7 @@ from .core.Distributions import ConditionalGaussian
 
 
 @dataclass
-class AutoregressiveAutoencoderHparams(TransformerLanguageModelHparams, ContinuousAutoencoderHparams):
+class AutoregressiveAutoencoderHparams(TransformerLanguageModelHparams, ContinuousVAEHparams):
     num_scales: int = 3
 
 @dataclass
@@ -25,7 +25,7 @@ class AutoregressiveAutoencoderState:
     stats: Dict[str, Tensor] = field(default_factory=lambda: defaultdict(float))
 
 
-class AutoregressiveAutoencoder(ContinuousAutoencoder):
+class AutoregressiveAutoencoder(ContinuousVAE):
     def __init__(self, hparams: DictConfig):
         super(AutoregressiveAutoencoder, self).__init__(hparams)
 
@@ -55,7 +55,7 @@ class AutoregressiveAutoencoder(ContinuousAutoencoder):
             nn.Linear(hparams.latent_depth, hparams.d_model)
             for _ in range(hparams.num_scales)
         ])
-        input_embedding = self.encoder.input_layer[0].codebook
+        input_embedding = self.encoder.input_layer[0].quantizer
         input_embedding.data *= encoder_depth ** -0.5
 
         output_embedding = nn.Linear(encoder_depth, input_embedding.shape[0])
@@ -144,7 +144,7 @@ class AutoregressiveAutoencoder(ContinuousAutoencoder):
 
     # Returns an outer list where each inner list corresponds to one data sample, and each element in the inner list
     # is a Normal distribution object for a given level in the latent variable hierarchy
-    def compute_posteriors(self, batch: Dict[str, Any]) -> List[List[Normal]]:
+    def compute_latents(self, batch: Dict[str, Any]) -> List[List[Normal]]:
         batched_dists = self.forward(batch).posteriors  # Posteriors whose parameters are tensors with batch dims
 
         # List of lists of Normal distribution objects
