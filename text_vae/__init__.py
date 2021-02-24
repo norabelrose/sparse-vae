@@ -14,7 +14,8 @@ from text_vae.core.VAE import *
 from text_vae.funnel_transformers.FunnelTransformer import *
 from text_vae.funnel_transformers.FunnelWithDecoder import *
 from text_vae.funnel_transformers.FunnelForPreTraining import *
-from .HierarchicalVAE import *
+from .ContinuousHierarchicalVAE import *
+from .QuantizedHierarchicalVAE import *
 from .AutoencoderDataModule import *
 from text_vae.funnel_transformers.FunnelPreTrainingDataModule import *
 

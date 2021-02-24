@@ -32,7 +32,8 @@ def main(args):
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
             # 'auto_select_gpus': gpu_available,
-            'gpus': int(gpu_available)
+            'gpus': int(gpu_available),
+            'num_sanity_val_steps': 0
         }
     })
     data_class = AutoencoderDataModule
@@ -47,8 +48,8 @@ def main(args):
         experiment = 'funnel-transformer'
 
     elif model_str == 'hvae':
-        hparam_class = HierarchicalVAEHparams
-        model_class = HierarchicalVAE
+        hparam_class = ContinuousHierarchicalVAEHparams
+        model_class = ContinuousHierarchicalVAE
         experiment = 'hierarchical-vae'
 
     elif model_str == 'ar-vae':

@@ -1,5 +1,8 @@
 from .core import ConditionalGaussian
 from .HierarchicalVAE import *
+from dataclasses import dataclass
+from collections import defaultdict
+from torch.distributions import Categorical
 from numpy import prod
 from torch.distributions import kl_divergence
 import math
@@ -12,132 +15,51 @@ class ContinuousHierarchicalVAEHparams(HierarchicalVAEHparams, ContinuousVAEHpar
 
 @dataclass
 class ContinuousHierarchicalVAEState(HierarchicalVAEState):
-    posteriors: List[Normal] = field(default_factory=dict)  # q(z|x)
+    latents: List[Tensor] = field(default_factory=list)
+    posteriors: List[Normal] = field(default_factory=list)  # q(z|x)
+
+    p_of_x_given_z: Optional[Categorical] = None
+    stats: Dict[str, Tensor] = field(default_factory=lambda: defaultdict(float))
 
 
-class ContinuousHierarchicalVAE(HierarchicalVAE):
+class ContinuousHierarchicalVAE(HierarchicalVAE, ContinuousVAE):
     def __init__(self, hparams: DictConfig):
         super(ContinuousHierarchicalVAE, self).__init__(hparams)
 
-        def get_distributions(input_dim, output_dim, num_scales: int, zero_initialized: bool = False):
-            return nn.ModuleList([
-                ConditionalGaussian(input_dim, output_dim,
-                                    reduce_dim=-2 if not hparams.use_long_latents else None,
-                                    zero_initialized=zero_initialized)
-                for _ in range(num_scales)
-            ])
-
-        # Output is a Normal distribution object. Note initializing the weights of the prior to zero means that
-        # at the start of training, it will output 0 mean, 0 log sigma (i.e. 1 sigma) independent of the input
         encoder_hparams = hparams.encoder
         num_latent_scales = len(encoder_hparams.scaling_factors)
 
-        overt_depth, latent_depth = encoder_hparams.d_model, hparams.latent_depth
-        self.priors = get_distributions(overt_depth, latent_depth, num_latent_scales - 1, zero_initialized=True)
-        self.posteriors = get_distributions(overt_depth, latent_depth, num_latent_scales)
-
-        self.latent_upsample = nn.ModuleList([
-            nn.Sequential(
-                nn.GELU(),
-                nn.Linear(latent_depth, overt_depth)
+        self.samplers = nn.ModuleList([
+            ContinuousLatentSampler(
+                latent_depth=hparams.latent_depth,
+                overt_depth=encoder_hparams.d_model,
+                is_base=i == 0,
+                reduce_length=not hparams.use_long_latents
             )
-            for _ in range(num_latent_scales)
+            for i in range(num_latent_scales)
         ])
 
-    # Runs a forward pass through the encoder and computes the posterior distributions over the latent variables
-    # (but does not actually sample the latents- you can do that yourself)
-    def forward(self, batch: Dict[str, Any], **kwargs) -> ContinuousHierarchicalVAEState:
-        vae_state = ContinuousHierarchicalVAEState()
-        vae_state.encoder_output = self.encoder_forward(batch)
-
-        funnel_state_iter = reversed(vae_state.encoder_output.hidden_states)
-        vae_state.posteriors = [
-            self.posteriors[idx](next(funnel_state_iter), 1.0)
-            for idx in range(len(self.encoder.hparams.scale_factors))
-        ]
-        return vae_state
+    def forward(self, batch: Dict[str, Any], **kwargs) -> FunnelTransformerOutput:
+        return self.encoder_forward(batch)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Tensor]:
         result = self.reconstruct(batch)
         self.log('iw_loss', self.get_loss_monte_carlo(batch))
         return self.compute_loss_for_step(result, 'val')
 
-    # Called both by reconstruct() and sample()
-    def decoder_forward(self, vae_state: Optional[ContinuousHierarchicalVAEState],
-                        padding_mask: Tensor = None,
-                        batch_dims: List[int] = None,
-                        clamped_latents: Mapping[int, Tensor] = None,
-                        temperature: float = 1.0,
-                        return_latents: bool = False,
-                        return_log_probs: bool = False
-                        ) -> HierarchicalVAEState:
-        if not vae_state:
-            vae_state = HierarchicalVAEState()
-        if not clamped_latents:
-            clamped_latents = {}
+    def decoder_block_end(self, vae_state: Any, dec_state: Tensor, enc_state: Tensor, block_idx: int, **kwargs):
+        z = self.samplers[block_idx + 1](dec_state, vae_state, enc_state=enc_state)
 
-        # We use a coroutine so that we can unobtrusively insert ourselves into Funnel Transformer's forward pass
-        # and replace its hidden state with samples from our prior or posterior distributions
-        self.decoder.attention_state.upsampling = True
-        encoder_output = vae_state.encoder_output
-        coroutine = self.decoder.forward_coroutine(
-            encoder_output.final_state if encoder_output else None,
-            padding_mask=padding_mask
-        )
+        if not self.hparams.use_long_latents:
+            # Replace the [CLS] token with the latent vector in an out-of-place, autograd-friendly way
+            return dec_state.where(not_cls_mask_like(dec_state), z.unsqueeze(-2))
+        else:
+            return dec_state + z
 
-        for block_idx, decoder_state in coroutine:
-            # Final output
-            if isinstance(decoder_state, FunnelTransformerOutput):
-                vae_state.decoder_output = decoder_state
-                raw_output = decoder_state.final_state
-
-                logits = self.output_layer(raw_output)
-                vae_state.p_of_x_given_z = Categorical(logits=logits)
-                if encoder_output:
-                    vae_state.ground_truth = encoder_output.original_ids
-
-                return vae_state
-
-            # In the first stochastic layer, the prior is just a standard diagonal Gaussian:
-            if block_idx == 0:
-                # Sampling unconditionally
-                if decoder_state is not None:
-                    batch_dims = list(decoder_state.shape[:2])
-
-                new_shape = batch_dims + [self.hparams.latent_depth]
-                prior = self.get_base_prior().expand(new_shape)  # noqa
-
-            # But in subsequent layers, it is conditioned on the state of the previous decoder layer:
-            else:
-                prior = self.priors[block_idx - 1](decoder_state, temperature=temperature)
-
-            if not vae_state.posteriors:  # Sample unconditionally
-                z = clamped_latents.get(block_idx)
-                if z is None:
-                    z = prior.rsample()
-
-                posterior = None
-            else:
-                posterior = vae_state.posteriors[block_idx]
-                z = posterior.rsample()
-
-            self.update_stats_dict(prior, posterior, z, vae_state.stats, return_log_probs=return_log_probs)
-            if return_latents:
-                vae_state.latents.append(z)
-
-            reconstruction = self.latent_upsample[block_idx](z)
-            if not self.hparams.use_long_latents:
-                # Replace the [CLS] token with the latent vector in an out-of-place, autograd-friendly way
-                out_state = decoder_state.where(not_cls_mask_like(decoder_state), z.unsqueeze(-2))
-            else:
-                out_state = decoder_state + reconstruction if decoder_state is not None else reconstruction
-
-            coroutine.send(out_state)
-
-    def compute_loss_for_step(self, result: HierarchicalVAEState, step: str):
+    def compute_loss_for_step(self, result: ContinuousHierarchicalVAEState, step: str):
         # Figure out the correct denominator for the loss
         if self.hparams.include_padding_positions:
-            num_tokens = result.decoder_output.final_state.shape[-2]
+            num_tokens = result.p_of_x_given_z.logits.shape[-2]
         else:
             # Each sample in the batch will have a different number of nonpadding tokens
             num_tokens = self.decoder.attention_state.padding_mask.sum(dim=-1)
@@ -154,8 +76,8 @@ class ContinuousHierarchicalVAE(HierarchicalVAE):
         return {'loss': loss, 'output': result}
 
     def compute_latents(self, batch: Dict[str, Any]) -> List[List[Normal]]:
-        encoder_out = self.forward(batch)
-        batched_dists = encoder_out.posteriors  # Posteriors whose parameters are tensors with batch dims
+        vae_state = self.reconstruct(batch)
+        batched_dists = vae_state.posteriors  # Posteriors whose parameters are tensors with batch dims
 
         # List where each element is a list of (mu, sigma) tuples; each inner list is for just one level latent
         dists = [
@@ -169,37 +91,20 @@ class ContinuousHierarchicalVAE(HierarchicalVAE):
 
     # Runs a forward pass through the encoder and the decoder and returns a dict with the sum total KL and NLL
     # for each sample in the batch. Note that these tensors must be normalized before computing the loss.
-    def reconstruct(self, batch: Dict[str, Any], **kwargs) -> HierarchicalVAEState:
-        # Encoder forward pass
-        vae_state = self.forward(batch)
+    def reconstruct(self, batch: Dict[str, Any], **kwargs) -> ContinuousHierarchicalVAEState:
+        encoder_output = self.encoder_forward(batch)
+
+        vae_state = ContinuousHierarchicalVAEState()
+        vae_state.ground_truth = encoder_output.original_ids
+        vae_state.decoder_input = self.samplers[0](encoder_output.final_state, vae_state)
+        vae_state.encoder_states = encoder_output.hidden_states[:0:-1]
+
         vae_state = self.decoder_forward(vae_state, **kwargs)
 
         log_probs = vae_state.p_of_x_given_z.log_prob(vae_state.ground_truth)
-        if not self.hparams.include_padding_positions:
-            original_ids = batch.get('labels', batch['token_ids'])
-            # Ignore padding by setting its probability to 1.0 (log probability 0.0)
-            log_probs = log_probs.where(original_ids.unsqueeze(-1) != 0, 0.0)
-
         vae_state.stats['nll'] = -log_probs.flatten(start_dim=1).sum(dim=-1)
+
         return vae_state
-
-    def update_stats_dict(self, prior: Normal, posterior: Normal, z: Tensor, stats: Dict[str, Any],
-                          return_log_probs: bool = False):
-        # Marginalize over successive layers of latent variables
-        if return_log_probs:
-            stats['p(z)'] += prior.log_prob(z).flatten(start_dim=1).sum(dim=1)
-            stats['q(z|x)'] += posterior.log_prob(z).flatten(start_dim=1).sum(dim=1)
-
-        # Update the running totals of the KL divergences
-        if posterior:
-            kl_tensor = kl_divergence(prior, posterior)
-
-            if not self.hparams.include_padding_positions:
-                # Gives us the appropriately scaled mask for the current block
-                padding_mask = self.decoder.attention_state.get_padding_mask().unsqueeze(-1)
-                kl_tensor.masked_fill_(padding_mask, 0.0)
-
-            stats['kl'] += kl_tensor.flatten(start_dim=1).sum(dim=1)  # Sum over seq len and latent dim
 
     # Get a tighter estimate for the KL and NLL of some input using Monte Carlo importance sampling
     @torch.no_grad()
@@ -225,9 +130,7 @@ class ContinuousHierarchicalVAE(HierarchicalVAE):
         avg_log_prob = log_marginal_prob.logsumexp(dim=0) - math.log(num_samples)
         return (-avg_log_prob / seq_len).mean()
 
-    def sample(self, max_length: int, count: int = 1, top_k: int = 1, return_latents: bool = False,
-               clamped_latents: Optional[Mapping[int, Tensor]] = None,
-               temperature: float = 1.0) -> Tensor:
+    def sample(self, max_length: int, count: int = 1, top_k: int = 1, temperature: float = 1.0) -> Tensor:
         # Find the sequence length dimension that the seed should have in order to generate the desired output length
         funnel_hparams = self.hparams.encoder
         total_scaling = prod(funnel_hparams.scaling_factors)
@@ -240,12 +143,74 @@ class ContinuousHierarchicalVAE(HierarchicalVAE):
             device=self.device,
             padding_mask=None
         )
+
+        base_sampler = self.samplers[0]
+        base_sampler.eval()
+
+        initial_state = ContinuousHierarchicalVAEState()
+        initial_state.decoder_input = base_sampler.forward(
+            x=torch.empty([count, seed_length, funnel_hparams.d_model]),
+            vae_state=initial_state
+        )
+        base_sampler.train()
+
         vae_output = self.decoder_forward(
-            vae_state=None,
+            vae_state=initial_state,
             padding_mask=None,
-            batch_dims=[count, seed_length],
-            clamped_latents=clamped_latents or {},  # Allow for style transfer-type experiments
-            return_latents=return_latents,
             temperature=temperature
         )
         return self.decode_logits(vae_output.p_of_x_given_z.logits)
+
+
+class ContinuousLatentSampler(nn.Module):
+    def __init__(self, latent_depth: int, overt_depth: int, reduce_length: bool = False, is_base: bool = False):
+        super(ContinuousLatentSampler, self).__init__()
+
+        reduce_dim = -2 if reduce_length else None
+        if is_base:
+            # Register these as buffers so they are moved to the correct device automagically by PyTorch Lightning
+            self.register_buffer('prior_mu', torch.zeros(latent_depth))
+            self.register_buffer('prior_sigma', torch.ones(latent_depth))
+        else:
+            self.prior = ConditionalGaussian(overt_depth, latent_depth, reduce_dim=reduce_dim, zero_initialized=True)
+
+        # We concatenate the encoder and decoder states depthwise to get the input for the posterior
+        posterior_input_depth = overt_depth if is_base else overt_depth * 2
+        self.is_base = is_base
+        self.posterior = ConditionalGaussian(posterior_input_depth, latent_depth, reduce_dim=reduce_dim)
+        self.upscaler = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(latent_depth, overt_depth)
+        )
+
+    def get_std_prior(self) -> Normal:
+        return Normal(self.prior_mu, self.prior_sigma)
+
+    # TODO: Add support for sampling temperatures
+    def forward(self, x: Tensor, vae_state: ContinuousHierarchicalVAEState, enc_state: Optional[Tensor] = None):
+        # For fixed Standard Gaussian priors
+        if self.is_base:
+            new_shape = list(x.shape[:-1]) + [self.prior_mu.shape[-1]]
+            prior = self.get_std_prior().expand(new_shape)  # noqa
+        else:
+            prior = self.prior(x)
+
+        if self.training:
+            if not self.is_base:
+                assert enc_state is not None, "Need encoder state to parameterize the posterior"
+                x = torch.cat([x, enc_state], dim=-1)
+
+            posterior = self.posterior(x)
+            z = posterior.rsample()
+
+            # We sum over all dimensions except the batch dimension
+            vae_state.stats['p(z)'] += prior.log_prob(z).flatten(start_dim=1).sum(dim=1)
+            vae_state.stats['q(z|x)'] += posterior.log_prob(z).flatten(start_dim=1).sum(dim=1)
+            vae_state.stats['kl'] += kl_divergence(prior, posterior).flatten(start_dim=1).sum(dim=1)
+
+            vae_state.posteriors += [posterior]
+        else:
+            z = prior.sample()
+
+        vae_state.latents += [z]
+        return self.upscaler(z)

@@ -3,7 +3,7 @@ from datasets import load_dataset
 from itertools import chain, islice
 from math import ceil
 from multiprocessing import cpu_count
-from omegaconf import OmegaConf
+from omegaconf import DictConfig
 from pathlib import Path
 from tokenizers import BertWordPieceTokenizer, Tokenizer  # noqa
 from torch import Tensor
@@ -25,7 +25,7 @@ class AutoencoderDataModuleHparams:
     dataset_name: str = 'pg19'
     masked_lm: bool = False
     max_sentences_per_sample: Optional[int] = None
-    min_tokens_per_sample: int = 10
+    min_tokens_per_sample: int = 16
     max_tokens_per_sample: int = 512
     pad_to_max_length: bool = False
     split: str = 'train'    # Any string of the format supported by the HuggingFace datasets library
@@ -38,7 +38,7 @@ class AutoencoderDataModuleHparams:
 # Base class for Text VAE data modules- takes care of boilerplate
 # noinspection PyAbstractClass
 class AutoencoderDataModule(pl.LightningDataModule):
-    def __init__(self, hparams: OmegaConf):
+    def __init__(self, hparams: DictConfig):
         super(AutoencoderDataModule, self).__init__()
 
         # These warnings are spurious and seem to pop up due to a bug in PyTorch which was fixed in PR #47160
@@ -245,7 +245,7 @@ class AutoencoderDataModule(pl.LightningDataModule):
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
         if self.hparams.uniform_length_batching:
-            sampler = SequentialRandomSampler(dataset_length=len(self.dataset['train']), batch_size=self.batch_size)
+            sampler = ContiguousRandomSampler(dataset_length=len(self.dataset['train']), batch_size=self.batch_size)
             shuffle = False
             batch_size = 1
         else:
@@ -305,7 +305,7 @@ class AutoencoderDataModule(pl.LightningDataModule):
 
 # Used to return random batches that are of roughly uniform length
 @dataclass
-class SequentialRandomSampler:
+class ContiguousRandomSampler:
     dataset_length: int
     batch_size: int
 

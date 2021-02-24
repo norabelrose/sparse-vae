@@ -3,7 +3,8 @@ from dataclasses import dataclass
 from einops import rearrange
 from omegaconf import DictConfig
 from text_vae import (
-    ContinuousVAE, ContinuousVAEHparams, autoregressive_decode, GenerationStrategy, MutualInformation
+    ContinuousVAE, ConditionalGaussian, ContinuousVAEHparams, autoregressive_decode, GenerationStrategy,
+    MutualInformation
 )
 from torch import nn, Tensor
 from torch.distributions import Normal
@@ -29,7 +30,7 @@ class LSTMAutoencoder(ContinuousVAE):
             hidden_size=hparams.dec_nh,
             batch_first=True
         )
-        self.posterior = nn.Linear(hparams.enc_nh, 2 * hparams.latent_depth)
+        self.posterior = ConditionalGaussian(hparams.enc_nh, hparams.latent_depth)
 
         self.dropout_in = nn.Dropout(hparams.dec_dropout_in)
         self.dropout_out = nn.Dropout(hparams.dec_dropout_out)
@@ -61,11 +62,9 @@ class LSTMAutoencoder(ContinuousVAE):
         self.decoder.requires_grad_(requires_grad)
 
     # Get the posterior distribution of the latent variable for an input
-    def forward(self, x):
+    def forward(self, x) -> Normal:
         _, (last_state, last_cell) = self.encoder(x)
-
-        mean, logvar = self.posterior(last_state).chunk(2, -1)
-        return Normal(mean.squeeze(0), logvar.squeeze(0).exp())
+        return self.posterior(last_state)
 
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False):
         original = batch['token_ids']

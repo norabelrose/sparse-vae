@@ -1,8 +1,7 @@
-from collections import defaultdict
-from torch.distributions import Categorical
 from .core.VAE import *
-from text_vae.funnel_transformers.FunnelTransformer import *
+from .funnel_transformers.FunnelTransformer import *
 from .KNNLookupTable import *
+from torch.distributions import Categorical
 
 
 @dataclass
@@ -22,18 +21,15 @@ class HierarchicalVAEHparams(VAEHparams):
 
     include_padding_positions: bool = True
 
+
 @dataclass
 class HierarchicalVAEState:
     ground_truth: Optional[Tensor] = None
-    encoder_output: Optional[FunnelTransformerOutput] = None
-    decoder_output: Optional[FunnelTransformerOutput] = None
-    latents: List[Tensor] = field(default_factory=list)
-
-    p_of_x_given_z: Optional[Categorical] = None
-    stats: Dict[str, Tensor] = field(default_factory=lambda: defaultdict(float))
+    decoder_input: Optional[Tensor] = None
+    encoder_states: List[Tensor] = field(default_factory=list)
 
 
-class HierarchicalVAE(VAE):
+class HierarchicalVAE(VAE, ABC):
     def __init__(self, hparams: DictConfig):
         super().__init__(hparams)
 
@@ -53,7 +49,7 @@ class HierarchicalVAE(VAE):
         self.decoder = FunnelTransformer(decoder_hparams)
         self.encoder.attention_state = attn_state
         self.decoder.attention_state = attn_state
-        output_embedding = nn.Linear(encoder_hparams.d_model, self.tokenizer.get_vocab_size())
+        output_embedding = nn.Linear(encoder_hparams.d_model, hparams.vocab_size)
         self.output_layer = nn.Sequential(
             nn.Linear(encoder_hparams.d_model, encoder_hparams.d_model),
             nn.GELU(),
@@ -81,8 +77,41 @@ class HierarchicalVAE(VAE):
     def encoder_forward(self, batch: Dict[str, Any], **kwargs) -> FunnelTransformerOutput:
         x, padding = batch['token_ids'], batch['padding_mask']
 
-        self.encoder.attention_state.configure_for_input(x.shape[-2], x.dtype, x.device, padding)
+        self.encoder.attention_state.configure_for_input(x.shape[-1], x.dtype, x.device, padding)
         return self.encoder(x, padding_mask=padding, **kwargs)
+
+    def decoder_forward(self, vae_state: HierarchicalVAEState, padding_mask: Tensor = None, **kwargs):
+        self.decoder.attention_state.upsampling = True
+        coroutine = self.decoder.forward_coroutine(
+            vae_state.decoder_input,
+            padding_mask=padding_mask
+        )
+        encoder_state_iter = iter(vae_state.encoder_states)
+
+        for block_idx, decoder_state in coroutine:
+            # Final output
+            if isinstance(decoder_state, FunnelTransformerOutput):
+                vae_state.decoder_output = decoder_state
+                raw_output = decoder_state.final_state
+
+                logits = self.output_layer(raw_output)
+                vae_state.p_of_x_given_z = Categorical(logits=logits)
+
+                return vae_state
+
+            if encoder_state_iter:
+                encoder_state = next(encoder_state_iter, None)
+                if encoder_state is None:  # We ran out of encoder states to use
+                    continue
+            else:
+                encoder_state = None
+
+            coroutine.send(self.decoder_block_end(vae_state, decoder_state, encoder_state, block_idx, **kwargs))
+
+    # Returns an optional Tensor which, if not None, is passed as input to the next decoder block
+    @abstractmethod
+    def decoder_block_end(self, vae_state: Any, dec_state: Tensor, enc_state: Tensor, block_idx: int, **kwargs):
+        raise NotImplementedError
 
     # Returns the loss
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, **kwargs) -> Dict[str, Tensor]:

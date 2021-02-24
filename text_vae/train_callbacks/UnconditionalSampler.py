@@ -15,7 +15,7 @@ class UnconditionalSampler(AutoencoderCallback):
             return
 
         samples = langmodel.sample(self.sample_max_len, self.num_samples, temperature=self.sampling_temperature)
-        if not samples:
+        if samples is None:
             return
 
         samples = samples.tolist()  # Tensor -> List of lists of ints

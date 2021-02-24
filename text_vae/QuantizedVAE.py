@@ -32,7 +32,7 @@ class QuantizedVAE(TransformerLanguageModel):
         x = self.preprocess(batch)
         return self.encoder_forward(x, batch['padding_mask'], quantize=quantize)
 
-    def preprocess(self, batch: Dict[str, Any]):
+    def preprocess(self, batch: Dict[str, Any]) -> FloatTensor:
         x = batch['token_ids']
         x = self.input_layer(x)
         return x + positional_encodings_like(x)
@@ -53,7 +53,7 @@ class QuantizedVAE(TransformerLanguageModel):
 
         return output
 
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int, **kwargs) -> Dict[str, Tensor]:
+    def training_step(self, batch: Dict[str, Any], batch_index: int, **kwargs) -> Dict[str, Tensor]:
         encoder_input = self.preprocess(batch)
 
         # First epoch: just use the soft codes and train as a continuous, non-variational autoencoder

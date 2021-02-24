@@ -1,10 +1,20 @@
 from .HierarchicalVAE import *
 from .core import Quantizer
+from torch.distributions import Categorical
 
 
 @dataclass
 class QuantizedHierarchicalVAEHparams(HierarchicalVAEHparams):
     codebook_size: int = 512
+
+
+@dataclass
+class QuantizerHierarchicalVAEState(HierarchicalVAEState):
+    latents: List[Tensor] = field(default_factory=list)
+
+    commitment_loss: Union[float, Tensor] = 0.0
+    embedding_loss: Union[float, Tensor] = 0.0
+    p_of_x_given_z: Optional[Categorical] = None
 
 
 class QuantizedHierarchicalVAE(HierarchicalVAE):
@@ -15,17 +25,20 @@ class QuantizedHierarchicalVAE(HierarchicalVAE):
         num_latent_scales = len(encoder_hparams.scaling_factors)
         self.quantizer = Quantizer(hparams.codebook_size, encoder_hparams.d_model, num_levels=num_latent_scales)
 
+    @property
+    def quantizing(self) -> bool:
+        return not self.training or self.trainer.current_epoch > 0
+
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, **kwargs) -> Dict[str, Tensor]:
-        encoder_out = self.encoder_forward(batch)
-
         # First epoch: just use the soft codes and train as a continuous, non-variational autoencoder
-        should_quantize = self.trainer.current_epoch > 0
-        quantizer_out = self.quantizer(encoder_out.final_state, level=0, quantize=should_quantize)
+        encoder_out = self.encoder_forward(batch)
+        quantizer_out = self.quantizer(encoder_out.final_state, level=0, quantize=self.quantizing)
 
-        decoder_in = quantizer_out.hard_codes if should_quantize else quantizer_out.soft_codes
-        encoder_out.final_state = self.quantizer.upsample_codes(decoder_in, level=0)
-
-        vae_state = self.decoder_forward(decoder_in, padding_mask=batch['padding_mask'])
+        vae_state = QuantizerHierarchicalVAEState()
+        vae_state.ground_truth = encoder_out.original_ids
+        vae_state.decoder_input = self.quantizer.upsample_codes(quantizer_out.hard_codes, level=0)
+        vae_state.encoder_states = encoder_out.hidden_states[-2::-1]
+        vae_state = self.decoder_forward(vae_state, padding_mask=batch['padding_mask'])
 
         log_probs = vae_state.p_of_x_given_z.log_prob(vae_state.ground_truth)
         if not self.hparams.include_padding_positions:
@@ -36,17 +49,16 @@ class QuantizedHierarchicalVAE(HierarchicalVAE):
         vae_state.stats['nll'] = -log_probs.flatten(start_dim=1).sum(dim=-1)
         return vae_state
 
-    def decoder_forward(self, encoder_output: FunnelTransformerOutput, padding_mask: Tensor = None):
-        self.decoder.attention_state.upsampling = True
-        coroutine = self.decoder.forward_coroutine(
-            encoder_output.final_state if encoder_output else None,
-            padding_mask=padding_mask
-        )
+    def decoder_block_end(self, vae_state: Any, dec_state: Tensor, enc_state: Tensor, block_idx: int, **kwargs):
+        # We're gonna try just adding together the encoder and decoder states here- it might be better
+        # to use cross attention
+        x = dec_state + enc_state
+        quantizer_out = self.quantizer(x, level=block_idx + 1, quantize=self.quantizing)
 
-        for block_idx, decoder_state in coroutine:
-            # Final output
-            if isinstance(decoder_state, FunnelTransformerOutput):
-                pass
+        vae_state.commitment_loss += quantizer_out.commitment_loss
+        vae_state.embedding_loss += quantizer_out.embedding_loss
+
+        return quantizer_out.hard_codes
 
     def compute_latents(self, batch: Dict[str, Any]) -> Any:
         pass

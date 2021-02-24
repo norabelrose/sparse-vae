@@ -1,6 +1,6 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import ceil
-from torch import nn, FloatTensor, LongTensor
+from torch import nn, FloatTensor, LongTensor, Tensor
 from tqdm import tqdm
 from typing import *
 import torch
@@ -15,8 +15,8 @@ class QuantizerOutput:
     hard_codes: Optional[FloatTensor] = None
 
     # Both these are zero when not training or when the Quantizer is called with quantize=False
-    commitment_loss: FloatTensor = field(default_factory=lambda: torch.tensor(0.0))
-    embedding_loss: FloatTensor = field(default_factory=lambda: torch.tensor(0.0))
+    commitment_loss: Union[float, Tensor] = 0.0
+    embedding_loss: Union[float, Tensor] = 0.0
 
 
 # Essentially a fancier version of nn.Embedding which can combine multiple embedding matrices into one object. This is
@@ -46,7 +46,7 @@ class Quantizer(nn.Module):
 
         # We set quantize = False during the first epoch of training- we still want to use the downsampling and
         # upsampling linear layers but we don't want to actually quantize just yet
-        output = QuantizerOutput(soft_codes=x)
+        output = QuantizerOutput(soft_codes=x, hard_codes=x)
         if quantize:
             output.code_indices = torch.cdist(x, self.codebook[level]).argmin(dim=-1)
             output.hard_codes = F.embedding(output.code_indices, self.codebook[level])
@@ -60,7 +60,7 @@ class Quantizer(nn.Module):
 
         return output
 
-    def lookup_codes(self, x: LongTensor, level: int = 0) -> FloatTensor:
+    def lookup_codes(self, x: LongTensor, level: int = 0) -> Tensor:
         book = self.codebook[level]
         return F.embedding(x, book)
 
@@ -69,7 +69,7 @@ class Quantizer(nn.Module):
         return self.upsamplers[level](x)
 
     @torch.no_grad()
-    def perform_kmeans_update(self, soft_codes: Union[FloatTensor, List[FloatTensor]], num_restarts: int = 3):
+    def perform_kmeans_update(self, soft_codes: Union[Tensor, List[Tensor]], num_restarts: int = 3):
         best_codebooks = self.codebook.data
         cur_codebooks = torch.empty_like(best_codebooks)
         num_levels, num_codes, code_depth = best_codebooks.shape
@@ -78,7 +78,7 @@ class Quantizer(nn.Module):
         if not isinstance(soft_codes, list):
             soft_codes = [soft_codes]
 
-        soft_codes = [x.flatten(end_dim=-2) for x in soft_codes]
+        soft_codes = [x.flatten(end_dim=-2) for x in soft_codes]  # noqa
         codes_per_cluster = [x.shape[0] / num_codes for x in soft_codes]
         min_codes_per_cluster = min(codes_per_cluster)
         max_codes_per_cluster = max(codes_per_cluster)
@@ -86,7 +86,7 @@ class Quantizer(nn.Module):
         assert min_codes_per_cluster > 1.0, "Not enough soft codes to perform K means codebook update"
         assert len(soft_codes) == num_levels, "Number of soft codes doesn't match number of levels in the codebook"
 
-        best_losses = [float('inf')] * self.codebook.size(0)
+        best_losses = [float('inf')] * self.codebook.shape[0]
         max_iter = min(100, int(ceil(max_codes_per_cluster)))
         pbar = tqdm(total=max_iter * num_restarts, postfix=dict(best_loss=float('inf')))
 

@@ -88,7 +88,7 @@ class FunnelTransformer(nn.Module):
     # Vanilla function wrapper for forward_coroutine()
     def forward(self, x: Tensor, padding_mask: Tensor) -> FunnelTransformerOutput:
         coroutine = self.forward_coroutine(x, padding_mask)
-        return next(coroutine)[-1]
+        return [x for x in coroutine][-1][-1]  # noqa
 
     # Yields specified hidden states as they are generated while processing the input x, along with the absolute indices
     # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
@@ -114,6 +114,7 @@ class FunnelTransformer(nn.Module):
         layer_iter = iter(self.layers)
         q = kv = x
 
+        last_block = len(self.hparams.block_sizes) - 1
         for block_idx, block_size in enumerate(self.hparams.block_sizes):
             for rel_layer_idx in range(block_size):
                 # Let AttentionState know we're starting a new block
@@ -123,37 +124,39 @@ class FunnelTransformer(nn.Module):
                 q = kv = layer(q, kv, attn_state, cross_attn_keys=cross_attn_keys)
                 attn_state.block_begin_flag = False
 
+            # We don't need to do any of this stuff if we just finished the last block
+            if block_idx == last_block:
+                break
+
+            # Cache block outputs if indicated
+            if hparams.return_block_outputs:
+                hidden_states.append(kv)
+
             q = attn_state.maybe_scale_input(kv)
 
             # The consumer of this generator may or may not send us anything
             cross_attn_keys = None
-            maybe_transformed_x = yield block_idx, q
-            if maybe_transformed_x is not None:
+            maybe_transformed_q = yield block_idx, q
+            if maybe_transformed_q is not None:
                 # The consumer may have sent us a tuple of the form (qkv, cross attention target)
-                if isinstance(maybe_transformed_x, tuple):
-                    cross_attn_keys = maybe_transformed_x[1]
-                    maybe_transformed_x = maybe_transformed_x[0]
+                if isinstance(maybe_transformed_q, tuple):
+                    cross_attn_keys = maybe_transformed_q[1]
+                    maybe_transformed_q = maybe_transformed_q[0]
 
-                q = kv = maybe_transformed_x
+                q = kv = maybe_transformed_q
                 yield  # Don't return anything from the .send() method
 
             # When we're upsampling, there's no stage where we scale Q but don't scale K and V.
             if self.hparams.upsampling:
                 kv = q
 
-            # Cache block outputs if indicated
-            if hparams.return_block_outputs:
-                hidden_states.append(kv)
-
-        output = FunnelTransformerOutput(
+        # Last thing we yield is the final output
+        yield -1, FunnelTransformerOutput(
             original_ids=original,
             final_state=q,
             embedded_input=x,
             hidden_states=hidden_states
         )
-
-        # Last thing we yield is the final output
-        yield -1, -1, output
 
     # Gives you both the block and (absolute) layer indices while iterating
     def enumerate_blocks_and_layers(self) -> Iterator:
