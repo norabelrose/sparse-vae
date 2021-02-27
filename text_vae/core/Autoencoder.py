@@ -1,19 +1,19 @@
 from abc import abstractmethod
 from torch.distributions import Normal
-from ..AutoencoderDataModule import *
+from ..TextDataModule import *
 from .LanguageModel import *
 
 
 @dataclass
-class VAEHparams(LanguageModelHparams, ABC):
+class AutoencoderHparams(LanguageModelHparams, ABC):
     latent_depth: int = 16  # Depth of the latent tensors/vectors
 
-class VAE(LanguageModel, ABC):
+class Autoencoder(LanguageModel, ABC):
     @abstractmethod
     def compute_latents(self, batch: Dict[str, Any]) -> Any:
         raise NotImplementedError
 
-    def extract_posteriors_for_dataset(self, datamodule: AutoencoderDataModule):
+    def extract_posteriors_for_dataset(self, datamodule: TextDataModule):
         batch_sz = datamodule.batch_size
         dataset = datamodule.dataset
         dataset.set_format('torch')  # Makes the dataset yield PyTorch tensors
@@ -29,12 +29,12 @@ class VAE(LanguageModel, ABC):
 
 # Abstract base classes for autoencoders with continuous latent spaces
 @dataclass
-class ContinuousVAEHparams(VAEHparams, ABC):
+class ContinuousVAEHparams(AutoencoderHparams, ABC):
     kl_weight: float = 1.0
 
-class ContinuousVAE(VAE):
+class ContinuousVAE(Autoencoder):
     def __init__(self, hparams: DictConfig):
-        super(VAE, self).__init__(hparams)
+        super(Autoencoder, self).__init__(hparams)
 
         # Create the standard diagonal Gaussian prior for the first layer
         self.register_buffer('prior_mu', torch.zeros(hparams.latent_depth))

@@ -1,15 +1,15 @@
-from .HierarchicalVAE import *
+from .HierarchicalAutoencoder import *
 from .core import Quantizer
 from torch.distributions import Categorical
 
 
 @dataclass
-class QuantizedHierarchicalVAEHparams(HierarchicalVAEHparams):
+class QuantizedHierarchicalVAEHparams(HierarchicalAutoencoderHparams):
     codebook_size: int = 512
 
 
 @dataclass
-class QuantizerHierarchicalVAEState(HierarchicalVAEState):
+class QuantizerHierarchicalVAEState(HierarchicalAutoencoderState):
     latents: List[Tensor] = field(default_factory=list)
 
     commitment_loss: Union[float, Tensor] = 0.0
@@ -17,7 +17,7 @@ class QuantizerHierarchicalVAEState(HierarchicalVAEState):
     p_of_x_given_z: Optional[Categorical] = None
 
 
-class QuantizedHierarchicalVAE(HierarchicalVAE):
+class QuantizedHierarchicalVAE(HierarchicalAutoencoder):
     def __init__(self, hparams: DictConfig):
         super(QuantizedHierarchicalVAE, self).__init__(hparams)
 

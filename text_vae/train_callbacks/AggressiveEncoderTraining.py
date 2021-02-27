@@ -1,4 +1,4 @@
-from text_vae.core.VAE import *
+from text_vae.core.Autoencoder import *
 from .AutoencoderCallback import *
 
 

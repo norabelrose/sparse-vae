@@ -1,4 +1,4 @@
-from .VAE import *
+from .Autoencoder import *
 from .Quantizer import *
 from .Distributions import *
 from .LanguageModel import *

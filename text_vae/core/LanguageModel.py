@@ -1,9 +1,9 @@
 import math
 import pytorch_lightning as pl
-import torch
 import torch.nn.functional as F
 from abc import ABC
 from dataclasses import dataclass
+from functools import partial
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.optim import AdamW
@@ -41,21 +41,11 @@ class LanguageModel(pl.LightningModule, ABC):
             self.end_token = vocab['[SEP]']
 
     def configure_optimizers(self):
-        adam = AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
-        decay_steps = self.hparams.lr_decay_steps
-        warmups = self.hparams.warmup_steps
-
-        def cosine_decay_with_warmup(cur_step: int):
-            if cur_step < warmups:          # Warmup phase
-                return cur_step / warmups
-            elif not decay_steps:           # Just fall back to a constant schedule if we don't know the decay steps
-                return 1.0
-            else:                           # Cosine decay
-                progress = (cur_step - warmups) / max(1, decay_steps - warmups)
-                return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        adam = AdamW(self.hparams, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, self.hparams.warmup_steps)
 
         return [adam], [{
-            'scheduler': LambdaLR(adam, cosine_decay_with_warmup),
+            'scheduler': LambdaLR(adam, lr_lambda),
             'interval': 'step'
         }]
 
@@ -77,10 +67,6 @@ class LanguageModel(pl.LightningModule, ABC):
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         return self.training_step(batch, batch_index, val=True)
 
-    def on_after_backward(self):
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
-        self.log('grad_norm', grad_norm, on_step=True)
-
     def decode_logits(self, logits: Tensor, min_length: int = 10, k: int = 1):
         # Make [SEP] infinitely unlikely until we hit the min length
         logits[:, :min_length, self.end_token] = -float('inf')
@@ -91,3 +77,17 @@ class LanguageModel(pl.LightningModule, ABC):
     # Called by UnconditionalSampler callback
     def sample(self, max_length: int, count: int = 1, **kwargs):
         return None
+
+# The actual lambda to pass into LambdaLR
+def cosine_decay_with_warmup(decay_steps: int, warmup_steps: int, cur_step: int):
+    if cur_step < warmup_steps:  # Warmup phase
+        return cur_step / warmup_steps
+    elif not decay_steps:  # Just fall back to a constant schedule if we don't know the decay steps
+        return 1.0
+    else:  # Cosine decay
+        progress = (cur_step - warmup_steps) / max(1, decay_steps - warmup_steps)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+# Convenience function
+def get_cosine_decay_with_warmup_schedule(decay_steps: int, warmup_steps: int):
+    return partial(cosine_decay_with_warmup, decay_steps, warmup_steps)

@@ -36,7 +36,7 @@ def main(args):
             'num_sanity_val_steps': 0
         }
     })
-    data_class = AutoencoderDataModule
+    data_class = TextDataModule
     hparam_class = None
     model_class = None
     experiment = None
@@ -51,6 +51,11 @@ def main(args):
         hparam_class = ContinuousHierarchicalVAEHparams
         model_class = ContinuousHierarchicalVAE
         experiment = 'hierarchical-vae'
+
+    elif model_str == 'adv-ae':
+        hparam_class = AdversarialAutoencoderHparams
+        model_class = AdversarialAutoencoder
+        experiment = 'adv-ae'
 
     elif model_str == 'ar-vae':
         hparam_class = AutoregressiveAutoencoderHparams
@@ -91,12 +96,12 @@ def main(args):
     else:
         config.trainer.update(precision=16)  # Any model other than a continuous VAE should be able to handle AMP
 
-    if issubclass(model_class, VAE):
+    if issubclass(model_class, Autoencoder):
         config.update(reconstruction_sampler=True)
     if issubclass(model_class, LanguageModel):
         config.update(unconditional_sampler=True)
 
-    config.data = OmegaConf.structured(AutoencoderDataModuleHparams)
+    config.data = OmegaConf.structured(TextDataModuleHparams)
     config.model = OmegaConf.structured(hparam_class)
     config.merge_with_dotlist(args[2:])
 
@@ -113,7 +118,7 @@ def main(args):
             config.trainer.resume_from_checkpoint = get_checkpoint_path_for_name(experiment, ckpt_name)
 
     if command == 'extract-posteriors':
-        assert issubclass(model_class, VAE)
+        assert issubclass(model_class, Autoencoder)
         ckpt_name = config.get('from_checkpoint')
         assert ckpt_name, "We need a checkpoint to load a model from"
 
@@ -160,7 +165,8 @@ def main(args):
             save_dir='text-vae-logs',
             name=experiment,
             version=config.get('name')
-        )
+        ),
+        gradient_clip_val=250.0
     )
     trainer.fit(model, datamodule=data)
 

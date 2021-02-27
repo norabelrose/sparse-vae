@@ -101,7 +101,6 @@ class RelativePositionalAttention(nn.Module):
         self.r_w_bias = nn.Parameter(torch.zeros(n_head, 1, d_head))
         self.r_r_bias = nn.Parameter(torch.zeros(n_head, 1, d_head))
         self.r_kernel = nn.Parameter(torch.zeros(n_head, d_model, d_head))
-        self.r_s_bias = nn.Parameter(torch.zeros(n_head, d_head))
         
         self.post_proj = EinsumLayer("...lnh,nhd->...ld", [n_head, d_head], [d_model])
         self.layer_norm = nn.LayerNorm(d_model, eps=hparams.layer_norm_eps)
@@ -112,7 +111,6 @@ class RelativePositionalAttention(nn.Module):
         nn.init.uniform_(self.r_w_bias, b=0.1)
         nn.init.uniform_(self.r_r_bias, b=0.1)
         nn.init.uniform_(self.r_kernel, b=0.1)
-        nn.init.uniform_(self.r_s_bias, b=0.1)
         
     def forward(self, q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState) -> Tensor:
         input_q = q  # Save for residual connection

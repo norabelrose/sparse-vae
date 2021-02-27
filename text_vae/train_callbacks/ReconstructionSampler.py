@@ -1,5 +1,5 @@
 from .AutoencoderCallback import *
-from ..HierarchicalVAE import *
+from ..HierarchicalAutoencoder import *
 
 
 @dataclass
@@ -7,7 +7,7 @@ class ReconstructionSampler(AutoencoderCallback):
     num_samples: int = 1
     train_step_interval: int = 1000
 
-    def on_train_batch_end(self, trainer, autoencoder: HierarchicalVAE, outputs, batch, batch_idx, _):
+    def on_train_batch_end(self, trainer, autoencoder: HierarchicalAutoencoder, outputs, batch, batch_idx, _):
         if autoencoder.global_step % self.train_step_interval != 0:
             return
 

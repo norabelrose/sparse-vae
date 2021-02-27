@@ -1,5 +1,5 @@
 from .core import ConditionalGaussian
-from .HierarchicalVAE import *
+from .HierarchicalAutoencoder import *
 from dataclasses import dataclass
 from collections import defaultdict
 from torch.distributions import Categorical
@@ -10,11 +10,11 @@ import torch
 
 
 @dataclass
-class ContinuousHierarchicalVAEHparams(HierarchicalVAEHparams, ContinuousVAEHparams):
+class ContinuousHierarchicalVAEHparams(HierarchicalAutoencoderHparams, ContinuousVAEHparams):
     pass
 
 @dataclass
-class ContinuousHierarchicalVAEState(HierarchicalVAEState):
+class ContinuousHierarchicalVAEState(HierarchicalAutoencoderState):
     latents: List[Tensor] = field(default_factory=list)
     posteriors: List[Normal] = field(default_factory=list)  # q(z|x)
 
@@ -22,7 +22,7 @@ class ContinuousHierarchicalVAEState(HierarchicalVAEState):
     stats: Dict[str, Tensor] = field(default_factory=lambda: defaultdict(float))
 
 
-class ContinuousHierarchicalVAE(HierarchicalVAE, ContinuousVAE):
+class ContinuousHierarchicalVAE(HierarchicalAutoencoder, ContinuousVAE):
     def __init__(self, hparams: DictConfig):
         super(ContinuousHierarchicalVAE, self).__init__(hparams)
 
@@ -44,7 +44,7 @@ class ContinuousHierarchicalVAE(HierarchicalVAE, ContinuousVAE):
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Tensor]:
         result = self.reconstruct(batch)
-        self.log('iw_loss', self.get_loss_monte_carlo(batch))
+        # self.log('iw_loss', self.get_loss_monte_carlo(batch))
         return self.compute_loss_for_step(result, 'val')
 
     def decoder_block_end(self, vae_state: Any, dec_state: Tensor, enc_state: Tensor, block_idx: int, **kwargs):

@@ -19,11 +19,10 @@ import warnings
 
 
 @dataclass
-class AutoencoderDataModuleHparams:
+class TextDataModuleHparams:
     batch_size: int = 32
     chunking_strategy: str = 'token'  # 'sentence', 'token', or 'none'
     dataset_name: str = 'pg19'
-    masked_lm: bool = False
     max_sentences_per_sample: Optional[int] = None
     min_tokens_per_sample: int = 16
     max_tokens_per_sample: int = 512
@@ -34,12 +33,15 @@ class AutoencoderDataModuleHparams:
     vocab_size: int = 30522
     dataset_save_dir: str = os.path.join(os.getcwd(), 'text-vae-datasets')
 
+    mask_token_prob: float = 0.0
+    random_token_prob: float = 0.0
+
 
 # Base class for Text VAE data modules- takes care of boilerplate
 # noinspection PyAbstractClass
-class AutoencoderDataModule(pl.LightningDataModule):
+class TextDataModule(pl.LightningDataModule):
     def __init__(self, hparams: DictConfig):
-        super(AutoencoderDataModule, self).__init__()
+        super(TextDataModule, self).__init__()
 
         # These warnings are spurious and seem to pop up due to a bug in PyTorch which was fixed in PR #47160
         warnings.filterwarnings('ignore', message='The given NumPy array is not writeable')
@@ -51,6 +53,7 @@ class AutoencoderDataModule(pl.LightningDataModule):
         self.hparams = hparams
         self.dataset = None     # HuggingFace Dataset object, possibly with both train and test splits
         self.tokenizer = None
+        self.token_freqs = torch.zeros(hparams.vocab_size, dtype=torch.long)
 
         # Make sure dataset save dir exists
         os.makedirs(self.hparams.dataset_save_dir, exist_ok=True)
@@ -236,6 +239,19 @@ class AutoencoderDataModule(pl.LightningDataModule):
 
         self.dataset.rename_column_('text', 'token_ids')
 
+        if self.hparams.random_token_prob > 0.0:
+            print("Computing token frequencies...")
+
+            def get_word_frequencies(batch: Dict[str, list]):
+                token_freqs = self.token_freqs
+                vocab_size = token_freqs.numel()
+
+                for sample in batch['token_ids']:
+                    token_freqs += torch.tensor(sample).bincount(minlength=vocab_size)
+
+            self.dataset.map(get_word_frequencies, batched=True)
+            self.token_freqs = self.token_freqs.float()  # So we can sample from it as a distribution
+
     def setup(self, stage: Optional[str] = None):
         # Keep track of the indices of samples we haven't yielded yet
         if self.hparams.uniform_length_batching:
@@ -273,35 +289,43 @@ class AutoencoderDataModule(pl.LightningDataModule):
         if self.hparams.pad_to_max_length:
             padding_needed = self.hparams.max_tokens_per_sample - tokens.shape[1]
             if padding_needed > 0:
-                inputs = F.pad(tokens, (0, padding_needed))
+                tokens = F.pad(tokens, (0, padding_needed))
 
         padding_mask = tokens.eq(0).float()
         word_counts = torch.stack([x['num_words'] for x in inputs])
-        if not self.hparams.masked_lm:
+
+        mask_prob = self.hparams.mask_token_prob
+        random_prob = self.hparams.random_token_prob
+        noise_prob = mask_prob + random_prob
+
+        if noise_prob <= 0.0:
             return {'token_ids': tokens, 'padding_mask': padding_mask, 'word_count': word_counts}
 
         # Mask tokens for MLM. Adapted from DataCollatorForLanguageModeling from huggingface/transformers
-        labels = inputs.clone()
+        labels = tokens.clone()
         vocab = self.tokenizer.get_vocab()
 
         # We sample a few tokens in each sequence for MLM training (with 15% probability)
-        probability_matrix = torch.full(labels.shape, 0.15)
-        special_tokens_mask = inputs.lt(1000)  # Token IDs under 1000 are special tokens or unused
+        probability_matrix = torch.full(labels.shape, noise_prob)
+        special_tokens_mask = tokens.lt(5)  # Token IDs under 5 are special tokens
 
         probability_matrix.masked_fill_(special_tokens_mask | padding_mask.bool(), value=0.0)
-        masked_indices = torch.bernoulli(probability_matrix).bool()
+        noise_mask = torch.bernoulli(probability_matrix).bool()
         # labels[~masked_indices] = -100  # We only compute loss on masked tokens
 
         # 80% of the time, we replace masked input tokens with [MASK]
-        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-        inputs[indices_replaced] = vocab['[MASK]']
+        mask_ratio = mask_prob / noise_prob
+        if mask_ratio > 0.0:
+            replaced_mask = torch.bernoulli(torch.full(labels.shape, mask_ratio)).bool() & noise_mask
+            tokens[replaced_mask] = vocab['[MASK]']
+            noise_mask &= ~replaced_mask
 
-        # 10% of the time, we replace masked input tokens with random word
-        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-        random_words = torch.randint(low=1000, high=len(vocab), size=labels.shape, dtype=torch.long)
-        inputs[indices_random] = random_words[indices_random]
+        # 20% of the time, we replace masked input tokens with random word
+        if random_prob > 0.0:
+            random_words = self.token_freqs.multinomial(num_samples=noise_mask.sum())
+            tokens.masked_scatter_(noise_mask, random_words)
 
-        return {'token_ids': inputs, 'labels': labels, 'padding_mask': padding_mask, 'word_count': word_counts}
+        return {'token_ids': tokens, 'labels': labels, 'padding_mask': padding_mask, 'word_count': word_counts}
 
 # Used to return random batches that are of roughly uniform length
 @dataclass

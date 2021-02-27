@@ -1,11 +1,11 @@
 from dataclasses import dataclass  # noqa; here to silence PyCharm linter bug
-from .core.VAE import *
+from .core.Autoencoder import *
 from .core.Quantizer import *
 from .core.TransformerLanguageModel import *
 
 
 @dataclass
-class QuantizedVAEHparams(TransformerLanguageModelHparams, VAEHparams):
+class QuantizedVAEHparams(TransformerLanguageModelHparams, AutoencoderHparams):
     codebook_size: int = 512
     beta: float = 0.5
     ema_decay: float = 0.99

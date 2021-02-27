@@ -1,5 +1,14 @@
-from copy import deepcopy
+from torch import nn
 from typing import *
+
+
+class LambdaLayer(nn.Module):
+    def __init__(self, function: Callable):
+        super(LambdaLayer, self).__init__()
+        self.function = function
+
+    def forward(self, x: Any):
+        return self.function(x)
 
 
 # Get a new dictionary with a subset of (possibly transformed) values from the old dictionary. If you want a

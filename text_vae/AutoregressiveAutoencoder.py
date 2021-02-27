@@ -1,5 +1,5 @@
 from text_vae.core.TransformerLanguageModel import *
-from text_vae.core.VAE import *
+from text_vae.core.Autoencoder import *
 from text_vae.funnel_transformers.FunnelTransformer import *
 from collections import defaultdict
 from einops import rearrange

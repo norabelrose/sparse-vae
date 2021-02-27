@@ -1,4 +1,4 @@
-from text_vae import HierarchicalVAE
+from text_vae import HierarchicalAutoencoder
 from omegaconf import OmegaConf, DictConfig
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -14,7 +14,7 @@ def run_hparam_search(tune_config: DictConfig, num_trials: int = 100, max_epochs
     from ray.tune.suggest.bohb import TuneBOHB
 
     def run_trial(config: dict):
-        autoencoder = HierarchicalVAE(OmegaConf.create(config))
+        autoencoder = HierarchicalAutoencoder(OmegaConf.create(config))
         trainer = Trainer(
             max_epochs=max_epochs_per_trial,
             logger=TensorBoardLogger(

@@ -22,14 +22,11 @@ class FunnelTransformerHparams(AttentionHparams):
 
     # Whether to return the pre-pooling output of each block
     return_block_outputs: bool = True
-    use_performer_attention: bool = False
+    use_embedding: bool = True
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
     def __post_init__(self):
         assert self.d_model % self.num_heads == 0, "num_heads must divide d_model evenly"
-        if self.use_performer_attention:
-            assert self.positional_encoding_type not in ('rel_shift', 'factorized'),\
-                "Performer attention not supported with relative positional encodings"
 
 
 # Returned by FunnelTransformer.forward()
@@ -54,7 +51,7 @@ class FunnelTransformer(nn.Module):
 
         self.hparams = hparams
 
-        if not hparams.upsampling:
+        if not hparams.upsampling and hparams.use_embedding:
             input_modules = [
                 nn.Embedding(hparams.vocab_size, hparams.d_embedding),
                 nn.LayerNorm(hparams.d_model, eps=hparams.layer_norm_eps),
@@ -86,18 +83,18 @@ class FunnelTransformer(nn.Module):
                 param.data *= depth ** -0.5
 
     # Vanilla function wrapper for forward_coroutine()
-    def forward(self, x: Tensor, padding_mask: Tensor) -> FunnelTransformerOutput:
+    def forward(self, x: Tensor, padding_mask: Optional[Tensor] = None) -> FunnelTransformerOutput:
         coroutine = self.forward_coroutine(x, padding_mask)
         return [x for x in coroutine][-1][-1]  # noqa
 
     # Yields specified hidden states as they are generated while processing the input x, along with the absolute indices
     # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
     # versions of these hidden states, which are then used as the input to the next layer in the Transformer.
-    def forward_coroutine(self, x: Tensor, padding_mask: Tensor):
+    def forward_coroutine(self, x: Tensor, padding_mask: Optional[Tensor] = None):
         hparams = self.hparams
 
         original = x
-        if not hparams.upsampling:
+        if not hparams.upsampling and hparams.use_embedding:
             x = self.input_layer(x)  # x.shape == (...length, d_model)
 
         # This lazy loading allows the user to give us a pre-initialized, possibly shared AttentionState object
