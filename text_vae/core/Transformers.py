@@ -8,17 +8,11 @@ from .GenerationUtils import GenerationStrategy, decode_next_token_with_context
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, d_model: int = 512, num_heads: int = 8, causal: bool = False, use_cross_attention: bool = False):
+    def __init__(self, d_model: int = 512, num_heads: int = 8, causal: bool = False):
         super(TransformerLayer, self).__init__()
 
         self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, dropout=0.1)
-        if use_cross_attention:
-            # self.alpha = nn.Parameter(torch.tensor(1.0))
-            self.cross_attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, dropout=0.1)
-            self.cross_attn_layer_norm = nn.LayerNorm(d_model)
-        else:
-            self.cross_attention = None
-            self.cross_attn_layer_norm = None
+        self.use_cross_attention = False
 
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
@@ -30,6 +24,23 @@ class TransformerLayer(nn.Module):
         self.dropout = nn.Dropout(p=0.1)
         self.attn_layer_norm = nn.LayerNorm(d_model)
         self.ffn_layer_norm = nn.LayerNorm(d_model)
+
+    @property
+    def use_cross_attention(self) -> bool:
+        return bool(self.cross_attention)
+
+    @use_cross_attention.setter
+    def use_cross_attention(self, value: bool):
+        if value:
+            self.cross_attention = nn.MultiheadAttention(
+                embed_dim=self.attention.embed_dim,
+                num_heads=self.attention.num_heads,
+                dropout=0.1
+            )
+            self.cross_attn_layer_norm = nn.LayerNorm(self.attention.embed_dim)
+        else:
+            self.cross_attention = None
+            self.cross_attn_layer_norm = None
 
     def forward(self, qkv: Tensor, cross_attn_kv: Tensor = None, padding_mask: Tensor = None) -> Tensor:
         if self.causal:
@@ -46,7 +57,7 @@ class TransformerLayer(nn.Module):
         if self.cross_attention:
             cross_attn_kv = cross_attn_kv.movedim(0, 1)
             qkv, _ = self.cross_attention(qkv, cross_attn_kv, cross_attn_kv, need_weights=False)
-            qkv = y = y + self.cross_attn_layer_norm(qkv)  # self.alpha *
+            qkv = y = y + self.cross_attn_layer_norm(qkv)
 
         y = self.ffn(y)
         y = self.dropout(y)
@@ -55,9 +66,50 @@ class TransformerLayer(nn.Module):
         y = y.movedim(1, 0)
         return y
 
+# This wrapper is basically just here so you can easily run a stack of Transformer layers that
+# all cross-attend to the same tensor.
+class Transformer(nn.Module):
+    def __init__(self, num_layers: int = 6, d_model: int = 512, num_heads: int = 8, causal: bool = False,
+                 reinject_pos_encodings: bool = True):
+        super(Transformer, self).__init__()
+
+        self.layers = nn.ModuleList([
+            TransformerLayer(d_model, num_heads, causal)
+            for _ in range(num_layers)
+        ])
+        self.reinject_pos_encodings = reinject_pos_encodings
+
+    def forward(self, x: Tensor, cross_attn_target: Tensor = None, padding_mask: Tensor = None):
+        # Re-inject the positional encodings at each layer so that the positional information doesn't
+        # get lost as we go up the layer hierarchy. This should work better with our implementation of
+        # sinusoidal positional encodings because we scale the encodings by 1/sqrt(d_model), so we won't
+        # mess up the norms of the hidden states and/or wash out non-positional information this way.
+        reinject_pos = self.reinject_pos_encodings
+
+        if cross_attn_target is None:
+            cross_attn_target = []
+        elif not isinstance(cross_attn_target, list):
+            cross_attn_target = [cross_attn_target]
+
+        cross_attn_iter = iter(cross_attn_target)
+        cross_attn_next = None
+
+        for layer in self.layers:
+            if reinject_pos:
+                x = x + positional_encodings_like(x)
+
+            if layer.cross_attention:
+                cross_attn_next = next(cross_attn_iter, None)
+                if cross_attn_next is not None and reinject_pos:
+                    cross_attn_next = cross_attn_next + positional_encodings_like(cross_attn_next)  # noqa
+
+            x = layer(x, cross_attn_kv=cross_attn_next, padding_mask=padding_mask)
+
+        return x
+
 
 def positional_encodings_like(x: Tensor):
-    return get_positional_encodings(x.shape[1], x.shape[2], x.device, x.dtype)
+    return get_positional_encodings(x.shape[-2], x.shape[-1], x.device, x.dtype)
 
 @lru_cache(maxsize=10)
 def get_positional_encodings(seq_len: int, d_model: int, device: torch.device, dtype: torch.dtype) -> Tensor:

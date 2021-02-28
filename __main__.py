@@ -84,8 +84,8 @@ def main(args):
         experiment = 'transformer-lm'
 
     elif model_str == 'vq-vae':
-        hparam_class = QuantizedVAEHparams
-        model_class = QuantizedVAE
+        hparam_class = SimpleQuantizedVAEHparams
+        model_class = SimpleQuantizedVAE
         experiment = 'vq-vae'
     else:
         exit(1)
@@ -141,6 +141,7 @@ def main(args):
         run_hparam_search(OmegaConf.from_dotlist(args[2:]))
         return
 
+    # warnings.filterwarnings('ignore', message='', module='torch')
     model = model_class(config.model)
     data = data_class(hparams=config.data)
 
@@ -148,7 +149,6 @@ def main(args):
     callbacks = []
     if config.get('early_stopping'):
         callbacks.append(EarlyStopping(monitor='val_loss'))
-
     for name, callback_class in AutoencoderCallbackRegistry.items():
         if config.get(name):
             callbacks.append(callback_class())
@@ -158,6 +158,8 @@ def main(args):
         trainer = Trainer(**config.trainer)
         trainer.tune(model, datamodule=data)
 
+    warnings.filterwarnings('ignore', module='pytorch_lightning')
+    warnings.filterwarnings('ignore', module='torch')  # Bug in PL
     trainer = Trainer(
         **config.trainer,
         callbacks=callbacks,
@@ -165,8 +167,7 @@ def main(args):
             save_dir='text-vae-logs',
             name=experiment,
             version=config.get('name')
-        ),
-        gradient_clip_val=250.0
+        )
     )
     trainer.fit(model, datamodule=data)
 

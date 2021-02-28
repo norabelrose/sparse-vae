@@ -3,7 +3,7 @@ from text_vae.core.Utilities import *
 from text_vae.core.GenerationUtils import *
 from text_vae.funnel_transformers.RemoteModels import *
 from .AutoencoderMetrics import *
-from .QuantizedVAE import *
+from .SimpleQuantizedVAE import *
 from .AutoregressiveAutoencoder import *
 from .TextFlow import *
 from .NystromAttention import *

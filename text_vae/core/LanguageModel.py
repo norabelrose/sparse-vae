@@ -1,5 +1,6 @@
 import math
 import pytorch_lightning as pl
+import torch
 import torch.nn.functional as F
 from abc import ABC
 from dataclasses import dataclass
@@ -28,6 +29,10 @@ class LanguageModel(pl.LightningModule, ABC):
         super(LanguageModel, self).__init__()
         self.save_hyperparameters(hparams)
 
+        # self.example_input_array = {'batch': {
+        #     'token_ids': torch.zeros(1, 192, dtype=torch.long),
+        #     'padding_mask': torch.zeros(1, 192, dtype=torch.float)}
+        # }
         self.start_token = None
         self.end_token = None
 
@@ -41,7 +46,7 @@ class LanguageModel(pl.LightningModule, ABC):
             self.end_token = vocab['[SEP]']
 
     def configure_optimizers(self):
-        adam = AdamW(self.hparams, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        adam = AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, self.hparams.warmup_steps)
 
         return [adam], [{
@@ -86,6 +91,10 @@ def cosine_decay_with_warmup(decay_steps: int, warmup_steps: int, cur_step: int)
         return 1.0
     else:  # Cosine decay
         progress = (cur_step - warmup_steps) / max(1, decay_steps - warmup_steps)
+        if progress >= 1.0:
+            print("Learning rate decayed to 0.0. Halting training.")
+            raise KeyboardInterrupt
+
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 # Convenience function

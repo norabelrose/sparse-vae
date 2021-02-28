@@ -1,6 +1,6 @@
 from .GenerationUtils import GenerationStrategy
 from .LanguageModel import *
-from .Transformers import TransformerLayer, positional_encodings_like, autoregressive_decode_transformer
+from .Transformers import Transformer, autoregressive_decode_transformer
 from torch import nn
 import torch
 
@@ -37,25 +37,18 @@ class TransformerLanguageModel(LanguageModel):
             output_embedding
         )
 
-        self.decoder = nn.Sequential(*[
-            TransformerLayer(d_model=hparams.d_model, num_heads=hparams.num_heads, causal=True)
-            for _ in range(hparams.num_layers)
-        ])
+        self.decoder = Transformer(num_layers=hparams.num_layers, d_model=hparams.d_model, num_heads=hparams.num_heads,
+                                   causal=True)
 
     def forward(self, x: Dict[str, Tensor]):
         x, padding = x['token_ids'], x['padding_mask']
         x = self.input_layer(x)
-        x = x + positional_encodings_like(x)
         x = self.decoder_forward(x, padding_mask=padding)
 
         return self.output_layer(x)
 
     def decoder_forward(self, x: Tensor, context: Tensor = None, padding_mask: Tensor = None):
-        # inputs = torch.cat([x, context], dim=-1) if context is not None else x
-        for layer in self.decoder:
-            x = layer(x, context, padding_mask=padding_mask)
-
-        return x
+        return self.decoder(x, cross_attn_target=context, padding_mask=padding_mask)
 
     @torch.no_grad()
     def sample(self, max_length: int, count: int = 1, start_embedding: Tensor = None, **kwargs):

@@ -74,6 +74,16 @@ class FunnelTransformer(nn.Module):
         ])
         self.attention_state = None  # Lazily loaded
 
+    def layer_with_indices(self, block_idx: int, layer_idx: int) -> 'FunnelLayer':
+        layer_iter = iter(self.layers)
+        for i, block_size in enumerate(self.hparams.block_sizes):
+            for j in range(block_size):
+                layer = next(layer_iter)
+                if i == block_idx and j == layer_idx:
+                    return layer
+
+        raise ValueError
+
     # Scale the weights of each layer by 1/sqrt(N) where N is the depth of the layer
     @torch.no_grad()
     def scale_parameters(self, *, depth: int = 0):
@@ -83,14 +93,16 @@ class FunnelTransformer(nn.Module):
                 param.data *= depth ** -0.5
 
     # Vanilla function wrapper for forward_coroutine()
-    def forward(self, x: Tensor, padding_mask: Optional[Tensor] = None) -> FunnelTransformerOutput:
-        coroutine = self.forward_coroutine(x, padding_mask)
+    def forward(self, x: Tensor, padding_mask: Optional[Tensor] = None,
+                cross_attn_target: Optional[Tensor] = None) -> FunnelTransformerOutput:
+        coroutine = self.forward_coroutine(x, padding_mask=padding_mask, cross_attn_target=cross_attn_target)
         return [x for x in coroutine][-1][-1]  # noqa
 
     # Yields specified hidden states as they are generated while processing the input x, along with the absolute indices
     # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
     # versions of these hidden states, which are then used as the input to the next layer in the Transformer.
-    def forward_coroutine(self, x: Tensor, padding_mask: Optional[Tensor] = None):
+    def forward_coroutine(self, x: Tensor, padding_mask: Optional[Tensor] = None,
+                          cross_attn_target: Optional[Union[Tensor, List[Tensor]]] = None):
         hparams = self.hparams
 
         original = x
@@ -107,9 +119,17 @@ class FunnelTransformer(nn.Module):
             attn_state.configure_for_input(x.shape[-2], x.dtype, x.device, padding_mask)
 
         hidden_states = []
-        cross_attn_keys = None
         layer_iter = iter(self.layers)
         q = kv = x
+
+        # We have a possibly empty list of tensors that we can cross-attend to, and every time we run into a
+        # FunnelLayer that supports cross attention we pop a tensor off the list and have it attend to that
+        if cross_attn_target is None:
+            cross_attn_target = []
+        elif not isinstance(cross_attn_target, list):
+            cross_attn_target = [cross_attn_target]
+
+        cross_attn_iter = iter(cross_attn_target)
 
         last_block = len(self.hparams.block_sizes) - 1
         for block_idx, block_size in enumerate(self.hparams.block_sizes):
@@ -118,28 +138,23 @@ class FunnelTransformer(nn.Module):
                 attn_state.block_begin_flag = (rel_layer_idx == 0)
                 layer = next(layer_iter)
 
-                q = kv = layer(q, kv, attn_state, cross_attn_keys=cross_attn_keys)
+                x_attn_target = next(cross_attn_iter, None) if layer.use_cross_attention else None
+                q = kv = layer(q, kv, attn_state, cross_attn_keys=x_attn_target)
                 attn_state.block_begin_flag = False
-
-            # We don't need to do any of this stuff if we just finished the last block
-            if block_idx == last_block:
-                break
 
             # Cache block outputs if indicated
             if hparams.return_block_outputs:
                 hidden_states.append(kv)
 
+            # We don't need to do any of this stuff if we just finished the last block
+            if block_idx == last_block:
+                break
+
             q = attn_state.maybe_scale_input(kv)
 
             # The consumer of this generator may or may not send us anything
-            cross_attn_keys = None
             maybe_transformed_q = yield block_idx, q
             if maybe_transformed_q is not None:
-                # The consumer may have sent us a tuple of the form (qkv, cross attention target)
-                if isinstance(maybe_transformed_q, tuple):
-                    cross_attn_keys = maybe_transformed_q[1]
-                    maybe_transformed_q = maybe_transformed_q[0]
-
                 q = kv = maybe_transformed_q
                 yield  # Don't return anything from the .send() method
 
@@ -257,7 +272,7 @@ class FunnelLayer(nn.Module):
         super().__init__()
 
         # d_model = hparams.d_model
-        if hparams.positional_encoding_type in ('absolute', 'learned'):
+        if hparams.positional_encoding_type == 'absolute':
             raise NotImplementedError
             # raw_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=hparams.num_heads)
 #

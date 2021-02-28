@@ -1,11 +1,11 @@
 from .HierarchicalAutoencoder import *
-from .core import Quantizer
+from .core import Quantizer, QuantizerOutput, QuantizedVAE, QuantizedVAEHparams
 from torch.distributions import Categorical
 
 
 @dataclass
-class QuantizedHierarchicalVAEHparams(HierarchicalAutoencoderHparams):
-    codebook_size: int = 512
+class QuantizedHierarchicalVAEHparams(HierarchicalAutoencoderHparams, QuantizedVAEHparams):
+    pass
 
 
 @dataclass
@@ -17,7 +17,7 @@ class QuantizerHierarchicalVAEState(HierarchicalAutoencoderState):
     p_of_x_given_z: Optional[Categorical] = None
 
 
-class QuantizedHierarchicalVAE(HierarchicalAutoencoder):
+class QuantizedHierarchicalVAE(HierarchicalAutoencoder, QuantizedVAE):
     def __init__(self, hparams: DictConfig):
         super(QuantizedHierarchicalVAE, self).__init__(hparams)
 
@@ -29,14 +29,18 @@ class QuantizedHierarchicalVAE(HierarchicalAutoencoder):
     def quantizing(self) -> bool:
         return not self.training or self.trainer.current_epoch > 0
 
+    def forward(self, batch: Dict[str, Tensor]) -> QuantizerOutput:
+        encoder_out = self.encoder_forward(batch)
+        return self.quantizer(encoder_out.final_state, level=0, quantize=True)
+
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, **kwargs) -> Dict[str, Tensor]:
         # First epoch: just use the soft codes and train as a continuous, non-variational autoencoder
         encoder_out = self.encoder_forward(batch)
-        quantizer_out = self.quantizer(encoder_out.final_state, level=0, quantize=self.quantizing)
+        quant_out = self.quantizer(encoder_out.final_state, level=0, quantize=self.quantizing)
 
         vae_state = QuantizerHierarchicalVAEState()
         vae_state.ground_truth = encoder_out.original_ids
-        vae_state.decoder_input = self.quantizer.upsample_codes(quantizer_out.hard_codes, level=0)
+        vae_state.decoder_input = self.quantizer.upsample_codes(quant_out.hard_codes, level=0)
         vae_state.encoder_states = encoder_out.hidden_states[-2::-1]
         vae_state = self.decoder_forward(vae_state, padding_mask=batch['padding_mask'])
 
@@ -47,7 +51,10 @@ class QuantizedHierarchicalVAE(HierarchicalAutoencoder):
             log_probs = log_probs.where(original_ids.unsqueeze(-1) != 0, 0.0)
 
         vae_state.stats['nll'] = -log_probs.flatten(start_dim=1).sum(dim=-1)
-        return vae_state
+        return {
+            'logits': vae_state.p_of_x_given_z.logits,
+            'loss': vae_state.stats['nll'] + quant_out.embedding_loss + self.hparams.beta * quant_out.commitment_loss
+        }
 
     def decoder_block_end(self, vae_state: Any, dec_state: Tensor, enc_state: Tensor, block_idx: int, **kwargs):
         # We're gonna try just adding together the encoder and decoder states here- it might be better

@@ -12,7 +12,10 @@ class ReconstructionSampler(AutoencoderCallback):
             return
 
         # Weirdly PL wraps the actual training_step output in two lists and a dict
-        outputs = outputs[0][0]['extra']
+        outputs = outputs[0][0]
+        if 'extra' in outputs:
+            outputs = outputs['extra']
+
         if (logits := outputs.get('logits')) is not None:
             dist = Categorical(logits=logits)
         else:

@@ -1,22 +1,19 @@
 from dataclasses import dataclass  # noqa; here to silence PyCharm linter bug
-from .core.Autoencoder import *
-from .core.Quantizer import *
+from .core import (
+    TransformerLayer, positional_encodings_like,
+    Quantizer, QuantizerOutput, QuantizedVAE, QuantizedVAEHparams
+)
 from .core.TransformerLanguageModel import *
 
 
 @dataclass
-class QuantizedVAEHparams(TransformerLanguageModelHparams, AutoencoderHparams):
-    codebook_size: int = 512
-    beta: float = 0.5
+class SimpleQuantizedVAEHparams(TransformerLanguageModelHparams, QuantizedVAEHparams):
     ema_decay: float = 0.99
-    use_kmeans_codebook_updates: bool = True
-    input_dropout: float = 0.5
-    output_dropout: float = 0.5
 
 
-class QuantizedVAE(TransformerLanguageModel):
+class SimpleQuantizedVAE(TransformerLanguageModel, QuantizedVAE):
     def __init__(self, hparams: DictConfig):
-        super(QuantizedVAE, self).__init__(hparams)
+        super(SimpleQuantizedVAE, self).__init__(hparams)
 
         num_codes = hparams.codebook_size
         self.quantizer = Quantizer(num_codes, hparams.latent_depth, hparams.d_model)
@@ -27,17 +24,17 @@ class QuantizedVAE(TransformerLanguageModel):
             for _ in range(self.hparams.num_layers)
         ])
 
-    # Returns a tuple containing the encoder output and the quantized codes
+    # Returns a dataclass containing the encoder output and the quantized codes
     def forward(self, batch: Dict[str, Any], quantize: bool = False) -> QuantizerOutput:
         x = self.preprocess(batch)
         return self.encoder_forward(x, batch['padding_mask'], quantize=quantize)
 
-    def preprocess(self, batch: Dict[str, Any]) -> FloatTensor:
+    def preprocess(self, batch: Dict[str, Any]) -> Tensor:
         x = batch['token_ids']
         x = self.input_layer(x)
         return x + positional_encodings_like(x)
 
-    def encoder_forward(self, x: FloatTensor, padding_mask: FloatTensor, quantize: bool = True):
+    def encoder_forward(self, x: Tensor, padding_mask: Tensor, quantize: bool = True):
         for layer in self.encoder:
             x = layer(x, padding_mask=padding_mask)
 
@@ -102,12 +99,6 @@ class QuantizedVAE(TransformerLanguageModel):
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Dict[str, Tensor]:
         return self.training_step(batch, batch_index, log_prefix='val_', loss_only=True)
 
-    def validation_epoch_end(self, outputs: List[Any]) -> None:
-        if self.trainer.running_sanity_check or not self.hparams.use_kmeans_codebook_updates:
-            return
-
-        self.update_codebook_kmeans()
-
     def compute_posteriors(self, batch: Dict[str, Tensor]) -> List[Tensor]:
         batched_codes = self.forward(batch).code_indices
         return batched_codes.split(1, dim=0)
@@ -125,18 +116,3 @@ class QuantizedVAE(TransformerLanguageModel):
 
         codes = self.quantizer.lookup_codes(code_indices)
         return super().sample(max_length, count, start_embedding=codes, strategy=GenerationStrategy.Greedy, **kwargs)
-
-    @torch.no_grad()
-    def update_codebook_kmeans(self):
-        self.print("\nPerforming K means codebook update...")
-
-        # Do encoder forward passes through the entire training dataset in order to gather the soft codes
-        loader = self.trainer.train_dataloader
-        loader = tqdm(islice(loader, len(loader)), desc='Gathering encoder outputs', total=len(loader))
-        observed_codes = [self.forward(
-            {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()},
-            quantize=False
-        ).soft_codes for batch in loader]
-
-        self.quantizer.perform_kmeans_update(torch.cat(observed_codes, dim=0))
-        self.code_frequencies.zero_()
