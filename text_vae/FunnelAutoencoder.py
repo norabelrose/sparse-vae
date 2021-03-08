@@ -11,6 +11,7 @@ class FunnelAutoencoderHparams(AutoencoderHparams):
         block_sizes=(2, 2, 2),  # Number of layers in each encoder block; reversed for the decoder
         scaling_factors=(4, 2),  # How much the hidden state is downsampled between each encoder block
     )
+    logit_scale_factor: Optional[float] = None  # If None defaults to 1/sqrt(d_model)
     tie_embedding_weights: bool = True
     use_pretrained_encoder: bool = False
 
@@ -36,16 +37,17 @@ class FunnelAutoencoder(Autoencoder, ABC):
         self.encoder.attention_state = attn_state
         self.decoder.attention_state = attn_state
 
+        logit_scale = hparams.logit_scale_factor or encoder_hparams.d_model ** -0.5
         output_embedding = nn.Linear(encoder_hparams.d_model, hparams.vocab_size)
         self.output_layer = nn.Sequential(
             nn.Linear(encoder_hparams.d_model, encoder_hparams.d_model),
             nn.GELU(),
             nn.LayerNorm(encoder_hparams.d_model),
             output_embedding,
-            LambdaLayer(lambda logits: logits * encoder_hparams.d_model ** -0.5)
+            LambdaLayer(lambda logits: logits * logit_scale)
         )
 
-        if hparams.encoder.positional_encoding_type == 'learned':
+        if hparams.encoder.positional_attention_type == 'learned':
             self.positional_encodings = nn.Embedding(192, encoder_hparams.d_model)
             attn_state.learned_pos_encodings = self.positional_encodings.weight
 

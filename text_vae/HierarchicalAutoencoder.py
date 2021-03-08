@@ -14,6 +14,7 @@ class HierarchicalAutoencoderState:
     ground_truth: Optional[Tensor] = None
     decoder_input: Optional[Tensor] = None
     encoder_states: List[Tensor] = field(default_factory=list)
+    p_of_x_given_z: Optional[Categorical] = None
 
 
 class HierarchicalAutoencoder(FunnelAutoencoder, ABC):

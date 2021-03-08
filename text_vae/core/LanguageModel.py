@@ -20,6 +20,8 @@ class LanguageModelHparams(ABC):
     lr_decay_steps: Optional[int] = 150_000
     vocab_size: int = 30522
     warmup_steps: int = 1000
+    adam_beta1: float = 0.9
+    adam_eps: float = 1e-8
     weight_decay: float = 0.01
 
 
@@ -29,14 +31,15 @@ class LanguageModel(pl.LightningModule, ABC):
         super(LanguageModel, self).__init__()
         self.save_hyperparameters(hparams)
 
-        # self.example_input_array = {'batch': {
-        #     'token_ids': torch.zeros(1, 192, dtype=torch.long),
-        #     'padding_mask': torch.zeros(1, 192, dtype=torch.float)}
-        # }
+        self.example_input_array = {'batch': {
+            'token_ids': torch.zeros(1, 192, dtype=torch.long),
+            'padding_mask': torch.zeros(1, 192, dtype=torch.float)}
+        }
+        self.tokenizer = None
         self.start_token = None
         self.end_token = None
 
-    # The callbacks need to have access to a tokenizer, so let's get a reference to the datamodule's tokenizer
+    # The callbacks need to have access to a tokenizer, so let's get a reference to the datamodule's tokenizer.
     def on_train_start(self):
         self.tokenizer = self.trainer.datamodule.tokenizer
 
@@ -46,7 +49,13 @@ class LanguageModel(pl.LightningModule, ABC):
             self.end_token = vocab['[SEP]']
 
     def configure_optimizers(self):
-        adam = AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        adam = AdamW(
+            self.parameters(),
+            lr=self.hparams.lr,
+            betas=(self.hparams.adam_beta1, 0.999),
+            weight_decay=self.hparams.weight_decay,
+            eps=self.hparams.adam_eps
+        )
         lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, self.hparams.warmup_steps)
 
         return [adam], [{

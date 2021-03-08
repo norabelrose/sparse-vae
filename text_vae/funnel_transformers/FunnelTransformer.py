@@ -1,5 +1,5 @@
 from text_vae.funnel_transformers.AttentionState import *
-from text_vae.funnel_transformers.ops import AttentionHparams, PositionwiseFFN, RelativePositionalAttention
+from text_vae.funnel_transformers.FunnelOps import AttentionHparams, PositionwiseFFN, FunnelAttention
 from text_vae.funnel_transformers.RemoteModels import *
 from text_vae.core.Utilities import *
 from dataclasses import dataclass, field
@@ -40,7 +40,7 @@ class FunnelTransformerOutput:
 
 
 class FunnelTransformer(nn.Module):
-    def __init__(self, hparams: Union[FunnelTransformerHparams, OmegaConf]):
+    def __init__(self, hparams: Union[FunnelTransformerHparams, DictConfig]):
         super().__init__()
 
         if isinstance(hparams, FunnelTransformerHparams):
@@ -54,7 +54,7 @@ class FunnelTransformer(nn.Module):
         if not hparams.upsampling and hparams.use_embedding:
             input_modules = [
                 nn.Embedding(hparams.vocab_size, hparams.d_embedding),
-                nn.LayerNorm(hparams.d_model, eps=hparams.layer_norm_eps),
+                nn.LayerNorm(hparams.d_embedding, eps=hparams.layer_norm_eps),
                 nn.Dropout(hparams.dropout)
             ]
 
@@ -64,7 +64,7 @@ class FunnelTransformer(nn.Module):
             # but shares embeddings with the discriminator.
             if hparams.d_embedding != hparams.d_model:
                 input_projection = nn.Linear(hparams.d_embedding, hparams.d_model)
-                input_modules.insert(1, input_projection)
+                input_modules.insert(2, input_projection)
 
             self.input_layer = nn.Sequential(*input_modules)
 
@@ -72,7 +72,18 @@ class FunnelTransformer(nn.Module):
             FunnelLayer(hparams)
             for _ in range(sum(hparams.block_sizes))
         ])
-        self.attention_state = None  # Lazily loaded
+        self._attention_state = None
+
+    @property
+    def attention_state(self) -> AttentionState:
+        if not self._attention_state:
+            self._attention_state = AttentionState(self.hparams)
+
+        return self._attention_state
+
+    @attention_state.setter
+    def attention_state(self, value: AttentionState):
+        self._attention_state = value
 
     def layer_with_indices(self, block_idx: int, layer_idx: int) -> 'FunnelLayer':
         layer_iter = iter(self.layers)
@@ -93,30 +104,26 @@ class FunnelTransformer(nn.Module):
                 param.data *= depth ** -0.5
 
     # Vanilla function wrapper for forward_coroutine()
-    def forward(self, x: Tensor, padding_mask: Optional[Tensor] = None,
-                cross_attn_target: Optional[Tensor] = None) -> FunnelTransformerOutput:
-        coroutine = self.forward_coroutine(x, padding_mask=padding_mask, cross_attn_target=cross_attn_target)
+    def forward(self, x: Tensor, **kwargs) -> FunnelTransformerOutput:
+        coroutine = self.forward_coroutine(x, **kwargs)
         return [x for x in coroutine][-1][-1]  # noqa
 
     # Yields specified hidden states as they are generated while processing the input x, along with the absolute indices
     # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
     # versions of these hidden states, which are then used as the input to the next layer in the Transformer.
-    def forward_coroutine(self, x: Tensor, padding_mask: Optional[Tensor] = None,
+    def forward_coroutine(self, x: Tensor, padding_mask: Optional[Tensor] = None, segment_ids: Optional[Tensor] = None,
                           cross_attn_target: Optional[Union[Tensor, List[Tensor]]] = None):
+        attn_state = self.attention_state
         hparams = self.hparams
 
         original = x
         if not hparams.upsampling and hparams.use_embedding:
             x = self.input_layer(x)  # x.shape == (...length, d_model)
 
-        # This lazy loading allows the user to give us a pre-initialized, possibly shared AttentionState object
-        if not (attn_state := self.attention_state):
-            attn_state = self.attention_state = AttentionState(hparams)
-
         # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
         # for the current input, because that could result in it getting configured twice
         if not attn_state.shared:
-            attn_state.configure_for_input(x.shape[-2], x.dtype, x.device, padding_mask)
+            attn_state.configure_for_input(x.shape[-2], x.dtype, x.device, padding_mask, segment_ids)
 
         hidden_states = []
         layer_iter = iter(self.layers)
@@ -240,7 +247,7 @@ class FunnelTransformer(nn.Module):
     def get_backward_compatible_args(self) -> AttributeDict:
         return transmute(
             self.hparams,
-            attn_type='positional_encoding_type',
+            attn_type='positional_attention_type',
             num_class='0',
             pad_id='None',
             seg_id_cls='2',
@@ -272,32 +279,7 @@ class FunnelLayer(nn.Module):
         super().__init__()
 
         # d_model = hparams.d_model
-        if hparams.positional_encoding_type == 'absolute':
-            raise NotImplementedError
-            # raw_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=hparams.num_heads)
-#
-            # # Wrap the raw attention module with this function that adds the positional encodings to the queries and
-            # # keys, but not to the values, as proposed in the Shortformer paper
-            # def absolute_pos_attn_func(q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState):
-            #     q_pos_encodings, k_pos_encodings = attn_state.get_positional_encodings()
-            #     padding_mask = attn_state.get_padding_mask(for_key=True)
-            #     # breakpoint()
-            #     q = q + q_pos_encodings
-            #     k = k + k_pos_encodings
-            #     v = v + k_pos_encodings
-#
-            #     # Annoyingly, MultiheadAttention expects the batch dimension to be at index 1
-            #     q, k, v = (x.permute(1, 0, 2) for x in (q, k, v))
-            #     q, k, v = (x.permute(1, 0, 2) for x in (q, k, v))
-            #     return raw_attn(q, k, v, key_padding_mask=padding_mask, need_weights=False)[0].permute(1, 0, 2)
-#
-            # self.attention = absolute_pos_attn_func
-            # self.raw_attn = raw_attn
-
-        # Either softmax or Performer attention with relative positional embeddings
-        else:
-            self.attention = RelativePositionalAttention(hparams)
-
+        self.attention = FunnelAttention(hparams)
         self.causal = causal
         self.cross_attention = use_cross_attention
         self.hparams = hparams
@@ -310,7 +292,7 @@ class FunnelLayer(nn.Module):
 
     @use_cross_attention.setter
     def use_cross_attention(self, value: bool):
-        self.cross_attention = RelativePositionalAttention(self.hparams) if value else None
+        self.cross_attention = FunnelAttention(self.hparams) if value else None
 
     # Q is different from K and V right after pooling; K and V are always the same
     def forward(self, q: Tensor, kv: Tensor, attn_state: AttentionState, cross_attn_keys: Tensor = None) -> Tensor:

@@ -9,7 +9,7 @@ from survae.transforms import (
 from text_vae.funnel_transformers.AttentionState import AttentionState
 from text_vae.core.LanguageModel import *
 from .EmbeddingSurjection import *
-from text_vae.funnel_transformers.ops import AttentionHparams, RelativePositionalAttention
+from text_vae.funnel_transformers.FunnelOps import AttentionHparams, FunnelAttention
 from .Stride import *
 
 
@@ -112,7 +112,7 @@ class MultiHeadTransformerLayer(nn.Module):
         super(MultiHeadTransformerLayer, self).__init__()
         d_model = hparams.d_model
 
-        self.attention = RelativePositionalAttention(hparams)
+        self.attention = FunnelAttention(hparams)
         self.attn_state = attn_state
         self.dropout = nn.Dropout(p=0.1)
         self.attn_layer_norm = nn.LayerNorm(d_model)

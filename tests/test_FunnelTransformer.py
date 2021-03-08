@@ -44,10 +44,15 @@ class TestFunnelTransformer(unittest.TestCase):
             exec(file_text, globals())  # Load everything
         
         with torch.cuda.device(0) if torch.cuda.is_available() else nullcontext(), torch.no_grad():
-            for positional_encoding_type in ("factorized", "rel_shift"):
+            seg_ids = torch.cat([
+                torch.zeros(1, 256),
+                torch.ones(1, 256)
+            ], dim=-1)
+            for positional_attention_type in ("factorized", "rel_shift"):
                 new_model = FunnelTransformer(FunnelTransformerHparams(
-                    positional_encoding_type=positional_encoding_type,
-                    return_block_outputs=True
+                    positional_attention_type=positional_attention_type,
+                    return_block_outputs=True,
+                    use_segment_attention=True
                 ))
                 new_model.load_pretrained_weights()
                 new_model.eval()
@@ -69,12 +74,12 @@ class TestFunnelTransformer(unittest.TestCase):
                 # Tokens below 999 are either unused or are special tokens like [CLS] and [MASK]
                 inputs = torch.randint(low=999, high=new_config.vocab_size, size=(1, 512))
                 
-                output_old = old_model(inputs)
-                output_new = new_model({'input': inputs})
+                output_old = old_model(inputs, seg_id=seg_ids)
+                output_new = new_model(inputs, segment_ids=seg_ids)
                 mean_err = torch.mean(abs(output_old[0][-1] - output_new.final_state))
         
                 print('Mean absolute error: ', mean_err.item())
                 print('Old output: ', output_old[0][4::4])
                 print('New output: ', output_new)
-                with self.subTest(positional_encoding_type):
+                with self.subTest(positional_attention_type):
                     self.assertTrue(mean_err < 1e-4)

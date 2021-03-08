@@ -27,7 +27,7 @@ class ContinuousHierarchicalVAE(HierarchicalAutoencoder, ContinuousVAE):
         super(ContinuousHierarchicalVAE, self).__init__(hparams)
 
         encoder_hparams = hparams.encoder
-        num_latent_scales = len(encoder_hparams.scaling_factors)
+        num_latent_scales = len(encoder_hparams.block_sizes)
 
         self.samplers = nn.ModuleList([
             ContinuousLatentSampler(
@@ -97,7 +97,7 @@ class ContinuousHierarchicalVAE(HierarchicalAutoencoder, ContinuousVAE):
         vae_state = ContinuousHierarchicalVAEState()
         vae_state.ground_truth = encoder_output.original_ids
         vae_state.decoder_input = self.samplers[0](encoder_output.final_state, vae_state)
-        vae_state.encoder_states = encoder_output.hidden_states[:0:-1]
+        vae_state.encoder_states = encoder_output.hidden_states[-2::-1]
 
         vae_state = self.decoder_forward(vae_state, **kwargs)
 

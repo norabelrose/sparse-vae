@@ -33,40 +33,47 @@ def main(args):
         'trainer': {
             # 'auto_select_gpus': gpu_available,
             'gpus': int(gpu_available),
+            'precision': 16,
             'num_sanity_val_steps': 0
         }
     })
     data_class = TextDataModule
+    data_hparam_class = TextDataModuleHparams
     hparam_class = None
     model_class = None
     experiment = None
 
-    if model_str == 'funnel':
-        data_class = FunnelPreTrainingDataModule
-        hparam_class = FunnelTransformerHparams
-        model_class = FunnelForPreTraining
-        experiment = 'funnel-transformer'
+    if model_str == 'electra':
+        data_class = ElectraDataModule
+        data_hparam_class = MLMDataModuleHparams
+        hparam_class = ElectraModelHparams
+        model_class = ElectraModel
+        experiment = 'electra'
 
     elif model_str == 'hvae':
         hparam_class = ContinuousHierarchicalVAEHparams
         model_class = ContinuousHierarchicalVAE
         experiment = 'hierarchical-vae'
 
-    elif model_str == 'adv-ae':
+    elif model_str in ('adv-ae', 'daae'):
         hparam_class = AdversarialAutoencoderHparams
         model_class = AdversarialAutoencoder
-        experiment = 'adv-ae'
+        experiment = model_str
+
+        if model_str == 'daae':
+            data_class = MLMDataModule
+            data_hparam_class = MLMDataModuleHparams
 
     elif model_str == 'ar-vae':
         hparam_class = AutoregressiveAutoencoderHparams
         model_class = AutoregressiveAutoencoder
         experiment = 'ar-vae'
 
-    elif model_str == 'flow':
-        hparam_class = TextFlowHparams
-        model_class = TextFlow
-        config.unconditional_sampler = True
-        experiment = 'flow'
+    # elif model_str == 'flow':
+    #     hparam_class = TextFlowHparams
+    #     model_class = TextFlow
+    #     config.unconditional_sampler = True
+    #     experiment = 'flow'
 
     elif model_str == 'lstm':
         hparam_class = LSTMAutoencoderHparams
@@ -84,8 +91,8 @@ def main(args):
         experiment = 'transformer-lm'
 
     elif model_str == 'vq-vae':
-        hparam_class = SimpleQuantizedVAEHparams
-        model_class = SimpleQuantizedVAE
+        hparam_class = QuantizedHierarchicalVAEHparams
+        model_class = QuantizedHierarchicalVAE
         experiment = 'vq-vae'
     else:
         exit(1)
@@ -93,15 +100,13 @@ def main(args):
     # Turn these callbacks on by default for VAEs
     if issubclass(model_class, ContinuousVAE):
         config.update(kl_annealing=True)
-    else:
-        config.trainer.update(precision=16)  # Any model other than a continuous VAE should be able to handle AMP
 
     if issubclass(model_class, Autoencoder):
         config.update(reconstruction_sampler=True)
     if issubclass(model_class, LanguageModel):
         config.update(unconditional_sampler=True)
 
-    config.data = OmegaConf.structured(TextDataModuleHparams)
+    config.data = OmegaConf.structured(data_hparam_class)
     config.model = OmegaConf.structured(hparam_class)
     config.merge_with_dotlist(args[2:])
 
@@ -109,9 +114,9 @@ def main(args):
         torch.autograd.set_detect_anomaly(True)
 
     if command == 'train':
-        if config.get('retrain_tokenizer'):
-            tokenizer = BertWordPieceTokenizer()
-            tokenizer.train_from_iterator()
+        # if config.get('retrain_tokenizer'):
+        #     tokenizer = BertWordPieceTokenizer()
+        #     tokenizer.train_from_iterator()
 
         print(f"Training {experiment}...")
         if ckpt_name := config.get('from_checkpoint'):
@@ -141,7 +146,6 @@ def main(args):
         run_hparam_search(OmegaConf.from_dotlist(args[2:]))
         return
 
-    # warnings.filterwarnings('ignore', message='', module='torch')
     model = model_class(config.model)
     data = data_class(hparams=config.data)
 

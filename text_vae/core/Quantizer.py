@@ -40,6 +40,10 @@ class Quantizer(nn.Module):
             self.downsamplers = None
             self.upsamplers = None
 
+    @property
+    def num_levels(self) -> int:
+        return self.codebook.shape[0]
+
     def forward(self, x: FloatTensor, level: int = 0, quantize: bool = True) -> QuantizerOutput:
         if self.downsamplers:
             x = self.downsamplers[level](x)
@@ -69,16 +73,19 @@ class Quantizer(nn.Module):
         return self.upsamplers[level](x)
 
     @torch.no_grad()
-    def perform_kmeans_update(self, soft_codes: Union[Tensor, List[Tensor]], num_restarts: int = 3):
+    def perform_kmeans_update(self, soft_codes: Union[Tensor, Sequence[Tensor]], num_restarts: int = 3):
         best_codebooks = self.codebook.data
-        cur_codebooks = torch.empty_like(best_codebooks)
+
+        # We do the whole K means algorithm in half precision because we don't need to be super accurate and this
+        # can be a very memory-intensive operation
+        cur_codebooks = torch.empty_like(best_codebooks, dtype=torch.float16)
         num_levels, num_codes, code_depth = best_codebooks.shape
 
         # Make sure this is always a list so that the code below can be generic
-        if not isinstance(soft_codes, list):
+        if not isinstance(soft_codes, Sequence):
             soft_codes = [soft_codes]
 
-        soft_codes = [x.flatten(end_dim=-2) for x in soft_codes]  # noqa
+        # soft_codes = [x.flatten(end_dim=-2) for x in soft_codes]  # noqa
         codes_per_cluster = [x.shape[0] / num_codes for x in soft_codes]
         min_codes_per_cluster = min(codes_per_cluster)
         max_codes_per_cluster = max(codes_per_cluster)
@@ -86,7 +93,7 @@ class Quantizer(nn.Module):
         assert min_codes_per_cluster > 1.0, "Not enough soft codes to perform K means codebook update"
         assert len(soft_codes) == num_levels, "Number of soft codes doesn't match number of levels in the codebook"
 
-        best_losses = [float('inf')] * self.codebook.shape[0]
+        best_losses = torch.full((self.num_levels,), float('inf'))
         max_iter = min(100, int(ceil(max_codes_per_cluster)))
         pbar = tqdm(total=max_iter * num_restarts, postfix=dict(best_loss=float('inf')))
 
@@ -100,17 +107,31 @@ class Quantizer(nn.Module):
             for _ in range(max_iter):
                 for level, level_soft_codes in enumerate(soft_codes):
                     cur_codebook = cur_codebooks[level]
-                    hard_code_indices = torch.cdist(level_soft_codes, cur_codebook).argmin(dim=-1)
-
-                    # Sum together all the soft codes assigned to a cluster, then divide by the number in that cluster
-                    counts = hard_code_indices.bincount(minlength=num_codes)
+                    distances, centroid_indices = torch.cdist(level_soft_codes, cur_codebook).min(dim=-1)
                     cur_codebook.zero_()
+
+                    # Sum together the soft codes assigned to a cluster, then divide by the number in that cluster
+                    counts = centroid_indices.bincount(minlength=num_codes)
+
+                    # Check for centroids to which zero points were assigned
+                    lonely_centroid_mask = counts.eq(0)
+                    counts[lonely_centroid_mask] = 1  # Avoid NaNs
+
                     cur_codebook.scatter_add_(
                         dim=0,
-                        index=hard_code_indices[:, None].repeat(1, code_depth),
+                        index=centroid_indices[:, None].repeat(1, code_depth),
                         src=level_soft_codes
                     )
                     cur_codebook /= counts.unsqueeze(-1)
+
+                    # Replace the lonely centroids with the top K points most distant from their assigned centroids
+                    num_lonely_centroids = lonely_centroid_mask.sum()
+                    if num_lonely_centroids:
+                        furthest_indices = distances.topk(num_lonely_centroids).indices
+                        cur_codebook.masked_scatter_(
+                            mask=lonely_centroid_mask[:, None],
+                            source=level_soft_codes[furthest_indices]
+                        )
 
                 pbar.update()
 
@@ -119,9 +140,9 @@ class Quantizer(nn.Module):
                 cur_loss = torch.cdist(x, cur_codebook).min(dim=-1).values.pow(2.0).mean() / code_depth  # MSE
 
                 if cur_loss < best_losses[level]:
-                    best_codebooks[level] = cur_codebook
+                    best_codebooks[level] = cur_codebook.type_as(best_codebooks)
                     best_losses[level] = cur_loss
 
-            pbar.set_postfix(best_loss=sum(best_losses) / len(best_losses))
+            pbar.set_postfix(best_loss=best_losses.mean().item())
 
         pbar.close()

@@ -1,6 +1,5 @@
 from abc import abstractmethod
 from torch.distributions import Normal
-from ..TextDataModule import *
 from .LanguageModel import *
 
 
@@ -13,7 +12,7 @@ class Autoencoder(LanguageModel, ABC):
     def compute_latents(self, batch: Dict[str, Any]) -> Any:
         raise NotImplementedError
 
-    def extract_posteriors_for_dataset(self, datamodule: TextDataModule):
+    def extract_posteriors_for_dataset(self, datamodule):
         batch_sz = datamodule.batch_size
         dataset = datamodule.dataset
         dataset.set_format('torch')  # Makes the dataset yield PyTorch tensors

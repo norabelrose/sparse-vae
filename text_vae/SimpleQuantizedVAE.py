@@ -1,4 +1,6 @@
 from dataclasses import dataclass  # noqa; here to silence PyCharm linter bug
+from itertools import islice
+from tqdm import tqdm
 from .core import (
     TransformerLayer, positional_encodings_like,
     Quantizer, QuantizerOutput, QuantizedVAE, QuantizedVAEHparams
@@ -54,12 +56,11 @@ class SimpleQuantizedVAE(TransformerLanguageModel, QuantizedVAE):
         encoder_input = self.preprocess(batch)
 
         # First epoch: just use the soft codes and train as a continuous, non-variational autoencoder
-        should_quantize = self.trainer.current_epoch > 0
-        quantized = self.encoder_forward(encoder_input, padding_mask=batch['padding_mask'], quantize=should_quantize)
+        quantized = self.encoder_forward(encoder_input, padding_mask=batch['padding_mask'], quantize=self.quantizing)
 
         decoder_input = encoder_input
         log_prefix = kwargs.get('log_prefix') or 'train_'
-        if not should_quantize:
+        if not self.quantizing:
             decoder_input[:, 0] = self.quantizer.upsample_codes(quantized.soft_codes)
 
         # After the first epoch, ease into using the hard codes
@@ -116,3 +117,18 @@ class SimpleQuantizedVAE(TransformerLanguageModel, QuantizedVAE):
 
         codes = self.quantizer.lookup_codes(code_indices)
         return super().sample(max_length, count, start_embedding=codes, strategy=GenerationStrategy.Greedy, **kwargs)
+
+    @torch.no_grad()
+    def update_codebook_kmeans(self):
+        self.print("\nPerforming K means codebook update...")
+
+        # Do encoder forward passes through the entire training dataset in order to gather the soft codes
+        loader = self.trainer.train_dataloader
+        loader = tqdm(islice(loader, len(loader)), desc='Gathering encoder outputs', total=len(loader))
+        observed_codes = [self.forward(
+            {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()},
+            quantize=False
+        ).soft_codes for batch in loader]
+
+        self.quantizer.perform_kmeans_update(torch.cat(observed_codes, dim=0))
+        self.code_frequencies.zero_()
