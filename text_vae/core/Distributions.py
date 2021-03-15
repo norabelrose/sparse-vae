@@ -1,19 +1,13 @@
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import *
-
 from torch import nn, Tensor
-from torch.distributions import Normal, Gamma
+from torch.distributions import Normal
+import torch
 
 
-class ConditionalDistribution(nn.Module, ABC):
-    num_params = 2
-    torch_distribution = None
-
+class ConditionalGaussian(nn.Module):
     def __init__(self, in_features: int, out_features: int, reduce_dim: int = None, zero_initialized: bool = False):
-        super(ConditionalDistribution, self).__init__()
+        super(ConditionalGaussian, self).__init__()
 
-        linear = nn.Linear(in_features, out_features * self.num_params)
+        linear = nn.Linear(in_features, out_features * 2)
         if zero_initialized:
             linear.bias.data.zero_()
             linear.weight.data.zero_()
@@ -22,56 +16,55 @@ class ConditionalDistribution(nn.Module, ABC):
         self.reduce_dim = reduce_dim
 
     def forward(self, x: Tensor, temperature: float = 1.0) -> Normal:
-        params = self.linear(x).chunk(2, dim=-1)
+        mu, logsigma = self.linear(x).chunk(2, dim=-1)
         if self.reduce_dim is not None:
-            params = [param.mean(dim=self.reduce_dim) for param in params]
+            mu = mu.mean(dim=self.reduce_dim)
+            logsigma = logsigma.mean(dim=self.reduce_dim)
 
-        params = self.transform_parameters(params, temperature)  # noqa
-        return self.torch_distribution(*params)
-
-    # Convert the raw output of the Linear layer into something that we can pass to the PyTorch Distribution object
-    @abstractmethod
-    def transform_parameters(self, params: List[Tensor], temperature: float):
-        raise NotImplementedError
+        return Normal(loc=mu, scale=logsigma.exp() * temperature)
 
 
-class ConditionalGaussian(ConditionalDistribution):
-    torch_distribution = Normal
+class AutoregressiveGaussian(nn.Module):
+    def __init__(self, num_features: int, stepwise_noise: bool = True):
+        super(AutoregressiveGaussian, self).__init__()
 
-    def transform_parameters(self, params: List[Tensor], temperature: float):
-        return params[0], params[1].exp() * temperature  # mu, logsigma -> mu, sigma
-
-
-class ConditionalGamma(ConditionalDistribution):
-    torch_distribution = Gamma
-
-    def transform_parameters(self, params: List[Tensor], temperature: float):
-        return params[0].exp(), params[1].exp() * temperature  # logalpha, logbeta -> alpha, beta
-
-
-@dataclass
-class NormalGamma:
-    mean_distribution: Normal
-    precision_distribution: Gamma
-
-    def log_prob(self, dist: Normal) -> Tensor:
-        mu_log_prob = self.mean_distribution.log_prob(dist.mean)
-        lambda_log_prob = self.precision_distribution.log_prob(dist.scale ** -2.0)
-        return mu_log_prob + lambda_log_prob
-
-    def rsample(self, sample_shape: Sequence[int] = None) -> Normal:
-        mean = self.mean_distribution.rsample(sample_shape)
-        precision = self.precision_distribution.rsample(sample_shape)
-
-        return Normal(loc=mean, scale=precision ** -0.5)
-
-class ConditionalNormalGamma:
-    def __init__(self, in_features: int, out_features: int, reduce_dim: int = None, zero_initialized: bool = False):
-        self.mu_distribution = ConditionalGaussian(in_features, out_features, reduce_dim, zero_initialized)
-        self.sigma_distribution = ConditionalGamma(in_features, out_features, reduce_dim, zero_initialized)
-
-    def forward(self, x: Tensor, temperature: float = 1.0) -> NormalGamma:
-        return NormalGamma(
-            self.mu_distribution(x, temperature),
-            self.sigma_distribution(x, temperature)
+        inner_depth = num_features * 2
+        self.num_features = num_features
+        self.noise_mlp = nn.Sequential(
+            nn.Linear(num_features, num_features),
+            nn.GELU(),
+            nn.Linear(num_features, num_features),
+            nn.GELU(),
+            nn.Linear(num_features, num_features)
         )
+        self.hidden_linear = nn.Linear(num_features, inner_depth)
+        self.output_linear = nn.Linear(inner_depth, num_features)
+        self.lstm = nn.LSTM(input_size=num_features, hidden_size=inner_depth, batch_first=True)
+
+        if stepwise_noise:
+            self.next_z_dist = ConditionalGaussian(num_features, num_features, zero_initialized=False)
+        else:
+            self.next_z_dist = None
+
+    def forward(self, batch: int, seq_len: int):
+        results = []
+
+        # Sample the initial noise vector
+        noise = torch.randn(batch, 1, self.num_features, device=self.output_linear.weight.device)
+        inputs = self.noise_mlp(noise)
+
+        hidden = self.hidden_linear(inputs).movedim(1, 0)  # [num_layers, batch, embedding]
+        cell = hidden.tanh()
+
+        for i in range(seq_len):
+            outputs, (hidden, cell) = self.lstm(inputs, (hidden, cell))
+            outputs = self.output_linear(outputs)
+
+            if self.next_z_dist:
+                # For each z_t, we sample from a Gaussian distribution conditioned on all previouz z's
+                outputs = self.next_z_dist(outputs).rsample()
+
+            results.append(outputs.squeeze(-2))
+            inputs = outputs
+
+        return torch.stack(results, dim=1)

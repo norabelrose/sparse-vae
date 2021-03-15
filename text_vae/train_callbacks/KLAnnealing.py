@@ -4,7 +4,7 @@ from .AutoencoderCallback import *
 
 @dataclass
 class KLAnnealing(AutoencoderCallback):
-    kl_weight_start: float = 0.0
+    kl_weight_start: float = 0.1
     kl_weight_end: float = 1.0
     num_annealing_steps: int = 50_000
 

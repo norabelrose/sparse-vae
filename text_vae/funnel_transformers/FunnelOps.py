@@ -182,7 +182,7 @@ class FunnelAttention(nn.Module):
 
     # A^{position} in the paper
     def _attn_pos_term(self, q, k_len, attn_state: AttentionState):
-        pos_enc = attn_state.get_positional_encodings()
+        pos_enc = attn_state.get_positional_encodings(self.hparams.d_model)
         attn_type = self.hparams.positional_attention_type
         
         if attn_type == "factorized":

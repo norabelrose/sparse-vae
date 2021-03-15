@@ -7,7 +7,7 @@ class MLMDataModuleHparams(TextDataModuleHparams):
     whole_word_masking: bool = True
 
     include_unmasked_tokens_in_labels: bool = True
-    mask_token_prob: float = 0.3
+    mask_token_prob: float = 0.15
     random_token_prob: float = 0.015
     use_smart_random_tokens: bool = False  # Sample random tokens proportional to their frequency in the dataset
     yield_segment_pairs: bool = False
@@ -53,8 +53,8 @@ class MLMDataModule(TextDataModule):
 
                 token_types += [seg_ids]
 
-            seg_ids = torch.nn.utils.rnn.pad_sequence(token_types, batch_first=True, padding_value=1.0)
-            tokens = torch.nn.utils.rnn.pad_sequence(pairs, batch_first=True)
+            seg_ids = self.pad_pack(token_types, pad_value=1.0)
+            tokens = self.pad_pack(pairs)
             padding_mask = tokens.eq(0).float()
 
             batch = {'token_ids': tokens, 'padding_mask': padding_mask, 'segment_ids': seg_ids}
@@ -72,8 +72,7 @@ class MLMDataModule(TextDataModule):
 
         if self.hparams.whole_word_masking:
             word_counts = torch.tensor([x['num_words'] for x in inputs])
-            word_ids = torch.nn.utils.rnn.pad_sequence([x['word_ids'] for x in inputs], batch_first=True,
-                                                       padding_value=-1.0)
+            word_ids = self.pad_pack([x['word_ids'] for x in inputs], pad_value=-1.0)
 
             noise_mask = whole_word_mask_(tokens, word_counts, word_ids, mask_prob, vocab['[MASK]'])
         else:

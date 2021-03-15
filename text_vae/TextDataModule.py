@@ -5,7 +5,6 @@ from pathlib import Path
 from tokenizers.implementations import BertWordPieceTokenizer
 from tokenizers.processors import BertProcessing
 from torch.utils.data import DataLoader  # noqa
-from torch import Tensor
 from .DataUtils import *
 import os
 import numpy as np
@@ -18,12 +17,14 @@ import warnings
 @dataclass
 class TextDataModuleHparams:
     batch_size: int = 32
-    chunking_strategy: str = 'token'  # 'sentence', 'token', or 'none'
+
+    chunking_strategy: str = 'none'  # 'sentence', 'token', or 'none'
     dataset_name: str = 'pg19'
     max_sentences_per_sample: Optional[int] = None
     min_tokens_per_sample: int = 16
     max_tokens_per_sample: int = 512
     pad_to_max_length: bool = False
+    pad_to_multiple_of: int = 1
     split: str = 'train'    # Any string of the format supported by the HuggingFace datasets library
     uniform_length_batching: bool = True
     use_finetuned_tokenizer: bool = True
@@ -206,16 +207,32 @@ class TextDataModule(pl.LightningDataModule):
 
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         # Combine into a single batched and padded tensor
-        tokens = torch.nn.utils.rnn.pad_sequence([x['text'] for x in inputs], batch_first=True)
-        if pad_len := self.hparams.pad_to_max_length:
-            padding_needed = pad_len - tokens.shape[1]
-            if padding_needed > 0:
-                tokens = F.pad(tokens, (0, padding_needed))
+        tokens = self.pad_pack([x['text'] for x in inputs])
 
         padding_mask = tokens.eq(0).float()
         word_counts = torch.stack([x['num_words'] for x in inputs])
 
         return {'padding_mask': padding_mask, 'token_ids': tokens, 'word_count': word_counts}
+
+    def pad_pack(self, tokens: List[Tensor], pad_value: float = 0.0) -> Tensor:
+        tokens = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=pad_value)
+
+        factor = self.hparams.pad_to_multiple_of
+        pad_len = self.hparams.pad_to_max_length
+        seq_len = tokens.shape[1]
+
+        if factor:
+            remainder = seq_len % factor
+            padding_needed = factor - remainder if remainder else 0
+        elif pad_len:
+            padding_needed = pad_len - seq_len
+        else:
+            padding_needed = 0
+
+        if padding_needed > 0:
+            tokens = F.pad(tokens, (0, padding_needed), value=pad_value)
+
+        return tokens
 
     # Called from prepare_data, as well as from setup when we load from a checkpoint
     def setup_tokenizer(self):

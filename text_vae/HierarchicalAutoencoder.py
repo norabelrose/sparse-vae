@@ -19,7 +19,9 @@ class HierarchicalAutoencoderState:
 
 class HierarchicalAutoencoder(FunnelAutoencoder, ABC):
     def decoder_forward(self, vae_state: HierarchicalAutoencoderState, padding_mask: Tensor = None, **kwargs):
-        self.decoder.attention_state.upsampling = True
+        attn_state = self.decoder.attention_state
+        attn_state.upsampling = True
+
         coroutine = self.decoder.forward_coroutine(
             vae_state.decoder_input,
             padding_mask=padding_mask

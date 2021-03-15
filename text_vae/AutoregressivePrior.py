@@ -48,8 +48,8 @@ class AutoregressiveCategoricalPrior(TransformerLanguageModel):
         return loss
 
     def sample(self, max_length: int, count: int = 1, start_embedding: Tensor = None, **kwargs):
-        start_symbol = torch.tensor(start_symbol, device=self.device)
-        stop_symbol = torch.tensor(end_symbol, device=self.device)
+        start_symbol = torch.tensor(self.start_token, device=self.device)
+        stop_symbol = torch.tensor(self.end_token, device=self.device)
 
         live_sample_mask = torch.ones(count, device=self.device, dtype=torch.bool)
 

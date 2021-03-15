@@ -18,8 +18,10 @@ class ReconstructionSampler(AutoencoderCallback):
 
         if (logits := outputs.get('logits')) is not None:
             dist = Categorical(logits=logits)
+        elif outputs := outputs.get('output'):
+            dist = outputs.p_of_x_given_z
         else:
-            dist = outputs['output'].p_of_x_given_z
+            return
 
         tokenizer = autoencoder.tokenizer
 

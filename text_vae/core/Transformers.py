@@ -79,7 +79,7 @@ class Transformer(nn.Module):
         ])
         self.reinject_pos_encodings = reinject_pos_encodings
 
-    def forward(self, x: Tensor, cross_attn_target: Tensor = None, padding_mask: Tensor = None):
+    def forward(self, x: Tensor, cross_attn_target = None, padding_mask: Tensor = None):
         # Re-inject the positional encodings at each layer so that the positional information doesn't
         # get lost as we go up the layer hierarchy. This should work better with our implementation of
         # sinusoidal positional encodings because we scale the encodings by 1/sqrt(d_model), so we won't
@@ -112,7 +112,7 @@ def positional_encodings_like(x: Tensor):
     return get_positional_encodings(x.shape[-2], x.shape[-1], x.device, x.dtype)
 
 @lru_cache(maxsize=10)
-def get_positional_encodings(seq_len: int, d_model: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+def get_positional_encodings(seq_len: int, d_model: int, device: Optional[torch.device], dtype: torch.dtype) -> Tensor:
     d_model_half = d_model // 2
     frequencies = torch.arange(d_model_half, dtype=dtype, device=device)
     periods = 1 / (10000 ** (frequencies / d_model_half))

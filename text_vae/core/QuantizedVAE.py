@@ -6,18 +6,13 @@ from .Quantizer import *
 @dataclass
 class QuantizedVAEHparams(AutoencoderHparams):
     codebook_size: int = 8192
+    latent_depth: int = 64
     beta: float = 0.25
+    quantize_in_first_epoch: bool = True
     use_kmeans_codebook_updates: bool = True
 
 
 class QuantizedVAE(LanguageModel, ABC):
     @property
     def quantizing(self) -> bool:
-        return True
-        # return not self.training or self.trainer.current_epoch > 0
-
-    # def validation_epoch_end(self, outputs: List[Any]) -> None:
-    #     if self.trainer.running_sanity_check or not self.hparams.use_kmeans_codebook_updates:
-    #         return
-
-    #     self.update_codebook_kmeans()
+        return self.hparams.quantize_in_first_epoch or not self.training or self.trainer.current_epoch > 0

@@ -1,8 +1,10 @@
-from text_vae.funnel_transformers.AttentionState import *
-from text_vae.funnel_transformers.FunnelOps import AttentionHparams, PositionwiseFFN, FunnelAttention
-from text_vae.funnel_transformers.RemoteModels import *
-from text_vae.core.Utilities import *
+from .AttentionState import *
+from .FunnelOps import AttentionHparams, PositionwiseFFN, FunnelAttention
+from .RemoteModels import *
+from ..core import PositionalEncoding
+from ..core.Utilities import *
 from dataclasses import dataclass, field
+from numpy import prod
 from omegaconf import OmegaConf
 from pytorch_lightning.utilities import AttributeDict
 from torch import nn, Tensor
@@ -18,11 +20,14 @@ class FunnelTransformerHparams(AttentionHparams):
 
     # If None, d_embedding is set to equal d_model. For the generator in ELECTRA pretraining they are different.
     d_embedding: Optional[int] = None
+    max_seq_length: Optional[int] = None
     vocab_size: int = 30522
 
     # Whether to return the pre-pooling output of each block
     return_block_outputs: bool = True
     use_embedding: bool = True
+
+    use_transpose_convs: bool = False  # Use transpose convolutions instead of nearest-neighbor upsampling
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
     def __post_init__(self):
@@ -50,6 +55,23 @@ class FunnelTransformer(nn.Module):
             hparams.d_embedding = hparams.d_model
 
         self.hparams = hparams
+
+        max_len = hparams.max_seq_length
+        if max_len:
+            if hparams.upsampling:
+                max_len //= prod(hparams.scaling_factors)
+
+            self.abs_pos_encodings = PositionalEncoding(max_len, hparams.d_model)
+        else:
+            self.abs_pos_encodings = None
+
+        if hparams.upsampling and hparams.use_transpose_convs:
+            self.upsamplers = nn.ModuleList([
+                nn.ConvTranspose1d(hparams.d_model, hparams.d_model, kernel_size=scale, stride=scale)
+                for scale in hparams.scaling_factors
+            ])
+        else:
+            self.upsamplers = None
 
         if not hparams.upsampling and hparams.use_embedding:
             input_modules = [
@@ -115,10 +137,13 @@ class FunnelTransformer(nn.Module):
                           cross_attn_target: Optional[Union[Tensor, List[Tensor]]] = None):
         attn_state = self.attention_state
         hparams = self.hparams
-
         original = x
+
         if not hparams.upsampling and hparams.use_embedding:
             x = self.input_layer(x)  # x.shape == (...length, d_model)
+
+        if self.abs_pos_encodings:
+            x = self.abs_pos_encodings(x)
 
         # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
         # for the current input, because that could result in it getting configured twice
@@ -137,8 +162,8 @@ class FunnelTransformer(nn.Module):
             cross_attn_target = [cross_attn_target]
 
         cross_attn_iter = iter(cross_attn_target)
-
         last_block = len(self.hparams.block_sizes) - 1
+
         for block_idx, block_size in enumerate(self.hparams.block_sizes):
             for rel_layer_idx in range(block_size):
                 # Let AttentionState know we're starting a new block
@@ -147,6 +172,7 @@ class FunnelTransformer(nn.Module):
 
                 x_attn_target = next(cross_attn_iter, None) if layer.use_cross_attention else None
                 q = kv = layer(q, kv, attn_state, cross_attn_keys=x_attn_target)
+
                 attn_state.block_begin_flag = False
 
             # Cache block outputs if indicated
@@ -157,7 +183,7 @@ class FunnelTransformer(nn.Module):
             if block_idx == last_block:
                 break
 
-            q = attn_state.maybe_scale_input(kv)
+            q = self.maybe_scale_hidden(kv)
 
             # The consumer of this generator may or may not send us anything
             maybe_transformed_q = yield block_idx, q
@@ -176,6 +202,28 @@ class FunnelTransformer(nn.Module):
             embedded_input=x,
             hidden_states=hidden_states
         )
+
+    # Either downsample or upsample the tensor, whichever is appropriate for the current block.
+    def maybe_scale_hidden(self, x: Tensor) -> Tensor:
+        attn_state = self.attention_state
+
+        # Sanity check
+        cur_block = attn_state.current_block
+        num_factors = len(attn_state.scaling_factors)
+        assert cur_block < num_factors + 1
+
+        # We're at the end of the Transformer, we don't scale at all at the end
+        if cur_block == num_factors:
+            return x
+
+        attn_state.current_block = cur_block + 1
+
+        if self.upsamplers:
+            conv = self.upsamplers[cur_block]
+            return conv(x.movedim(-1, -2)).movedim(-2, -1)
+
+        new_stride = attn_state.strides[attn_state.current_block]
+        return attn_state.scale_tensor(x, attn_state.max_seq_len // new_stride)
 
     # Gives you both the block and (absolute) layer indices while iterating
     def enumerate_blocks_and_layers(self) -> Iterator:

@@ -48,10 +48,10 @@ class LanguageModel(pl.LightningModule, ABC):
             self.start_token = vocab['[CLS]']
             self.end_token = vocab['[SEP]']
 
-    def configure_optimizers(self):
+    def configure_optimizers(self, lr: float = None, params = None):
         adam = AdamW(
-            self.parameters(),
-            lr=self.hparams.lr,
+            params or self.parameters(),
+            lr=lr or self.hparams.lr,
             betas=(self.hparams.adam_beta1, 0.999),
             weight_decay=self.hparams.weight_decay,
             eps=self.hparams.adam_eps

@@ -25,8 +25,6 @@ def main(args):
     command = args[1]
     model_str = args[2]
 
-    seed_everything(7295)  # Reproducibility
-
     gpu_available = torch.cuda.is_available()
     config = OmegaConf.create({
         # Override Trainer defaults but still allow them to be overridden by the command line
@@ -114,15 +112,57 @@ def main(args):
         torch.autograd.set_detect_anomaly(True)
 
     if command == 'train':
-        # if config.get('retrain_tokenizer'):
-        #     tokenizer = BertWordPieceTokenizer()
-        #     tokenizer.train_from_iterator()
+        seed_everything(7295)  # Reproducibility
 
         print(f"Training {experiment}...")
         if ckpt_name := config.get('from_checkpoint'):
             config.trainer.resume_from_checkpoint = get_checkpoint_path_for_name(experiment, ckpt_name)
 
-    if command == 'extract-posteriors':
+    elif command == 'sample':
+        ckpt_name = config.get('from_checkpoint')
+        assert ckpt_name, "We need a checkpoint to load a model from"
+
+        model = model_class.load_from_checkpoint(get_checkpoint_path_for_name(experiment, ckpt_name))
+        if gpu_idx := config.get('gpu'):
+            model = model.to('cuda:' + str(gpu_idx))
+
+        num_samples = config.get('samples', 1)
+        max_length = config.get('max_length', 40)
+        dataset_name = config.get('dataset_name', 'yelp_polarity')
+
+        vocab_path = Path.cwd() / 'text-vae-pretrained' / 'tokenizers' / (dataset_name + '.json')
+        assert vocab_path.exists(), f"Couldn't find pretrained tokenizer for {dataset_name}"
+
+        tokenizer = Tokenizer.from_file(str(vocab_path))
+        model.tokenizer = tokenizer
+
+        while True:
+            # Running the Markov chain takes a while so we want to print each iteration
+            # to the screen as it runs
+            if model_class == AdversarialAutoencoder:
+                num_iter = config.get('num_iter', 200)
+                masked_tokens_per_iter = config.get('masked_tokens_per_iter', 1)
+
+                for i, iteration in enumerate(model.markov_chain_sample(max_length, num_samples, num_iter=num_iter,
+                                                                        masked_tokens_per_iter=masked_tokens_per_iter)):
+                    if i == 0:
+                        print("Initial sample:")
+                    else:
+                        print(f"Iteration {i}:")
+
+                    text = tokenizer.decode_batch(iteration.tolist())
+                    if len(text) == 1:
+                        text = text[0]
+
+                    print(text)
+            else:
+                samples = model.sample(max_length, num_samples)
+                print(samples)
+
+            if input("Would you like to sample again? (y/n): ")[0].lower() != "y":
+                return
+
+    elif command == 'extract-posteriors':
         assert issubclass(model_class, Autoencoder)
         ckpt_name = config.get('from_checkpoint')
         assert ckpt_name, "We need a checkpoint to load a model from"
@@ -164,14 +204,20 @@ def main(args):
 
     warnings.filterwarnings('ignore', module='pytorch_lightning')
     warnings.filterwarnings('ignore', module='torch')  # Bug in PL
-    trainer = Trainer(
-        **config.trainer,
-        callbacks=callbacks,
-        logger=TensorBoardLogger(
+
+    if config.get('no_log'):
+        logger = False
+    else:
+        logger = TensorBoardLogger(
             save_dir='text-vae-logs',
             name=experiment,
             version=config.get('name')
         )
+
+    trainer = Trainer(
+        **config.trainer,
+        callbacks=callbacks,
+        logger=logger
     )
     trainer.fit(model, datamodule=data)
 
