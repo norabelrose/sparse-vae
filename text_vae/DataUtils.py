@@ -76,6 +76,7 @@ class ContiguousRandomSampler:
 
     def __post_init__(self):
         self.batch_starts = list(range(0, self.dataset_length, self.batch_size))
+        random.shuffle(self.batch_starts)
 
     def __iter__(self):
         return self
@@ -86,13 +87,80 @@ class ContiguousRandomSampler:
     def __next__(self):
         if not self.batch_starts:
             self.batch_starts = list(range(0, self.dataset_length, self.batch_size))  # Prepare for next epoch
+            random.shuffle(self.batch_starts)
             raise StopIteration
 
-        index_idx = random.randrange(0, len(self.batch_starts))
-        start_idx = self.batch_starts[index_idx]
+        start_idx = self.batch_starts.pop()
         end = start_idx + self.batch_size
         if end > self.dataset_length:
             end = self.dataset_length
 
-        del self.batch_starts[index_idx]  # Don't yield the same indices twice
         return list(range(start_idx, end))
+
+@dataclass
+class UniformSizeRandomSampler:
+    sample_lengths: List[int]
+    max_tokens_per_batch: int
+
+    def __post_init__(self):
+        self.batches = compute_uniform_sized_batches(self.sample_lengths, self.max_tokens_per_batch)
+        self.remaining_batches = self.batches.copy()
+        random.shuffle(self.remaining_batches)
+
+    def __iter__(self):
+        return self
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __next__(self):
+        if not self.remaining_batches:
+            self.remaining_batches = self.batches.copy()
+            random.shuffle(self.remaining_batches)
+            raise StopIteration
+
+        start, length = self.remaining_batches.pop()
+        return list(range(start, start + length))
+
+
+def compute_uniform_sized_batches(lengths: List[int], max_size: int) -> List[Tuple[int, int]]:
+    cur_num_tokens = 0  # Running total of the number of tokens in this batch
+    cur_num_samples = 0  # Length in *number of samples*
+    cur_start = 0  # Index of the first *sample* in this batch
+    batches = []  # List of tuples of the form (first sample index, num samples)
+
+    for i, num_tokens in enumerate(lengths):
+        # If adding this sample to the current batch would make it too big, end the current batch
+        # and add the sample to a new batch
+        if cur_num_tokens + num_tokens > max_size:
+            if cur_num_samples > 0:
+                batches.append((cur_start, cur_num_samples))
+
+            # If this sample is so huge that it exceeds the maximum number of tokens by itself,
+            # then just skip it and see if the next sample is of a more manageable size
+            if num_tokens > max_size:
+                cur_start = i + 1
+                cur_num_samples = 0
+                cur_num_tokens = 0
+            else:
+                cur_start = i
+                cur_num_samples = 1
+                cur_num_tokens = num_tokens
+        else:
+            cur_num_tokens += num_tokens
+            cur_num_samples += 1
+
+    # Take care of whatever is left over when we're done iterating over all the samples
+    if cur_num_samples > 0:
+        batches.append((cur_start, cur_num_samples))
+
+    return batches
+
+# Actually chunk large batches of samples from a HuggingFace dataset into uniformly sized minibatches.
+# Designed to be used with the dataset.map() method.
+def perform_uniform_size_batching(batch: Dict[str, list], max_size: int, length_key: str) -> Dict[str, list]:
+    batch_tuples = compute_uniform_sized_batches(batch[length_key], max_size)
+    return {
+        key: [value[start:start + length] for start, length in batch_tuples]
+        for key, value in batch.items()
+    }

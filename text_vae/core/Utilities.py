@@ -1,3 +1,4 @@
+from pathlib import Path
 from torch import nn
 from typing import *
 
@@ -20,3 +21,14 @@ def transmute(big_dict: T, *args: str, **kwargs: str) -> T:
     eval_ctx = big_dict if isinstance(big_dict, dict) else dict(**big_dict)
     new_dict.update({new_k: eval(expr, eval_ctx) for new_k, expr in kwargs.items()})
     return new_dict
+
+
+def get_checkpoint_path_for_name(experiment: str, ckpt_name: str) -> Path:
+    ckpt_path = Path.cwd() / 'text-vae-logs' / experiment / ckpt_name / "checkpoints"
+    try:
+        # Open the most recent checkpoint
+        ckpt = max(ckpt_path.glob('*.ckpt'), key=lambda file: file.lstat().st_mtime)
+        return ckpt
+    except ValueError:
+        print(f"Couldn't find checkpoint at path {ckpt_path}")
+        exit(1)

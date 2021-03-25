@@ -20,8 +20,8 @@ class MLMDataModule(TextDataModule):
         if self.hparams.random_token_prob > 0.0 and self.hparams.use_smart_random_tokens:
             print("Computing token frequencies...")
 
-            token_freqs = self.token_freqs
-            vocab_size = token_freqs.numel()
+            vocab_size = self.hparams.vocab_size
+            token_freqs = torch.zeros(vocab_size, dtype=torch.long)
 
             def get_word_frequencies(batch: Dict[str, list]):
                 nonlocal token_freqs
@@ -29,7 +29,7 @@ class MLMDataModule(TextDataModule):
                     token_freqs += torch.tensor(sample).bincount(minlength=vocab_size)
 
             self.dataset.map(get_word_frequencies, batched=True)
-            self.token_freqs = self.token_freqs.float()  # So we can sample from it as a distribution
+            self.token_freqs = token_freqs.float()  # So we can sample from it as a distribution
 
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         if self.hparams.yield_segment_pairs:
@@ -55,9 +55,8 @@ class MLMDataModule(TextDataModule):
 
             seg_ids = self.pad_pack(token_types, pad_value=1.0)
             tokens = self.pad_pack(pairs)
-            padding_mask = tokens.eq(0).float()
 
-            batch = {'token_ids': tokens, 'padding_mask': padding_mask, 'segment_ids': seg_ids}
+            batch = {'token_ids': tokens, 'padding_mask': tokens.eq(0), 'segment_ids': seg_ids}
         else:
             batch = super().collate(inputs)
             tokens, padding_mask = batch['token_ids'], batch['padding_mask']

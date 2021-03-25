@@ -25,7 +25,7 @@ class ContinuousHierarchicalVAE(HierarchicalAutoencoder, ContinuousVAE):
     def __init__(self, hparams: DictConfig):
         super(ContinuousHierarchicalVAE, self).__init__(hparams)
 
-        encoder_hparams = hparams.encoder
+        encoder_hparams = hparams.funnel
         num_latent_scales = len(encoder_hparams.block_sizes)
 
         self.samplers = nn.ModuleList([
@@ -125,15 +125,13 @@ class ContinuousHierarchicalVAE(HierarchicalAutoencoder, ContinuousVAE):
 
     def sample(self, max_length: int, count: int = 1, top_k: int = 1, temperature: float = 1.0) -> Tensor:
         # Find the sequence length dimension that the seed should have in order to generate the desired output length
-        funnel_hparams = self.hparams.encoder
+        funnel_hparams = self.hparams.funnel
         total_scaling = prod(funnel_hparams.scaling_factors)
         seed_length = max_length // total_scaling
 
         # (batch, seq_len, vocab_size)
         self.decoder.attention_state.configure_for_input(
             seq_len=total_scaling * seed_length,  # May not be the same as max_length if it doesn't divide evenly
-            dtype=torch.long,
-            device=self.device,
             padding_mask=None
         )
 
@@ -149,7 +147,7 @@ class ContinuousHierarchicalVAE(HierarchicalAutoencoder, ContinuousVAE):
             padding_mask=None,
             temperature=temperature
         )
-        return self.decode_logits(vae_output.p_of_x_given_z.logits)
+        return vae_output.p_of_x_given_z.logits.argmax(dim=-1)
 
 
 class ContinuousLatentSampler(nn.Module):

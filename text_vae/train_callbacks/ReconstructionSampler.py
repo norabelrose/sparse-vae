@@ -1,5 +1,5 @@
 from .AutoencoderCallback import *
-from ..HierarchicalAutoencoder import *
+from torch.distributions import Categorical
 
 
 @dataclass
@@ -7,8 +7,12 @@ class ReconstructionSampler(AutoencoderCallback):
     num_samples: int = 1
     train_step_interval: int = 1000
 
-    def on_train_batch_end(self, trainer, autoencoder: HierarchicalAutoencoder, outputs, batch, batch_idx, _):
+    def on_train_batch_end(self, trainer, autoencoder, outputs, batch, batch_idx, _):
         if autoencoder.global_step % self.train_step_interval != 0:
+            return
+
+        logger = trainer.logger
+        if not logger:
             return
 
         # Weirdly PL wraps the actual training_step output in two lists and a dict
@@ -23,7 +27,7 @@ class ReconstructionSampler(AutoencoderCallback):
         else:
             return
 
-        tokenizer = autoencoder.tokenizer
+        tokenizer = trainer.datamodule.tokenizer
 
         # We're doing a masked language modeling / denoising autoencoder task
         if (originals := batch.get('labels')) is not None:
@@ -31,15 +35,14 @@ class ReconstructionSampler(AutoencoderCallback):
             originals = tokenizer.decode_batch(originals)
 
         model_inputs = batch['token_ids'][:self.num_samples].tolist()  # Tensor -> List of lists of ints
-        model_inputs = [[char for char in seq if char != 0] for seq in model_inputs]  # Filter out padding
-        model_inputs = tokenizer.decode_batch(model_inputs, skip_special_tokens=not originals)  # List of strings
+        model_inputs = tokenizer.decode_batch(model_inputs, skip_special_tokens=False)  # List of strings
         if not originals:
             originals = model_inputs
 
-        reconstruction_ids = autoencoder.decode_logits(dist.logits[:self.num_samples]).tolist()
-        reconstructions = tokenizer.decode_batch(reconstruction_ids)
+        reconstruction_ids = dist.logits[:self.num_samples].argmax(dim=-1).tolist()
+        reconstructions = tokenizer.decode_batch(reconstruction_ids, skip_special_tokens=False)
 
-        logger = trainer.logger.experiment
+        logger = logger.experiment
         for original, model_input, reconstruction in zip(originals, model_inputs, reconstructions):
             logged_msg = "Original:  \n" + original
             if model_input != original:

@@ -2,10 +2,9 @@ from enum import Enum
 from torch import nn, Tensor
 from typing import *
 import torch
-import torch.nn.functional as F
 
 
-GenerationStrategy = Enum('GenerationStrategy', ['Beam', 'Greedy', 'Sampling', 'SamplingTopK'])
+GenerationStrategy = Enum('GenerationStrategy', ['Beam', 'Greedy', 'Sampling', 'SamplingTopK', 'SamplingTopP'])
 
 @torch.no_grad()
 def autoregressive_decode(
@@ -28,11 +27,11 @@ def autoregressive_decode(
         num_samples = z.shape[0]
 
     if strategy == GenerationStrategy.Beam:
-        beam_log_probs = torch.zeros([num_samples, k], device=device)  # 100% likely that a sample will start with [CLS]
-        output_tensor = torch.zeros([num_samples * k, max_length], device=device, dtype=torch.long)
+        beam_log_probs = torch.zeros(num_samples, k, device=device)  # 100% likely that a sample will start with [CLS]
+        output_tensor = torch.zeros(num_samples * k, max_length, device=device, dtype=torch.long)
     else:
         beam_log_probs = None
-        output_tensor = torch.zeros([num_samples, max_length], device=device, dtype=torch.long)
+        output_tensor = torch.zeros(num_samples, max_length, device=device, dtype=torch.long)
 
     # Every sample starts with [CLS]
     output_tensor[:, 0] = start_symbol
@@ -70,7 +69,7 @@ def autoregressive_decode(
         if current_idx < min_length:
             output_logits[:, :, end_symbol] = -float('inf')
 
-        word_ids = decode_next_token_with_context(output_logits, strategy, k=k, beam_log_probs=beam_log_probs)
+        word_ids = decode_next_token_from_logits(output_logits, strategy, k=k, beam_log_probs=beam_log_probs)
 
         word_ids[~live_sample_mask].zero_()  # After the [SEP] token, everything afterward should be the padding token
         output_tensor[:, current_idx] = word_ids
@@ -90,20 +89,21 @@ def autoregressive_decode(
     return output_tensor
 
 @torch.no_grad()
-def decode_next_token_with_context(logits: Tensor, strategy: GenerationStrategy, k: int = 1, beam_log_probs = None):
+def decode_next_token_from_logits(logits: Tensor, strategy: GenerationStrategy, k: int = 10, p: float = 0.92,
+                                  beam_log_probs = None):
     if strategy == GenerationStrategy.Beam:
         num_samples = logits.shape[0] // k
 
         # (batch_size * k, 1, vocab_size) -> (batch_size, k, vocab_size)
         output_logits = logits.view(num_samples, k, -1)
-        logits, word_ids = output_logits.topk(k=k, sorted=False)  # (batch_size, k, k)
-        hypothesis_log_probs = F.log_softmax(logits, dim=-1)  # (batch_size, k, k)
+        logits, token_ids = output_logits.topk(k=k, sorted=False)  # (batch_size, k, k)
+        hypothesis_log_probs = logits.log_softmax(dim=-1)  # (batch_size, k, k)
         hypothesis_log_probs += beam_log_probs.unsqueeze(-1)  # noqa; joint probs of the hypotheses plus these new words
         hypothesis_log_probs = hypothesis_log_probs.view(num_samples, -1)  # (batch_size, k^2)
 
         indices_to_keep = torch.empty_like(beam_log_probs, dtype=torch.long)
         hypothesis_log_probs.topk(k=k, sorted=False, out=(beam_log_probs, indices_to_keep))  # (batch_size, k)
-        return word_ids[indices_to_keep].flatten()  # (batch_size * k)
+        return token_ids[indices_to_keep].flatten()  # (batch_size * k)
 
     elif strategy == GenerationStrategy.Greedy:
         return logits.argmax(dim=-1)  # (batch_size)
@@ -111,10 +111,19 @@ def decode_next_token_with_context(logits: Tensor, strategy: GenerationStrategy,
     elif strategy == GenerationStrategy.SamplingTopK:
         top_logits, indices = logits.topk(k=k)
 
-        dist = F.softmax(top_logits, dim=-1).flatten(end_dim=-2)
+        dist = top_logits.softmax(dim=-1).flatten(end_dim=-2)
         subindices = dist.multinomial(num_samples=1).view(*top_logits.shape[:-1], 1)
         return indices.gather(dim=-1, index=subindices).squeeze(-1)
 
+    elif strategy == GenerationStrategy.SamplingTopP:
+        sorted_logits, indices = logits.sort(descending=True)
+        sorted_probs = sorted_logits.softmax(dim=-1)
+        cum_probs = sorted_probs.cumsum(dim=-1)
+
+        probs_to_keep = sorted_probs[cum_probs <= p]
+        subindices = probs_to_keep.multinomial(num_samples=1).view(*sorted_logits.shape[:-1], 1)
+        return indices.gather(dim=-1, index=subindices).squeeze(-1)
+
     else:  # Regular sampling
-        dist = F.softmax(logits, dim=-1).flatten(end_dim=-2)
+        dist = logits.softmax(dim=-1).flatten(end_dim=-2)
         return dist.multinomial(num_samples=1).view(*logits.shape[:-1])

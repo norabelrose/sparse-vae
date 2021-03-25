@@ -24,7 +24,8 @@ class HierarchicalAutoencoder(FunnelAutoencoder, ABC):
 
         coroutine = self.decoder.forward_coroutine(
             vae_state.decoder_input,
-            padding_mask=padding_mask
+            padding_mask=padding_mask,
+            cross_attn_iter=kwargs.get('cross_attn_target')
         )
         encoder_state_iter = iter(vae_state.encoder_states)
 
@@ -33,9 +34,7 @@ class HierarchicalAutoencoder(FunnelAutoencoder, ABC):
             if isinstance(decoder_state, FunnelTransformerOutput):
                 vae_state.decoder_output = decoder_state
                 raw_output = decoder_state.final_state
-
-                logits = self.output_layer(raw_output)
-                vae_state.p_of_x_given_z = Categorical(logits=logits)
+                vae_state.p_of_x_given_z = self.output_layer(raw_output)
 
                 return vae_state
 
@@ -46,7 +45,14 @@ class HierarchicalAutoencoder(FunnelAutoencoder, ABC):
             else:
                 encoder_state = None
 
-            coroutine.send(self.decoder_block_end(vae_state, decoder_state, encoder_state, block_idx, **kwargs))
+            dec_state = self.decoder_block_end(vae_state, decoder_state, encoder_state, block_idx, **kwargs)
+            if dec_state is not None:
+                coroutine.send(dec_state)
+
+            # Abort the forward pass. Used when gathering latent codes for training the prior model. After we get
+            # the bottom latent feature map we don't actually need to run the last few layers.
+            else:
+                return vae_state
 
     # Returns an optional Tensor which, if not None, is passed as input to the next decoder block
     @abstractmethod

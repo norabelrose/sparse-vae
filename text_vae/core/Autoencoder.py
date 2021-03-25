@@ -1,29 +1,13 @@
 from abc import abstractmethod
+from pytorch_lightning.callbacks import EarlyStopping
 from torch.distributions import Normal
 from .LanguageModel import *
+from ..train_callbacks import KLAnnealing, ReconstructionSampler
 
 
 @dataclass
 class AutoencoderHparams(LanguageModelHparams, ABC):
     latent_depth: int = 16  # Depth of the latent tensors/vectors
-
-class Autoencoder(LanguageModel, ABC):
-    @abstractmethod
-    def compute_latents(self, batch: Dict[str, Any]) -> Any:
-        raise NotImplementedError
-
-    def extract_posteriors_for_dataset(self, datamodule):
-        batch_sz = datamodule.batch_size
-        dataset = datamodule.dataset
-        dataset.set_format('torch')  # Makes the dataset yield PyTorch tensors
-
-        def get_posteriors(batch: Dict[str, list]) -> Dict[str, list]:
-            batch = [dict(zip(batch, x)) for x in zip(*batch.values())]  # dict of lists -> list of dicts
-            batch = datamodule.collate(batch)
-            return {'posteriors': self.compute_latents(batch)}
-
-        print(f"Extracting posteriors over the latent space for dataset '{datamodule.hparams.dataset_name}'...")
-        datamodule.dataset = dataset.map(get_posteriors, batched=True, batch_size=batch_sz, load_from_cache_file=False)
 
 
 # Abstract base classes for autoencoders with continuous latent spaces
@@ -31,13 +15,17 @@ class Autoencoder(LanguageModel, ABC):
 class ContinuousVAEHparams(AutoencoderHparams, ABC):
     kl_weight: float = 1.0
 
-class ContinuousVAE(Autoencoder):
+class ContinuousVAE(LanguageModel):
     def __init__(self, hparams: DictConfig):
-        super(Autoencoder, self).__init__(hparams)
+        super(LanguageModel, self).__init__(hparams)
 
         # Create the standard diagonal Gaussian prior for the first layer
         self.register_buffer('prior_mu', torch.zeros(hparams.latent_depth))
         self.register_buffer('prior_sigma', torch.ones(hparams.latent_depth))
+
+    def configure_callbacks(self):
+        callbacks = super().configure_callbacks()
+        return callbacks + [EarlyStopping(monitor='val_loss', mode='min'), KLAnnealing(), ReconstructionSampler()]
 
     # Workaround for the fact that Distribution objects don't have a .to() method
     def get_base_prior(self) -> Normal:

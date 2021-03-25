@@ -21,8 +21,8 @@ class LSTMLanguageModel(LanguageModel):
 
         vocab_size = self.tokenizer.get_vocab_size()
         self.embedding = nn.Embedding(vocab_size, hparams.ni)
-        self.decoder = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.dec_nh, batch_first=True, num_layers=4)
-        self.initial_state = nn.Parameter(torch.randn(4, 1, hparams.dec_nh))
+        self.decoder = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.dec_nh, batch_first=True, num_layers=2)
+        self.initial_state = nn.Parameter(torch.randn(2, 1, hparams.dec_nh))
 
         output_embedding = nn.Linear(hparams.ni, vocab_size)
         output_embedding.weight = self.embedding.weight

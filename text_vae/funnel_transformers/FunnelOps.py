@@ -1,8 +1,10 @@
 from dataclasses import dataclass
-from torch import nn
-from .AttentionState import *
-from ..core.Transformers import positional_encodings_like
+from einops import rearrange
+from torch import nn, Tensor
+from typing import *
+from ..core import positional_encodings_like
 import numpy as np
+import torch
 
 BIG_CONST = 1e6
 
@@ -39,7 +41,8 @@ class EinsumLayer(nn.Module):
 # These custom module classes are probably unnecessary, but we keep them them here in order
 # to maintain full backward compatibility with the original pretrained Funnel Transformer checkpoints.
 class GELU(nn.Module):
-    def forward(self, x):
+    @staticmethod
+    def forward(x):
         cdf = 0.5 * (1.0 + torch.tanh(
             (np.sqrt(2 / np.pi) * (x + 0.044715 * torch.pow(x, 3)))))
         return x * cdf
@@ -69,11 +72,10 @@ class AttentionHparams:
     attention_dropout: float = 0.1
     dropout: float = 0.1
     ffn_dropout: float = 0.0
-    layer_norm_eps: float = 1e-9
+    layer_norm_eps: float = 1e-5
     separate_cls: bool = False
     use_segment_attention: bool = False
 
-    inject_absolute_pos_encodings: bool = False
     positional_attention_type: str = 'rel_shift'  # 'none', 'rel_shift' or 'factorized'
 
 
@@ -87,7 +89,10 @@ class FunnelAttention(nn.Module):
 
         self.hparams = hparams
         self.causal = False
-        self.separate_cls = hparams.separate_cls
+
+        # Low priority to-do: make this work properly again
+        if hparams.separate_cls:
+            raise NotImplementedError
 
         self.dropout = hparams.dropout
         self.dropatt = hparams.attention_dropout
@@ -119,24 +124,15 @@ class FunnelAttention(nn.Module):
 
         self.post_proj = EinsumLayer("...lnh,nhd->...ld", [n_head, d_head], [d_model])
         self.layer_norm = nn.LayerNorm(d_model, eps=hparams.layer_norm_eps)
-        self.normalizer = 1. / np.sqrt(d_head)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        if self.r_w_bias is not None:
-            nn.init.uniform_(self.r_w_bias, b=0.1)
-            nn.init.uniform_(self.r_r_bias, b=0.1)
-            nn.init.uniform_(self.r_kernel, b=0.1)
-        if self.r_s_bias is not None:
-            nn.init.uniform_(self.r_s_bias, b=0.1)
-            nn.init.uniform_(self.seg_embed, b=0.1)
         
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, attn_state: AttentionState) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Tensor = None, pos_encodings = None,
+                seg_matrix: Tensor = None) -> Tensor:
         input_q = q  # Save for residual connection
 
-        # Inject absolute positional encodings at each layer if we're not using relative positional attention
-        if self.hparams.inject_absolute_pos_encodings:
-            q, k, v = (x + positional_encodings_like(x) for x in (q, k, v))
+        # Add absolute positional encodings to the queries and keys, but not the values, as described
+        # in the Shortformer paper.
+        if self.hparams.positional_attention_type == 'none':
+            q, k = (x + positional_encodings_like(x) for x in (q, k))
 
         q = self.q_head(q)
         k = self.k_head(k)
@@ -145,26 +141,21 @@ class FunnelAttention(nn.Module):
         q, k, v = (rearrange(x, '... l h d -> ... h l d') for x in (q, k, v))
 
         if self.r_w_bias is not None:
-            attn_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * self.normalizer
-            attn_score = attn_score + self._attn_pos_term(q, k.size(-2), attn_state)
+            attn_score = (q + self.r_w_bias) @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
+            attn_score = attn_score + self._attn_pos_term(q, k.size(-2), pos_encodings)
         else:
-            attn_score = q @ k.transpose(-2, -1) * self.normalizer
-
-        if (not_cls := attn_state.get_not_cls_mask()) is not None:
-            attn_score *= not_cls
+            attn_score = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
 
         if self.r_s_bias is not None:
-            attn_score = attn_score + self._attn_seg_term(q, attn_state)
+            attn_score = attn_score + self._attn_seg_term(q, seg_matrix)
 
         # Perform masking
-        attn_mask = attn_state.get_attention_mask()
         if self.causal:
-            causal_mask = torch.ones_like(attn_score)
-            causal_mask.triu_(1)
-            attn_mask = causal_mask if attn_mask is None else attn_mask * causal_mask
+            causal_mask = torch.ones(*attn_score.shape[-2:], device=attn_score.device, dtype=torch.bool).triu_(1)
+            mask = causal_mask if mask is None else mask | causal_mask
 
-        if attn_mask is not None:
-            attn_score = attn_score - BIG_CONST * attn_mask
+        if mask is not None:
+            attn_score = attn_score - BIG_CONST * mask
 
         # Attention distribution
         attn_dist = torch.softmax(attn_score, dim=-1)
@@ -181,13 +172,12 @@ class FunnelAttention(nn.Module):
         return output
 
     # A^{position} in the paper
-    def _attn_pos_term(self, q, k_len, attn_state: AttentionState):
-        pos_enc = attn_state.get_positional_encodings(self.hparams.d_model)
+    def _attn_pos_term(self, q, k_len, pos_enc):
         attn_type = self.hparams.positional_attention_type
         
         if attn_type == "factorized":
             enc_q_1, enc_q_2, enc_k_1, enc_k_2 = pos_enc  # seq_len, d_model
-            q_r = (q + self.r_r_bias) @ self.r_kernel.transpose(-2, -1) * self.normalizer
+            q_r = (q + self.r_r_bias) @ self.r_kernel.transpose(-2, -1) * q.shape[-1] ** -0.5
 
             # Broadcast positional encodings across the batch and head dimensions
             q_len = q.shape[-2]
@@ -197,39 +187,46 @@ class FunnelAttention(nn.Module):
             scores = q_r_1 @ enc_k_1[:k_len].transpose(-2, -1) + q_r_2 @ enc_k_2[:k_len].transpose(-2, -1)
 
         elif attn_type == "rel_shift":
-            shift = 1 + (attn_state.block_begin_flag and attn_state.current_block > 0)
-            # shift = 0
+            # The formula below is from the Funnel Transformer paper, page 13.
+            # Q is (B, H, L, D); pos_enc is (L * 4, H * D), r_kernel is (H, H * D, D), so (pos_enc @ r_kernel) is
+            # (H, L * 4, D) and that transposed is (H, D, L * 4), yielding a scores tensor (B, H, L, L * 4) which
+            # we now have to cleverly manipulate into (B, H, L, L). Apparently this gives the same results as
+            # a gather operation, although to be honest I don't understand why.
+            scores = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * q.shape[-1] ** -0.5
 
-            # Funnel Transformer paper, page 13
-            scores = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * self.normalizer
+            temp_shape1 = list(scores.shape)
+            temp_shape2 = temp_shape1.copy()
 
-            # Do the "relative shift"
-            target_shape1 = list(scores.shape)
-            target_shape2 = target_shape1.copy()
-            target_shape1[-2], target_shape1[-1] = target_shape1[-1], target_shape1[-2]
-            
-            scores = scores.reshape(target_shape1)
-            target_shape2[-1] -= shift
-            scores = scores.narrow(-2, shift, target_shape2[-1])
-            scores = scores.reshape(target_shape2)
-            scores = scores.narrow(-1, 0, k_len)
+            # While this operation yields a tensor with the same dimensions as if we had simply transposed
+            # the last two dimensions of `scores` (B, H, L * 4, L), it is important to understand that the
+            # elements of the resulting tensor are NOT laid out in the same way as if we had simply called
+            # `scores.transpose(-1, -2)`; the strides are different.
+            temp_shape1[-2], temp_shape1[-1] = temp_shape1[-1], temp_shape1[-2]
+            scores = scores.reshape(temp_shape1)
+
+            # Remove 1 or 2 positions from the left end of the tensor across the long L * 4 dimension
+            shift = 1 + (q.shape[-2] != k_len)
+            temp_shape2[-1] -= shift
+            scores = scores.narrow(-2, shift, temp_shape2[-1])
+
+            # Now reshape to (B, H, L, (L * 4) - (1 or 2))
+            scores = scores.reshape(temp_shape2)
+            scores = scores.narrow(-1, 0, k_len)  # Chop off the rightmost elements to get (B, H, L, L)
         else:
             raise NotImplementedError
 
         return scores
 
-    def _attn_seg_term(self, q_head, attn_state: AttentionState):
-        # segment based attention score
-        segment_matrix = attn_state.get_segment_matrix()
-        if segment_matrix is None:
+    def _attn_seg_term(self, q, seg_matrix: Tensor):
+        if seg_matrix is None:
             seg_term = 0
         else:
-            r_s_bias = self.r_s_bias.unsqueeze(-2) * self.normalizer
+            r_s_bias = self.r_s_bias.unsqueeze(-2) * q.shape[-1] ** -0.5
 
-            seg_term = torch.einsum("...ind,snd->...nis", (q_head + r_s_bias).movedim(2, 1), self.seg_embed)
-            tgt_shape = list(segment_matrix.shape)
+            seg_term = torch.einsum("...ind,snd->...nis", (q + r_s_bias).movedim(2, 1), self.seg_embed)
+            tgt_shape = list(seg_matrix.shape)
             tgt_shape.insert(-2, self.hparams.num_heads)
-            segment_matrix = segment_matrix.unsqueeze(-3).expand(tgt_shape)
+            segment_matrix = seg_matrix.unsqueeze(-3).expand(tgt_shape)
             different, same = seg_term.chunk(2, dim=-1)
             different = different.expand(tgt_shape)
             same = same.expand(tgt_shape)

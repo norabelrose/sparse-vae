@@ -6,10 +6,10 @@ from abc import ABC
 from dataclasses import dataclass
 from functools import partial
 from omegaconf import DictConfig
-from torch import Tensor
-from torch.optim import AdamW
+from torch import nn, Tensor
 from torch.optim.lr_scheduler import LambdaLR
 from typing import *
+from ..train_callbacks import UnconditionalSampler
 
 
 @dataclass
@@ -18,11 +18,16 @@ class LanguageModelHparams(ABC):
     grad_clip_threshold: float = 150.0
     lr: float = 1e-4
     lr_decay_steps: Optional[int] = 150_000
-    vocab_size: int = 30522
     warmup_steps: int = 1000
     adam_beta1: float = 0.9
-    adam_eps: float = 1e-8
+    adam_eps: float = 1e-7  # We need to use 1e-7 and not the default 1e-8 since 1e-8 underflows to 0 on fp16
     weight_decay: float = 0.01
+
+    vocab_size: int = 30522
+    padding_idx: int = 0
+    start_token: Optional[int] = None  # If None, it's read off the datamodule's Tokenizer object
+    end_token: Optional[int] = None
+    log_samples: bool = True
 
 
 # noinspection PyMethodMayBeStatic
@@ -32,16 +37,20 @@ class LanguageModel(pl.LightningModule, ABC):
         self.save_hyperparameters(hparams)
 
         self.example_input_array = {'batch': {
-            'token_ids': torch.zeros(1, 192, dtype=torch.long),
-            'padding_mask': torch.zeros(1, 192, dtype=torch.float)}
+            'token_ids': torch.zeros(1, 256, dtype=torch.long),
+            'padding_mask': torch.zeros(1, 256, dtype=torch.bool)}
         }
         self.tokenizer = None
-        self.start_token = None
-        self.end_token = None
+        self.start_token = hparams.start_token
+        self.end_token = hparams.end_token
+
+    def configure_callbacks(self):
+        return [UnconditionalSampler()] if self.hparams.log_samples else []
 
     # The callbacks need to have access to a tokenizer, so let's get a reference to the datamodule's tokenizer.
-    def on_train_start(self):
-        self.tokenizer = self.trainer.datamodule.tokenizer
+    def setup(self, stage: str):
+        datamodule = self.trainer.datamodule if stage == 'fit' else self.datamodule
+        self.tokenizer = datamodule.tokenizer
 
         if not self.start_token and not self.end_token:
             vocab = self.tokenizer.get_vocab()
@@ -49,7 +58,13 @@ class LanguageModel(pl.LightningModule, ABC):
             self.end_token = vocab['[SEP]']
 
     def configure_optimizers(self, lr: float = None, params = None):
-        adam = AdamW(
+        try:
+            from deepspeed.ops.adam import FusedAdam as Adam
+        except ImportError:
+            print("Couldn't import fused Adam kernel from DeepSpeed, falling back on PyTorch version.")
+            from torch.optim import Adam
+
+        adam = Adam(
             params or self.parameters(),
             lr=lr or self.hparams.lr,
             betas=(self.hparams.adam_beta1, 0.999),
@@ -63,6 +78,16 @@ class LanguageModel(pl.LightningModule, ABC):
             'interval': 'step'
         }]
 
+    def initialize_weights(self):
+        # Default BERT weight initialization
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.data.normal_(0.0, 0.02)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+            elif isinstance(module, nn.Embedding):
+                module.weight.data.normal_(0.0, 0.02)
+
     # These implementations are used by LSTMLanguageModel and TransformerLanguageModel, but are overriden by
     # HierarchicalAutoencoder and TextFlow
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Tensor:
@@ -70,23 +95,16 @@ class LanguageModel(pl.LightningModule, ABC):
         loss = F.cross_entropy(
             input=logits[:, :-1].flatten(0, 1),          # Remove final [SEP] token
             target=batch['token_ids'][:, 1:].flatten(),  # Remove initial [CLS] token
-            ignore_index=0
+            ignore_index=self.hparams.padding_idx
         )
 
         # Log the entropy of the model's probability distribution over words to see how confident it is
         self.log('logit_entropy', (logits * F.softmax(logits, dim=-1)).sum(dim=-1).mean())
-        self.log('train_loss' if not val else 'val_loss', loss, on_step=not val, on_epoch=val)
+        self.log('train_nll' if not val else 'val_nll', loss, on_step=not val, on_epoch=val)
         return loss
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         return self.training_step(batch, batch_index, val=True)
-
-    def decode_logits(self, logits: Tensor, min_length: int = 10, k: int = 1):
-        # Make [SEP] infinitely unlikely until we hit the min length
-        logits[:, :min_length, self.end_token] = -float('inf')
-
-        output = logits.topk(k).indices
-        return output.squeeze(-1) if k == 1 else output
 
     # Called by UnconditionalSampler callback
     def sample(self, max_length: int, count: int = 1, **kwargs):

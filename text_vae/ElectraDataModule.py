@@ -8,7 +8,7 @@ class ElectraDataModule(MLMDataModule):
         hparams.dataset_name = 'electra'
         hparams.max_tokens_per_sample = 256
         hparams.use_finetuned_tokenizer = False
-        hparams.uniform_length_batching = False
+        # hparams.uniform_length_batching = False
 
         hparams.include_unmasked_tokens_in_labels = False
         hparams.pad_to_max_length = True

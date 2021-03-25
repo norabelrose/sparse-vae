@@ -1,4 +1,4 @@
-from text_vae.core.Autoencoder import *
+from torch import Tensor
 from .AutoencoderCallback import *
 
 
@@ -14,10 +14,10 @@ class AggressiveEncoderTraining(AutoencoderCallback):
     _last_loss: float = field(default=0.0, init=False)
     _last_mutual_info: float = field(default=0.0, init=False)
 
-    def on_train_start(self, trainer, autoencoder: ContinuousVAE):
+    def on_train_start(self, trainer, autoencoder):
         autoencoder.decoder_requires_grad_(False)
 
-    def on_train_batch_end(self, trainer, autoencoder: ContinuousVAE, outputs, batch, batch_idx, dl_idx):
+    def on_train_batch_end(self, trainer, autoencoder, outputs, batch, batch_idx, dl_idx):
         if self._aggressive_stage_complete:
             return
 
@@ -37,7 +37,7 @@ class AggressiveEncoderTraining(AutoencoderCallback):
             self._last_decoder_update = cur_step
             self._last_loss = new_loss
 
-    def on_validation_end(self, trainer, autoencoder: ContinuousVAE):
+    def on_validation_end(self, trainer, autoencoder):
         if trainer.running_sanity_check or self._aggressive_stage_complete:
             return
 
@@ -52,7 +52,7 @@ class AggressiveEncoderTraining(AutoencoderCallback):
         else:
             self._last_mutual_info = new_mutual_info
 
-    def end_aggressive_training(self, autoencoder: ContinuousVAE):
+    def end_aggressive_training(self, autoencoder):
         autoencoder.print("Aggressive encoder training complete.")
 
         self._aggressive_stage_complete = True

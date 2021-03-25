@@ -1,4 +1,4 @@
-from .AutoencoderCallback import AutoencoderCallback, AutoencoderCallbackRegistry
+from .AutoencoderCallback import AutoencoderCallback
 from .AggressiveEncoderTraining import *
 from .KLAnnealing import *
 from .PosteriorCollapseEarlyStopping import *

@@ -1,7 +1,7 @@
 from .AttentionState import *
 from .FunnelOps import AttentionHparams, PositionwiseFFN, FunnelAttention
 from .RemoteModels import *
-from ..core import PositionalEncoding
+from ..core import PaddedTensor, PositionalEncoding
 from ..core.Utilities import *
 from dataclasses import dataclass, field
 from numpy import prod
@@ -21,13 +21,16 @@ class FunnelTransformerHparams(AttentionHparams):
     # If None, d_embedding is set to equal d_model. For the generator in ELECTRA pretraining they are different.
     d_embedding: Optional[int] = None
     max_seq_length: Optional[int] = None
+    padding_idx: Optional[int] = 0
     vocab_size: int = 30522
 
     # Whether to return the pre-pooling output of each block
     return_block_outputs: bool = True
     use_embedding: bool = True
 
-    use_transpose_convs: bool = False  # Use transpose convolutions instead of nearest-neighbor upsampling
+    # Use strided convolutions instead of average pooling for downsampling, and
+    # transpose convolutions instead of nearest-neighbor upsampling
+    use_convolutions: bool = True
     upsampling: bool = False  # True for the "reverse" funnel transformer; e.g. a VAE decoder
 
     def __post_init__(self):
@@ -39,7 +42,7 @@ class FunnelTransformerHparams(AttentionHparams):
 class FunnelTransformerOutput:
     original_ids: Tensor
     final_state: Tensor
-    hidden_states: List[Tensor] = field(default_factory=list)  # May be empty list
+    hidden_states: List[PaddedTensor] = field(default_factory=list)  # May be empty list
 
     embedded_input: Optional[Tensor] = None
 
@@ -65,17 +68,21 @@ class FunnelTransformer(nn.Module):
         else:
             self.abs_pos_encodings = None
 
-        if hparams.upsampling and hparams.use_transpose_convs:
-            self.upsamplers = nn.ModuleList([
-                nn.ConvTranspose1d(hparams.d_model, hparams.d_model, kernel_size=scale, stride=scale)
+        if hparams.use_convolutions:
+            conv_type = nn.ConvTranspose1d if hparams.upsampling else nn.Conv1d
+            self.scalers = nn.ModuleList([
+                conv_type(hparams.d_model, hparams.d_model, kernel_size=scale, stride=scale)
                 for scale in hparams.scaling_factors
             ])
         else:
-            self.upsamplers = None
+            self.scalers = nn.ModuleList([
+                nn.Upsample(scale_factor=scale) if hparams.upsampling else nn.AvgPool1d(kernel_size=scale)
+                for scale in hparams.scaling_factors
+            ])
 
         if not hparams.upsampling and hparams.use_embedding:
             input_modules = [
-                nn.Embedding(hparams.vocab_size, hparams.d_embedding),
+                nn.Embedding(hparams.vocab_size, hparams.d_embedding, padding_idx=hparams.padding_idx),
                 nn.LayerNorm(hparams.d_embedding, eps=hparams.layer_norm_eps),
                 nn.Dropout(hparams.dropout)
             ]
@@ -117,14 +124,6 @@ class FunnelTransformer(nn.Module):
 
         raise ValueError
 
-    # Scale the weights of each layer by 1/sqrt(N) where N is the depth of the layer
-    @torch.no_grad()
-    def scale_parameters(self, *, depth: int = 0):
-        depth = depth or len(self.layers)
-        for i, layer in enumerate(self.layers):  # noqa
-            for param in layer.parameters():
-                param.data *= depth ** -0.5
-
     # Vanilla function wrapper for forward_coroutine()
     def forward(self, x: Tensor, **kwargs) -> FunnelTransformerOutput:
         coroutine = self.forward_coroutine(x, **kwargs)
@@ -134,7 +133,7 @@ class FunnelTransformer(nn.Module):
     # of the Transformer layers that produced them. The consumer of this coroutine is allowed to send back transformed
     # versions of these hidden states, which are then used as the input to the next layer in the Transformer.
     def forward_coroutine(self, x: Tensor, padding_mask: Optional[Tensor] = None, segment_ids: Optional[Tensor] = None,
-                          cross_attn_target: Optional[Union[Tensor, List[Tensor]]] = None):
+                          start_block: int = 0, end_block: int = None):
         attn_state = self.attention_state
         hparams = self.hparams
         original = x
@@ -148,36 +147,41 @@ class FunnelTransformer(nn.Module):
         # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
         # for the current input, because that could result in it getting configured twice
         if not attn_state.shared:
-            attn_state.configure_for_input(x.shape[-2], x.dtype, x.device, padding_mask, segment_ids)
+            attn_state.configure_for_input(x.shape[-2], padding_mask, segment_ids)
 
         hidden_states = []
-        layer_iter = iter(self.layers)
+        context = None
+
+        blocks = self.hparams.block_sizes
+        start_layer = sum(blocks[:start_block])
+        layer_iter = iter(self.layers[start_layer:])
+
+        num_blocks = len(blocks)
+        end_block = end_block % num_blocks if end_block else num_blocks
+        last_block = num_blocks - 1
+
+        attn_state.current_block = start_block
         q = kv = x
 
-        # We have a possibly empty list of tensors that we can cross-attend to, and every time we run into a
-        # FunnelLayer that supports cross attention we pop a tensor off the list and have it attend to that
-        if cross_attn_target is None:
-            cross_attn_target = []
-        elif not isinstance(cross_attn_target, list):
-            cross_attn_target = [cross_attn_target]
+        for block_idx, block_size in enumerate(self.hparams.block_sizes[start_block:end_block], start=start_block):
+            padding = attn_state.padding_mask_with_length(kv.shape[-2])
+            mask = padding[:, None, None, :] if padding is not None else None
 
-        cross_attn_iter = iter(cross_attn_target)
-        last_block = len(self.hparams.block_sizes) - 1
-
-        for block_idx, block_size in enumerate(self.hparams.block_sizes):
             for rel_layer_idx in range(block_size):
                 # Let AttentionState know we're starting a new block
                 attn_state.block_begin_flag = (rel_layer_idx == 0)
                 layer = next(layer_iter)
 
-                x_attn_target = next(cross_attn_iter, None) if layer.use_cross_attention else None
-                q = kv = layer(q, kv, attn_state, cross_attn_keys=x_attn_target)
+                q = kv = layer(q, kv, mask, attn_state, context=context)
+                if mask.shape[-1] != kv.shape[-2]:
+                    padding = attn_state.padding_mask_with_length(kv.shape[-2])
+                    mask = padding[:, None, None, :] if padding is not None else None
 
                 attn_state.block_begin_flag = False
 
             # Cache block outputs if indicated
             if hparams.return_block_outputs:
-                hidden_states.append(kv)
+                hidden_states.append(PaddedTensor(data=kv, padding=padding))
 
             # We don't need to do any of this stuff if we just finished the last block
             if block_idx == last_block:
@@ -188,6 +192,13 @@ class FunnelTransformer(nn.Module):
             # The consumer of this generator may or may not send us anything
             maybe_transformed_q = yield block_idx, q
             if maybe_transformed_q is not None:
+                # The consumer of this generator can send us tensors to cross-attend to
+                if isinstance(maybe_transformed_q, tuple):
+                    context = maybe_transformed_q[1]
+                    maybe_transformed_q = maybe_transformed_q[0]
+                else:
+                    context = None
+
                 q = kv = maybe_transformed_q
                 yield  # Don't return anything from the .send() method
 
@@ -218,12 +229,8 @@ class FunnelTransformer(nn.Module):
 
         attn_state.current_block = cur_block + 1
 
-        if self.upsamplers:
-            conv = self.upsamplers[cur_block]
-            return conv(x.movedim(-1, -2)).movedim(-2, -1)
-
-        new_stride = attn_state.strides[attn_state.current_block]
-        return attn_state.scale_tensor(x, attn_state.max_seq_len // new_stride)
+        scaler = self.scalers[cur_block]
+        return scaler(x.movedim(-1, -2)).movedim(-2, -1)
 
     # Gives you both the block and (absolute) layer indices while iterating
     def enumerate_blocks_and_layers(self) -> Iterator:
@@ -256,7 +263,7 @@ class FunnelTransformer(nn.Module):
 
         # Don't forget about the embeddings
         assert len(self.input_layer) == 3   # We don't support loading PyTorch weights where d_embedding != d_model
-        self.input_layer.load_state_dict({
+        self.input_layer.load_state_dict({  # noqa
             '0.weight': state_dict['input_layer.0.lookup_table'],
             '1.weight': state_dict['input_layer.1.weight'],
             '1.bias': state_dict['input_layer.1.bias']
@@ -343,11 +350,15 @@ class FunnelLayer(nn.Module):
         self.cross_attention = FunnelAttention(self.hparams) if value else None
 
     # Q is different from K and V right after pooling; K and V are always the same
-    def forward(self, q: Tensor, kv: Tensor, attn_state: AttentionState, cross_attn_keys: Tensor = None) -> Tensor:
+    def forward(self, q: Tensor, kv: Tensor, mask: Tensor, attn_state: AttentionState, context: Tensor = None) -> Tensor:
+        pos_encodings = attn_state.get_positional_encodings(kv.shape[-1], q.device)
+
         # These custom attention and feedforward layers have built-in residual connections
-        q = self.attention(q, kv, kv, attn_state)
-        if cross_attn_keys is not None:
-            q = self.cross_attention(q, cross_attn_keys, cross_attn_keys, attn_state)  # noqa
+        q = self.attention(q, kv, kv, mask=mask, pos_encodings=pos_encodings)
+        if context is not None:
+            ctx_len = context.shape[-2]
+            mask = attn_state.padding_mask_with_length(ctx_len)[:, None, None, :] if context is not None else None
+            q = self.cross_attention(q, context, context, mask=mask, pos_encodings=pos_encodings)  # noqa
 
         q = self.feedforward(q)
         return q

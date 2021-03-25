@@ -8,7 +8,7 @@ import torch
 
 @dataclass
 class AdversarialAutoencoderHparams(FunnelAutoencoderHparams):
-    encoder: FunnelTransformerHparams = FunnelTransformerHparams(
+    funnel: FunnelTransformerHparams = FunnelTransformerHparams(
         d_model=512,
         num_heads=8,
         block_sizes=(4, 4),
@@ -47,7 +47,7 @@ class AdversarialAutoencoder(HierarchicalAutoencoder):
         self.skip_validation = False
         self.training_status = 'critic'
 
-        encoder_hparams = hparams.encoder
+        encoder_hparams = hparams.funnel
         self.num_scales = len(encoder_hparams.block_sizes)
         self.critic = Critic(
             encoder_hparams=encoder_hparams,
@@ -93,7 +93,7 @@ class AdversarialAutoencoder(HierarchicalAutoencoder):
         return fake_latents if not self.hparams.constrain_to_unit_sphere else [z.tanh() for z in fake_latents]
 
     def get_latents(self, x: Tensor) -> List[Tensor]:
-        self.encoder.attention_state.configure_for_input(x.shape[-1], x.dtype, x.device, padding_mask=None)
+        self.encoder.attention_state.configure_for_input(x.shape[-1], padding_mask=None)
         encoder_output = self.encoder(x)
 
         latents = [downsampler(z) for downsampler, z in zip(
@@ -265,14 +265,12 @@ class AdversarialAutoencoder(HierarchicalAutoencoder):
     def markov_chain_sample(self, max_length: int = 40, num_samples: int = 1, k: int = 100, num_iter: int = 100,
                             masked_tokens_per_iter: int = 1, anneal_temperature: bool = False):
         # Find the sequence length dimension that the seed should have in order to generate the desired output length
-        funnel_hparams = self.hparams.encoder
+        funnel_hparams = self.hparams.funnel
         stride = prod(funnel_hparams.scaling_factors)
         length = max_length // stride
 
         self.decoder.attention_state.configure_for_input(
             seq_len=length * stride,  # May not be the same as max_length if it doesn't divide evenly
-            dtype=torch.long,
-            device=self.device,
             padding_mask=None,
             upsampling=True
         )
@@ -281,8 +279,8 @@ class AdversarialAutoencoder(HierarchicalAutoencoder):
         latents = self.fake_latent_sample([num_samples, length, depth])
         latents = [upsampler(z) for upsampler, z in zip(self.latent_upsamplers, latents)]
 
-        logits = self.output_layer(self.decoder(latents[0], cross_attn_target=latents[1:]).final_state)
-        tokens = self.decode_logits(logits)
+        logits = self.output_layer(self.decoder(latents[0], cross_attn_iter=latents[1:]).final_state).logits
+        tokens = logits.argmax(dim=-1)
         yield tokens
 
         mask_token = self.tokenizer.get_vocab()['[MASK]']
@@ -323,7 +321,6 @@ class Generator(nn.Module):
         funnel_hparams.d_model = d_model
         funnel_hparams.scaling_factors = funnel_hparams.scaling_factors[::-1]
         funnel_hparams.upsampling = True
-        funnel_hparams.use_transpose_convs = True
 
         self.base_dist = AutoregressiveGaussian(d_model)
         self.downsamplers = nn.ModuleList([

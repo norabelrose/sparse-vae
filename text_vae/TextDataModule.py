@@ -16,17 +16,18 @@ import warnings
 
 @dataclass
 class TextDataModuleHparams:
-    batch_size: int = 32
+    batch_size: int = 64
 
+    batching_strategy: str = 'uniform_size'  # 'uniform_size', 'uniform_size_prebatched', 'uniform_length', 'random'
     chunking_strategy: str = 'none'  # 'sentence', 'token', or 'none'
-    dataset_name: str = 'pg19'
+    dataset_name: str = 'yelp_polarity'
+    dataset_config: Optional[str] = None
     max_sentences_per_sample: Optional[int] = None
     min_tokens_per_sample: int = 16
     max_tokens_per_sample: int = 512
     pad_to_max_length: bool = False
     pad_to_multiple_of: int = 1
     split: str = 'train'    # Any string of the format supported by the HuggingFace datasets library
-    uniform_length_batching: bool = True
     use_finetuned_tokenizer: bool = True
     vocab_size: int = 30522
     dataset_save_dir: str = os.path.join(os.getcwd(), 'text-vae-datasets')
@@ -46,7 +47,6 @@ class TextDataModule(pl.LightningDataModule):
         self.batch_size = hparams.batch_size
         self.hparams = hparams
         self.dataset = None     # HuggingFace Dataset object, possibly with both train and test splits
-        self.token_freqs = torch.zeros(hparams.vocab_size, dtype=torch.long)
         self.special_token_threshold = 5 if hparams.use_finetuned_tokenizer else 1000
 
         self._preproc_batch_size = None
@@ -80,20 +80,26 @@ class TextDataModule(pl.LightningDataModule):
 
     # Subclass hook
     def create_dataset(self):
-        self.dataset = load_dataset(self.hparams.dataset_name, split=self.hparams.split,
-                                    cache_dir=self.hparams.dataset_save_dir)
+        self.dataset = load_dataset(self.hparams.dataset_name, name=self.hparams.dataset_config,
+                                    split=self.hparams.split, cache_dir=self.hparams.dataset_save_dir)
 
     def prepare_data(self, *args, **kwargs):
         self.create_dataset()   # Download or load a big file from disk
         assert self.dataset
-
-        self.setup_tokenizer()
 
         min_tokens = self.hparams.min_tokens_per_sample
         max_tokens = self.hparams.max_tokens_per_sample
 
         nontext_cols = self.dataset.column_names
         nontext_cols.remove('text')
+
+        # Weirdly the yelp_polarity dataset uses the sequence '\ n' instead of actual newlines, and
+        # '\ " "' instead of simple double quotes, so we fix that here.
+        if self.hparams.dataset_name == 'yelp_polarity':
+            def remove_backslashes(batch: Dict[str, list]) -> Dict[str, list]:
+                return {'text': [text.replace(r'\ n', '\n').replace(r'\ " "', '"') for text in batch['text']]}
+
+            self.dataset = self.dataset.map(remove_backslashes, batched=True, batch_size=self.preproc_batch_size)
 
         chunk_strategy = self.hparams.chunking_strategy
         # We're either generating single-sentence samples, or multi-sentence samples that respect sentence boundaries
@@ -174,45 +180,62 @@ class TextDataModule(pl.LightningDataModule):
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
         self.dataset = self.dataset.train_test_split(test_size=0.025, shuffle=True)
-        if self.hparams.uniform_length_batching:
+
+        batch_strategy = self.hparams.batching_strategy
+        if batch_strategy != 'random':
             print("Sorting samples by length...")
             self.dataset = self.dataset.sort('num_tokens')
+
+            if batch_strategy == 'uniform_size_prebatched':
+                print("Grouping into roughly equal sized batches...")
+                self.dataset = self.dataset.map(
+                    perform_uniform_size_batching, batched=True, batch_size=self.preproc_batch_size,
+                    fn_kwargs=dict(max_size=self.batch_size * max_tokens, length_key='num_tokens')
+                )
 
     def setup(self, stage: Optional[str] = None):
         self.dataset.set_format('torch')
 
     def train_dataloader(self, *args, **kwargs) -> DataLoader:
-        if self.hparams.uniform_length_batching:
-            sampler = ContiguousRandomSampler(dataset_length=len(self.dataset['train']), batch_size=self.batch_size)
-            shuffle = False
-            batch_size = 1
+        split = kwargs.get('split') or 'train'
+        strategy = self.hparams.batching_strategy
+        sampler = None
+        shuffle = False
+        batch_size = 1
+
+        if strategy == 'uniform_length':
+            sampler = ContiguousRandomSampler(dataset_length=len(self.dataset[split]), batch_size=self.batch_size)
+        elif strategy == 'uniform_size':
+            sampler = UniformSizeRandomSampler(
+                sample_lengths=self.dataset[split]['num_tokens'].tolist(),
+                max_tokens_per_batch=self.batch_size * self.hparams.max_tokens_per_sample
+            )
         else:
-            sampler = None
             shuffle = True
-            batch_size = self.batch_size
+            if strategy != 'uniform_size_prebatched':
+                batch_size = self.batch_size
 
         return DataLoader(
-            self.dataset['train'], batch_sampler=sampler, batch_size=batch_size, shuffle=shuffle,
-            collate_fn=self.collate, pin_memory=True, num_workers=min(20, cpu_count())
+            self.dataset[split], batch_sampler=sampler, batch_size=batch_size,
+            shuffle=shuffle, collate_fn=self.collate, pin_memory=True, num_workers=min(20, cpu_count())
         )
 
     def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
-        return DataLoader(
-            self.dataset['test'], batch_size=self.batch_size, collate_fn=self.collate,
-            pin_memory=True, num_workers=min(20, cpu_count())
-        )
+        return self.train_dataloader(split='test')
 
     def test_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return self.val_dataloader()
 
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        # Combine into a single batched and padded tensor
-        tokens = self.pad_pack([x['text'] for x in inputs])
+        if self.hparams.batching_strategy == 'uniform_size_prebatched':
+            text = inputs[0]['text']
+            word_counts = inputs[0]['num_words']
+        else:
+            text = [x['text'] for x in inputs]
+            word_counts = [x['num_words'] for x in inputs]
 
-        padding_mask = tokens.eq(0).float()
-        word_counts = torch.stack([x['num_words'] for x in inputs])
-
-        return {'padding_mask': padding_mask, 'token_ids': tokens, 'word_count': word_counts}
+        tokens = self.pad_pack(text)
+        return {'padding_mask': tokens.eq(0), 'token_ids': self.pad_pack(text), 'word_count': torch.stack(word_counts)}
 
     def pad_pack(self, tokens: List[Tensor], pad_value: float = 0.0) -> Tensor:
         tokens = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=pad_value)

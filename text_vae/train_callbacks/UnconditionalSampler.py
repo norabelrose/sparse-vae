@@ -1,4 +1,3 @@
-from text_vae.core.LanguageModel import LanguageModel
 from .AutoencoderCallback import *
 
 
@@ -9,17 +8,21 @@ class UnconditionalSampler(AutoencoderCallback):
     sampling_temperature: float = 0.85  # Taken from Very Deep VAEs paper
     train_step_interval: int = 1000
 
-    def on_train_batch_end(self, trainer, langmodel: LanguageModel, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(self, trainer, langmodel, outputs, batch, batch_idx, dataloader_idx):
         cur_step = langmodel.global_step
         if cur_step % self.train_step_interval != 0:
+            return
+
+        logger = trainer.logger
+        if not logger:
             return
 
         samples = langmodel.sample(self.sample_max_len, self.num_samples, temperature=self.sampling_temperature)
         if samples is None:
             return
 
-        logger = trainer.logger.experiment
-        tokenizer = langmodel.tokenizer
+        logger = logger.experiment
+        tokenizer = trainer.datamodule.tokenizer
 
         # List of Markov chain MLM iterations
         if isinstance(samples, list):
