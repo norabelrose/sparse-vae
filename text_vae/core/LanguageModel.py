@@ -16,15 +16,14 @@ from ..train_callbacks import UnconditionalSampler
 class LanguageModelHparams(ABC):
     batch_size: int = 0  # This is here just for compatibility with pl.Trainer's auto_scale_batch_size feature
     grad_clip_threshold: float = 150.0
-    lr: float = 1e-4
+    lr: float = 2.5e-4
     lr_decay_steps: Optional[int] = 150_000
     warmup_steps: int = 1000
     adam_beta1: float = 0.9
-    adam_eps: float = 1e-7  # We need to use 1e-7 and not the default 1e-8 since 1e-8 underflows to 0 on fp16
+    adam_eps: float = 1e-6  # We need to use 1e-6 and not the default 1e-8 since 1e-8 underflows to 0 on fp16
     weight_decay: float = 0.01
 
     vocab_size: int = 30522
-    padding_idx: int = 0
     start_token: Optional[int] = None  # If None, it's read off the datamodule's Tokenizer object
     end_token: Optional[int] = None
     log_samples: bool = True
@@ -78,29 +77,48 @@ class LanguageModel(pl.LightningModule, ABC):
             'interval': 'step'
         }]
 
-    def initialize_weights(self):
+    def initialize_weights(self, scale: float = 0.02):
         # Default BERT weight initialization
         for module in self.modules():
-            if isinstance(module, nn.Linear):
-                module.weight.data.normal_(0.0, 0.02)
-                if module.bias is not None:
-                    module.bias.data.zero_()
-            elif isinstance(module, nn.Embedding):
-                module.weight.data.normal_(0.0, 0.02)
+            if isinstance(module, nn.LayerNorm) or getattr(module, 'no_initialize', False):
+                continue
 
-    # These implementations are used by LSTMLanguageModel and TransformerLanguageModel, but are overriden by
-    # HierarchicalAutoencoder and TextFlow
+            if hasattr(module, 'weight'):
+                module.weight.data.normal_(0.0, scale)
+            if getattr(module, 'bias', None) is not None:
+                module.bias.data.zero_()
+
+    def stats_from_logits(self, logits: Tensor, batch: Dict[str, Tensor], autoregressive: bool = False):
+        ground_truth, word_counts = batch['token_ids'], batch.get('num_words')
+        if autoregressive:
+            logits = logits[:, :-1]             # Remove final [SEP] token
+            ground_truth = ground_truth[:, 1:]  # Remove initial [CLS] token
+
+        log_probs = logits.log_softmax(dim=-1)
+        loss = F.nll_loss(input=log_probs.flatten(0, 1), target=ground_truth.flatten(), ignore_index=0)
+
+        # Normalize the NLL using the number of words, not number of tokens, so that it's comparable across
+        # different subword vocabularies
+        if word_counts is not None:
+            token_counts = batch['num_tokens'] if 'num_tokens' in batch else (~batch['padding_mask']).sum(dim=-1)
+            ppl_loss = loss * token_counts / word_counts
+        else:
+            ppl_loss = loss
+
+        # For some reason it's convention to use base 2 for perplexity scores
+        ppl = 2 ** (ppl_loss / math.log(2))
+        entropy = -(log_probs * log_probs.exp()).sum(dim=-1).mean()
+        return loss, ppl, entropy
+
+    # These implementations are used by LSTMLanguageModel and TransformerLanguageModel, but are overriden by others
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Tensor:
         logits = self.forward(batch)
-        loss = F.cross_entropy(
-            input=logits[:, :-1].flatten(0, 1),          # Remove final [SEP] token
-            target=batch['token_ids'][:, 1:].flatten(),  # Remove initial [CLS] token
-            ignore_index=self.hparams.padding_idx
-        )
+        loss, ppl, entropy = self.stats_from_logits(logits, batch, autoregressive=True)
 
         # Log the entropy of the model's probability distribution over words to see how confident it is
-        self.log('logit_entropy', (logits * F.softmax(logits, dim=-1)).sum(dim=-1).mean())
+        self.log('pred_entropy', entropy)
         self.log('train_nll' if not val else 'val_nll', loss, on_step=not val, on_epoch=val)
+        self.log('train_ppl' if not val else 'val_ppl', ppl, on_step=not val, on_epoch=val)
         return loss
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:

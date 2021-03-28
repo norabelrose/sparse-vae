@@ -3,7 +3,6 @@ from .funnel_transformers.FunnelTransformer import *
 from .TextDataModule import *
 from copy import deepcopy
 from numpy import prod
-from torch.distributions import Categorical
 
 
 @dataclass
@@ -11,8 +10,8 @@ class FunnelAutoencoderHparams(AutoencoderHparams):
     funnel: FunnelTransformerHparams = FunnelTransformerHparams(
         d_model=512,
         num_heads=8,
-        block_sizes=(2, 2, 2),  # Number of layers in each encoder block; reversed for the decoder
-        scaling_factors=(2, 2),  # How much the hidden state is downsampled between each encoder block
+        block_sizes=(4, 2),  # Number of layers in each encoder block; reversed for the decoder
+        scaling_factors=(2,),  # How much the hidden state is downsampled between each encoder block
     )
     max_seq_length: Optional[int] = None
     tie_embedding_weights: bool = True
@@ -46,17 +45,14 @@ class FunnelAutoencoder(LanguageModel, ABC):
 
         self.decoder = FunnelTransformer(decoder_hparams)
         self.decoder.attention_state = attn_state
-        self.setup_output_layer(hparams)
 
-    def setup_output_layer(self, hparams: DictConfig):
-        d_model = hparams.funnel.d_model
+        d_model = funnel_hparams.d_model
         output_embedding = nn.Linear(d_model, hparams.vocab_size)
         output_layers = [
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
-            output_embedding,
-            LambdaLayer(lambda x: Categorical(logits=x))
+            output_embedding
         ]
         self.output_layer = nn.Sequential(*output_layers)
 

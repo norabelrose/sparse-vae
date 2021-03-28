@@ -4,7 +4,7 @@ from .AutoencoderCallback import *
 @dataclass
 class UnconditionalSampler(AutoencoderCallback):
     num_samples: int = 1
-    sample_max_len: int = 40
+    sample_max_len: int = 512
     sampling_temperature: float = 0.85  # Taken from Very Deep VAEs paper
     train_step_interval: int = 1000
 

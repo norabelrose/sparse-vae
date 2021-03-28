@@ -1,11 +1,11 @@
 from .QuantizedVAE import *
 from .QuantizedLatentDataModule import *
-from .core import GenerationStrategy, Transformer, select_best_gpu
+from .core import GenerationStrategy, LanguageModel, Transformer, select_best_gpu
 from contextlib import nullcontext
-from datasets import Dataset, load_from_disk
+from datasets import Dataset, DatasetDict, load_from_disk
 from numpy import cumprod
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -20,14 +20,14 @@ class QuantizedVAESamplingOptions:
     decode_tokens: bool = True
     profile: bool = False
     max_length: int = 250
-    strategy: GenerationStrategy = GenerationStrategy.SamplingTopK
+    strategy: GenerationStrategy = GenerationStrategy.SamplingTopP
 
 
 @dataclass
 class QuantizedVAESampler:
     vae_name: str
     vae: QuantizedVAE
-    priors: Dict[int, Transformer] = field(default_factory=dict)
+    priors: Dict[int, LanguageModel] = field(default_factory=dict)
 
     @staticmethod
     def for_vae(name: str):
@@ -134,8 +134,7 @@ class QuantizedVAESampler:
         gpus = hparams.trainer.gpus
         dm_hparams = deepcopy(hparams.data)
 
-        scales = self.vae.decoder.hparams.scaling_factors
-        dm_hparams.batch_size *= int(cumprod(scales)[::-1][level])
+        # scales = self.vae.decoder.hparams.scaling_factors
         dm_hparams.codebook_size = num_codes
         dm_hparams.latent_key = prior_name
         dm_hparams.vae_version_name = self.vae_name
@@ -148,7 +147,7 @@ class QuantizedVAESampler:
         prior_hparams = deepcopy(hparams.prior)
         prior_hparams.log_samples = False
         prior_hparams.lr = 1e-4
-        prior_hparams.num_layers = scales[::-1][level]
+        prior_hparams.num_layers = 6
         prior_hparams.start_token = start_code
         prior_hparams.end_token = end_code
         prior_hparams.cross_attention = level > 0
@@ -164,10 +163,7 @@ class QuantizedVAESampler:
             save_dir='text-vae-logs',
             name='vq-vae-prior'
         ))
-        trainer.callbacks = [
-            EarlyStopping(monitor='val_nll', mode='min'),
-            ckpt_monitor
-        ]
+        trainer.callbacks = [ckpt_monitor]
 
         print(f"Fitting {prior_name} prior...")
         trainer.fit(prior, datamodule=datamodule)
@@ -215,6 +211,32 @@ class QuantizedVAESampler:
             print(f"Generated roughly {num_tokens} tokens in {start.elapsed_time(end)} ms.")
 
         return logits
+
+    def gather_samples_if_needed(self, datamodule: TextDataModule, dataset_name: str):
+        if datamodule.dataset:
+            return
+
+        sample_dir = os.path.join(os.getcwd(), 'text-vae-datasets', 'samples', dataset_name, self.vae_name)
+        try:
+            datamodule.dataset = load_from_disk(sample_dir)
+        except:
+            pass
+        else:
+            return
+
+        os.makedirs(sample_dir, exist_ok=True)
+
+        original_dataset = load_dataset(dataset_name, cache_dir='text-vae-datasets')
+        if not isinstance(original_dataset, DatasetDict):
+            num_samples = len(original_dataset)
+        else:
+            num_samples = sum(len(x) for x in original_dataset.values())
+
+        del original_dataset
+        print(f"No pre-computed samples found for version '{self.vae_name}' and dataset '{dataset_name}'. "
+              f"Preparing to gather {num_samples} samples from the VQ-VAE.")
+
+        self.write_samples_to_disk(Path(sample_dir), num_samples // 500, QuantizedVAESamplingOptions(batch_size=500))  # noqa
 
     @torch.no_grad()
     def write_samples_to_disk(self, path: Path, num_batches: int, options: QuantizedVAESamplingOptions):
@@ -309,27 +331,29 @@ class QuantizedVAESampler:
         # Find the maximum sequence length that the top latent sequence can be allowed to have in order to ensure
         # that the final overt sequence length does not exceed max_length
         funnel_hparams = vae.hparams.funnel
+        num_codes = vae.quantizer.num_codes
         strides = cumprod(funnel_hparams.scaling_factors)[::-1]
 
         latent_seqs = []
         for level, stride in enumerate(strides):
             prior = priors[level]
-            context = latent_seqs[-1] if latent_seqs else None
+            context = latent_seqs[-1].data if latent_seqs else None
 
             max_z_length = options.max_length // stride
-            z = prior.sample(max_length=max_z_length + 2, count=options.batch_size, context=context,
-                             include_padding=True)
-            latent_seqs.append(z)
+            z = prior.sample(max_length=max_z_length + 2, count=options.batch_size, context=context)[..., 1:].squeeze(1)
+            z[z > num_codes] = 0
+            latent_seqs.append(PaddedTensor(data=z, padding=z.eq(0)))
 
         vae.decoder.attention_state.configure_for_input(
             seq_len=options.max_length
         )
-        latent_seqs = [vae.quantizer.lookup_codes(codes[..., 1:-1], level) for level, codes in enumerate(latent_seqs)]
+        for i, z in enumerate(latent_seqs):
+            z.data = vae.quantizer.lookup_codes(z.data, i)
 
         vae_input = QuantizedVAEState()
-        vae_input.decoder_input = vae.quantizer.upsample_codes(latent_seqs[0], level=0)
+        vae_input.decoder_input = vae.quantizer.upsample_codes(latent_seqs[0].data, level=0)
         vae_input.encoder_states = latent_seqs[1:]
-        return vae.decoder_forward(vae_input).logits.argmax(dim=-1)
+        return vae.decoder_forward(vae_input, mask=latent_seqs[0].padding).logits.argmax(dim=-1)
 
     def to(self, device: Union[torch.device, str]):
         self.vae = self.vae.to(device)  # noqa

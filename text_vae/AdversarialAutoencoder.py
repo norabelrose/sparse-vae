@@ -1,7 +1,8 @@
 from .core import AutoregressiveGaussian, Transformer
-from .HierarchicalAutoencoder import *
+from .FunnelAutoencoder import *
 from dataclasses import dataclass
 from math import log
+from torch.distributions import Categorical
 import gc
 import torch
 
@@ -38,7 +39,14 @@ class AdversarialAutoencoderHparams(FunnelAutoencoderHparams):
     critic_weight_clip_threshold: Optional[float] = None
     wasserstein: bool = False
 
-class AdversarialAutoencoder(HierarchicalAutoencoder):
+@dataclass
+class AdversarialAutoencoderState:
+    ground_truth: Optional[Tensor] = None
+    decoder_input: Optional[Tensor] = None
+    encoder_states: List[Tensor] = field(default_factory=list)
+    p_of_x_given_z: Optional[Categorical] = None
+
+class AdversarialAutoencoder(FunnelAutoencoder):
     def __init__(self, hparams: DictConfig):
         super(AdversarialAutoencoder, self).__init__(hparams)
 
@@ -106,7 +114,7 @@ class AdversarialAutoencoder(HierarchicalAutoencoder):
         # Now run the forward pass through the decoder
         big_latents = [upsampler(z) for upsampler, z in zip(self.latent_upsamplers, latents)]
 
-        ae_state = HierarchicalAutoencoderState()
+        ae_state = AdversarialAutoencoderState()
         ae_state.decoder_input = big_latents[0]
         ae_state.encoder_states = big_latents[1:]
         ae_state = self.decoder_forward(ae_state)
@@ -121,6 +129,42 @@ class AdversarialAutoencoder(HierarchicalAutoencoder):
             pbar_dict['training'] = self.training_status
 
         return pbar_dict
+
+    def decoder_forward(self, vae_state: AdversarialAutoencoderState, padding_mask: Tensor = None, **kwargs):
+        attn_state = self.decoder.attention_state
+        attn_state.upsampling = True
+
+        coroutine = self.decoder.forward_coroutine(
+            vae_state.decoder_input,
+            padding_mask=padding_mask,
+            cross_attn_iter=kwargs.get('cross_attn_target')
+        )
+        encoder_state_iter = iter(vae_state.encoder_states)
+
+        for block_idx, decoder_state in coroutine:
+            # Final output
+            if isinstance(decoder_state, FunnelTransformerOutput):
+                vae_state.decoder_output = decoder_state
+                raw_output = decoder_state.final_state
+                vae_state.p_of_x_given_z = self.output_layer(raw_output)
+
+                return vae_state
+
+            if encoder_state_iter:
+                encoder_state = next(encoder_state_iter, None)
+                if encoder_state is None:  # We ran out of encoder states to use
+                    continue
+            else:
+                encoder_state = None
+
+            dec_state = self.decoder_block_end(vae_state, decoder_state, encoder_state, block_idx, **kwargs)
+            if dec_state is not None:
+                coroutine.send(dec_state)
+
+            # Abort the forward pass. Used when gathering latent codes for training the prior model. After we get
+            # the bottom latent feature map we don't actually need to run the last few layers.
+            else:
+                return vae_state
 
     # This method is reused for both training and inference. The compute_loss parameter is only used when
     # self.training == False; during training the loss is always computed.

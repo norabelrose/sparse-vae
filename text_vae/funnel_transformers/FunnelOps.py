@@ -2,11 +2,8 @@ from dataclasses import dataclass
 from einops import rearrange
 from torch import nn, Tensor
 from typing import *
-from ..core import positional_encodings_like
 import numpy as np
 import torch
-
-BIG_CONST = 1e6
 
 
 class EinsumLayer(nn.Module):
@@ -20,7 +17,7 @@ class EinsumLayer(nn.Module):
             self.register_parameter("bias", None)
         
         self.einsum_formula = einsum_formula
-        
+
         # Initialize weights
         fan_in = np.prod(input_shape)
         fan_out = np.prod(output_shape)
@@ -69,14 +66,14 @@ class AttentionHparams:
     d_model: int = 768
     num_heads: int = 12
 
-    attention_dropout: float = 0.1
+    attention_dropout: float = 0.0  # The Funnel Transformer paper used 0.1 but 0.0 seems to work better
     dropout: float = 0.1
     ffn_dropout: float = 0.0
     layer_norm_eps: float = 1e-5
     separate_cls: bool = False
     use_segment_attention: bool = False
 
-    positional_attention_type: str = 'rel_shift'  # 'none', 'rel_shift' or 'factorized'
+    positional_attention_type: str = 'rel_shift'  # 'absolute', 'rel_shift' or 'factorized'
 
 
 class FunnelAttention(nn.Module):
@@ -94,11 +91,8 @@ class FunnelAttention(nn.Module):
         if hparams.separate_cls:
             raise NotImplementedError
 
-        self.dropout = hparams.dropout
-        self.dropatt = hparams.attention_dropout
-
-        self.att_drop = nn.Dropout(self.dropatt)
-        self.hid_drop = nn.Dropout(self.dropout)
+        self.att_drop = nn.Dropout(hparams.attention_dropout)
+        self.hid_drop = nn.Dropout(hparams.dropout)
 
         # The asymmetry (Q proj has no bias, but K and V do) is for backward comp. with Funnel-Transformers checkpoints
         self.q_head = EinsumLayer("...d,dnh->...nh", [d_model], [n_head, d_head], bias=False)
@@ -106,7 +100,7 @@ class FunnelAttention(nn.Module):
         self.v_head = EinsumLayer("...d,dnh->...nh", [d_model], [n_head, d_head])
 
         # These parameters are applied *headwise*, hence they have a extra head dimension
-        if hparams.positional_attention_type != 'none':
+        if hparams.positional_attention_type != 'absolute':
             self.r_w_bias = nn.Parameter(torch.zeros(n_head, 1, d_head))
             self.r_r_bias = nn.Parameter(torch.zeros(n_head, 1, d_head))
             self.r_kernel = nn.Parameter(torch.zeros(n_head, d_model, d_head))
@@ -131,8 +125,9 @@ class FunnelAttention(nn.Module):
 
         # Add absolute positional encodings to the queries and keys, but not the values, as described
         # in the Shortformer paper.
-        if self.hparams.positional_attention_type == 'none':
-            q, k = (x + positional_encodings_like(x) for x in (q, k))
+        if self.hparams.positional_attention_type == 'absolute':
+            q = q + pos_encodings[0]
+            k = k + pos_encodings[1] if len(pos_encodings) > 0 else pos_encodings[0]
 
         q = self.q_head(q)
         k = self.k_head(k)
@@ -155,10 +150,10 @@ class FunnelAttention(nn.Module):
             mask = causal_mask if mask is None else mask | causal_mask
 
         if mask is not None:
-            attn_score = attn_score - BIG_CONST * mask
+            attn_score = attn_score - 1e6 * mask
 
         # Attention distribution
-        attn_dist = torch.softmax(attn_score, dim=-1)
+        attn_dist = attn_score.softmax(dim=-1)
         attn_dist = self.att_drop(attn_dist)
         output = attn_dist @ v
         

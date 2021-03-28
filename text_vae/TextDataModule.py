@@ -1,4 +1,4 @@
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from multiprocessing import cpu_count
 from omegaconf import DictConfig
 from pathlib import Path
@@ -10,13 +10,12 @@ import os
 import numpy as np
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 import warnings
 
 
 @dataclass
 class TextDataModuleHparams:
-    batch_size: int = 64
+    batch_size: int = 8
 
     batching_strategy: str = 'uniform_size'  # 'uniform_size', 'uniform_size_prebatched', 'uniform_length', 'random'
     chunking_strategy: str = 'none'  # 'sentence', 'token', or 'none'
@@ -25,9 +24,8 @@ class TextDataModuleHparams:
     max_sentences_per_sample: Optional[int] = None
     min_tokens_per_sample: int = 16
     max_tokens_per_sample: int = 512
-    pad_to_max_length: bool = False
     pad_to_multiple_of: int = 1
-    split: str = 'train'    # Any string of the format supported by the HuggingFace datasets library
+    split: Optional[str] = None    # Any string of the format supported by the HuggingFace datasets library
     use_finetuned_tokenizer: bool = True
     vocab_size: int = 30522
     dataset_save_dir: str = os.path.join(os.getcwd(), 'text-vae-datasets')
@@ -61,9 +59,15 @@ class TextDataModule(pl.LightningDataModule):
         if not self._preproc_batch_size:
             prng = np.random.default_rng(seed=7295)  # Make this deterministic
 
+            # If we have a dataset with multiple splits, use the largest split
+            if not isinstance(self.dataset, DatasetDict):
+                dataset = self.dataset
+            else:
+                dataset = max(self.dataset.values(), key=lambda x: x.num_rows)
+
             # Get Monte Carlo estimate of the average sample length without actually iterating through the whole dataset
-            indices = prng.choice(len(self.dataset), 10, replace=False)
-            elements = [self.dataset[int(i)] for i in indices]
+            indices = prng.choice(len(dataset), 10, replace=False)
+            elements = [dataset[int(i)] for i in indices]
             avg_len_estimate = sum(len(x['text']) for x in elements) / len(elements)
 
             # 1,000 for 1,000 character samples
@@ -90,7 +94,14 @@ class TextDataModule(pl.LightningDataModule):
         min_tokens = self.hparams.min_tokens_per_sample
         max_tokens = self.hparams.max_tokens_per_sample
 
-        nontext_cols = self.dataset.column_names
+        if isinstance(self.dataset, DatasetDict):
+            cols_by_split = self.dataset.column_names.values()
+            columns = next(iter(cols_by_split))
+
+            assert all(cols == columns for cols in cols_by_split), "All splits must have the same columns"
+            nontext_cols = columns
+        else:
+            nontext_cols = self.dataset.column_names
         nontext_cols.remove('text')
 
         # Weirdly the yelp_polarity dataset uses the sequence '\ n' instead of actual newlines, and
@@ -179,7 +190,8 @@ class TextDataModule(pl.LightningDataModule):
         # Silence annoying warnings from the tokenizers package after we spawn DataLoader processes
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-        self.dataset = self.dataset.train_test_split(test_size=0.025, shuffle=True)
+        if not isinstance(self.dataset, DatasetDict):
+            self.dataset = self.dataset.train_test_split(test_size=0.025, shuffle=True)  # noqa
 
         batch_strategy = self.hparams.batching_strategy
         if batch_strategy != 'random':
@@ -237,25 +249,19 @@ class TextDataModule(pl.LightningDataModule):
         tokens = self.pad_pack(text)
         return {'padding_mask': tokens.eq(0), 'token_ids': self.pad_pack(text), 'word_count': torch.stack(word_counts)}
 
-    def pad_pack(self, tokens: List[Tensor], pad_value: float = 0.0) -> Tensor:
-        tokens = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=pad_value)
+    def pad_pack(self, batch: List[Tensor], pad_value: int = 0) -> Tensor:
+        buffer_len = max(len(x) for x in batch)
 
         factor = self.hparams.pad_to_multiple_of
-        pad_len = self.hparams.pad_to_max_length
-        seq_len = tokens.shape[1]
+        if factor > 1:
+            remainder = buffer_len % factor
+            buffer_len += factor - remainder if remainder else 0
 
-        if factor:
-            remainder = seq_len % factor
-            padding_needed = factor - remainder if remainder else 0
-        elif pad_len:
-            padding_needed = pad_len - seq_len
-        else:
-            padding_needed = 0
+        buffer = torch.full([len(batch), buffer_len], pad_value, dtype=batch[0].dtype)
+        for i, sequence in enumerate(batch):
+            buffer[i, :len(sequence)] = sequence
 
-        if padding_needed > 0:
-            tokens = F.pad(tokens, (0, padding_needed), value=pad_value)
-
-        return tokens
+        return buffer
 
     # Called from prepare_data, as well as from setup when we load from a checkpoint
     def setup_tokenizer(self):

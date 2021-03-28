@@ -1,5 +1,6 @@
 from .TextDataModule import *
 from datasets import load_from_disk
+import torch.nn.functional as F
 
 
 @dataclass
@@ -33,20 +34,18 @@ class QuantizedLatentDataModule(TextDataModule):
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         key = self.hparams.latent_key
         codes = self.pad_pack([x[key] for x in inputs])
-        batch = {'token_ids': codes, 'padding_mask': codes.eq(-1)}
+        batch = {'token_ids': codes, 'padding_mask': codes.eq(0)}
 
         ctx_key = self.hparams.context_key
         if ctx_key:
             ctx = self.pad_pack([x[ctx_key] for x in inputs])
             batch['context'] = ctx
-            batch['padding_mask_ctx'] = ctx.eq(-1)
+            batch['padding_mask_ctx'] = ctx.eq(0)
 
         return batch
 
     # Add special start and end codes to each latent sequence- then pad pack the sequences together.
-    # Notice that here we use a default padding value of -1 because the VQ-VAE will use the latent code
-    # at index 0 to mean something.
-    def pad_pack(self, tokens: List[Tensor], pad_value: float = -1.0) -> Tensor:
+    def pad_pack(self, tokens: List[Tensor], pad_value: float = 0) -> Tensor:
         for i in range(len(tokens)):
             x = F.pad(tokens[i], (1, 1), value=self.start_code)
             x[..., -1] = self.end_code

@@ -3,7 +3,6 @@ from benchmarks import *
 from text_vae import *
 import sys
 import torch
-from hparam_search import run_hparam_search
 
 
 def main(args):
@@ -13,9 +12,9 @@ def main(args):
     config = OmegaConf.create({
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
+            'accumulate_grad_batches': 4,
             'precision': 16,
-            'num_sanity_val_steps': 2,
-            'terminate_on_nan': True
+            'num_sanity_val_steps': 2
         }
     })
 
@@ -41,11 +40,6 @@ def main(args):
         hparam_class = ElectraModelHparams
         model_class = ElectraModel
         experiment = 'electra'
-
-    elif model_str == 'hvae':
-        hparam_class = ContinuousHierarchicalVAEHparams
-        model_class = ContinuousHierarchicalVAE
-        experiment = 'hierarchical-vae'
 
     elif model_str in ('adv-ae', 'daae'):
         hparam_class = AdversarialAutoencoderHparams
@@ -138,13 +132,6 @@ def main(args):
 
             if input("Would you like to sample again? (y/n): ")[0].lower() != "y":
                 return
-
-    elif command == 'test':
-        print(f"Testing a {experiment}...")
-
-    elif command == 'tune':
-        run_hparam_search(OmegaConf.from_dotlist(args[2:]))
-        return
 
     model = model_class(config.model)
     data = data_class(hparams=config.data)

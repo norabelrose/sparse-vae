@@ -53,7 +53,7 @@ class MLMDataModule(TextDataModule):
 
                 token_types += [seg_ids]
 
-            seg_ids = self.pad_pack(token_types, pad_value=1.0)
+            seg_ids = self.pad_pack(token_types, pad_value=1)
             tokens = self.pad_pack(pairs)
 
             batch = {'token_ids': tokens, 'padding_mask': tokens.eq(0), 'segment_ids': seg_ids}
@@ -71,7 +71,7 @@ class MLMDataModule(TextDataModule):
 
         if self.hparams.whole_word_masking:
             word_counts = torch.tensor([x['num_words'] for x in inputs])
-            word_ids = self.pad_pack([x['word_ids'] for x in inputs], pad_value=-1.0)
+            word_ids = self.pad_pack([x['word_ids'] for x in inputs], pad_value=-1)
 
             noise_mask = whole_word_mask_(tokens, word_counts, word_ids, mask_prob, vocab['[MASK]'])
         else:

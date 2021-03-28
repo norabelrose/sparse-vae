@@ -1,21 +1,18 @@
-from .CategoricalMixture import *
-from .HierarchicalAutoencoder import *
+from .FunnelAutoencoder import *
 from .core import PaddedTensor, Quantizer
 from .train_callbacks import ReconstructionSampler
-from itertools import islice
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.core.decorators import auto_move_data
 from torchtext.data.metrics import bleu_score
-from tqdm import tqdm
 
 
 @dataclass
 class QuantizedVAEHparams(FunnelAutoencoderHparams):
     beta: float = 0.25
-    codebook_size: int = 8192
+    codebook_size: int = 1024
     ema_decay: float = 0.99
-    use_categorical_mixture: bool = False
-    use_kmeans_codebook_updates: bool = False
+    include_full_res_latents: bool = False
+    num_style_codes: int = 0
 
     grad_clip_threshold: float = 25.0
     latent_depth: int = 64
@@ -40,41 +37,41 @@ class QuantizedVAE(FunnelAutoencoder):
     def __init__(self, hparams: DictConfig):
         super(QuantizedVAE, self).__init__(hparams)
 
-        encoder_hparams = hparams.funnel
-        d_model = encoder_hparams.d_model
-        num_latent_scales = len(encoder_hparams.scaling_factors)
+        num_latent_scales = len(hparams.funnel.scaling_factors)
+        if hparams.include_full_res_latents:
+            num_latent_scales += 1
 
         # These combine the encoder and decoder states together right before quantization
+        d_model = hparams.funnel.d_model
         self.combiners = nn.ModuleList([
             nn.Linear(d_model * 2, d_model)
             for _ in range(num_latent_scales - 1)
         ])
-        self.quantizer = Quantizer(
-            num_codes=hparams.codebook_size,
-            code_depth=hparams.latent_depth,
-            d_model=d_model,
-            num_levels=num_latent_scales,
-            ema_decay=hparams.ema_decay
-        )
+        self.quantizers = nn.ModuleList([
+            Quantizer(
+                num_codes=hparams.codebook_size,
+                code_depth=hparams.latent_depth,
+                d_model=d_model,
+                ema_decay=hparams.ema_decay
+            )
+            for _ in range(num_latent_scales)
+        ])
         self.gathering_latents = False
 
-        for block, length in enumerate(encoder_hparams.block_sizes[-2:0:-1], start=1):
-            self.decoder.layer_with_indices(block, length - 2).use_cross_attention = True
-            self.decoder.layer_with_indices(block, length - 1).use_cross_attention = True
-
-        self.initialize_weights()
-
-    def setup_output_layer(self, hparams: DictConfig):
-        # last_scaling_factor = hparams.funnel.scaling_factors[0]
-        if not hparams.use_categorical_mixture:
-            super(QuantizedVAE, self).setup_output_layer(hparams)
-        else:
-            self.output_layer = ConditionalCategoricalMixture(
-                num_mixtures=2,
-                num_features=hparams.funnel.d_model,
-                num_classes=hparams.vocab_size
+        if hparams.num_style_codes > 0:
+            self.style_query = nn.Parameter(torch.randn(hparams.latent_depth))
+            self.style_quantizer = Quantizer(
+                num_codes=hparams.num_style_codes,
+                code_depth=hparams.latent_depth,
+                d_model=d_model,
+                ema_decay=hparams.ema_decay
             )
-            self.output_layer.embedding = self.encoder.input_layer[0].weight
+        else:
+            self.style_quantizer = None
+
+        blocks = self.decoder.hparams.block_sizes[1:1 + num_latent_scales]
+        self.decoder.configure_cross_attention([(block, 0) for block, length in enumerate(blocks, start=1)])
+        self.initialize_weights()
 
     def configure_callbacks(self):
         callbacks = super().configure_callbacks()
@@ -86,43 +83,47 @@ class QuantizedVAE(FunnelAutoencoder):
         return pbar_dict
 
     def configure_optimizers(self, **kwargs):
-        noncodebook_params = list(filter(lambda x: x is not self.quantizer.codebook, self.parameters()))
+        codebooks = set(x.codebook for x in self.quantizers)
+        noncodebook_params = list(filter(lambda x: x not in codebooks, self.parameters()))
 
         # Use a higher learning rate for the codebook so that 'dead' codes move quickly toward the
         # encoder outputs and get revived
         return super().configure_optimizers(params=[
-            {'params': [self.quantizer.codebook], 'lr': 10.0 * self.hparams.lr},
+            {'params': list(codebooks), 'lr': 10.0 * self.hparams.lr},
             {'params': noncodebook_params}
         ])
 
     def on_train_epoch_start(self):
-        if self.hparams.use_kmeans_codebook_updates:
-            self.update_codebook_kmeans()
-
-        self.quantizer.reset_code_usage_info()
+        for quantizer in self.quantizers:
+            quantizer.reset_code_usage_info()
 
     # quantize = False is used by update_codebook_kmeans()
     def forward(self, batch: Dict[str, Tensor], quantize: bool = True) -> QuantizedVAEState:
         encoder_out = self.encoder_forward(batch)
         mask = self.encoder.attention_state.padding_mask_with_length(encoder_out.final_state.shape[-2])
-        quant_out = self.quantizer(encoder_out.final_state, level=0, quantize=quantize, mask=mask)
+        quant_out = self.quantizers[0](encoder_out.final_state, quantize=quantize, mask=mask)
 
         vae_state = QuantizedVAEState()
         vae_state.commitment_loss = quant_out.commitment_loss
         vae_state.embedding_loss = quant_out.embedding_loss
 
+        encoder_states = encoder_out.hidden_states[:-1]
+        encoder_states.reverse()
+        if not self.hparams.include_full_res_latents:
+            del encoder_states[-1]
+
         vae_state.ground_truth = encoder_out.original_ids
-        vae_state.decoder_input = self.quantizer.upsample_codes(quant_out.hard_codes, level=0)
-        vae_state.encoder_states = encoder_out.hidden_states[-2:0:-1]
+        vae_state.decoder_input = self.quantizers[0].upsample_codes(quant_out.hard_codes)
+        vae_state.encoder_states = encoder_states
         vae_state.code_indices = [quant_out.code_indices]
         vae_state.soft_codes = [quant_out.soft_codes]
 
         return self.decoder_forward(vae_state)
 
-    def decoder_forward(self, vae_state: QuantizedVAEState) -> QuantizedVAEState:
+    def decoder_forward(self, vae_state: QuantizedVAEState, mask: Tensor = None) -> QuantizedVAEState:
         self.decoder.attention_state.upsampling = True
 
-        coroutine = self.decoder.forward_coroutine(vae_state.decoder_input)
+        coroutine = self.decoder.forward_coroutine(vae_state.decoder_input, padding_mask=mask)
         enc_state_iter = iter(vae_state.encoder_states)
         last_dec_state = None
 
@@ -130,7 +131,7 @@ class QuantizedVAE(FunnelAutoencoder):
             # Final output
             if isinstance(decoder_state, FunnelTransformerOutput):
                 vae_state.decoder_output = decoder_state
-                vae_state.logits = self.output_layer(decoder_state.final_state).logits
+                vae_state.logits = self.output_layer(decoder_state.final_state)
 
                 return vae_state
 
@@ -157,15 +158,15 @@ class QuantizedVAE(FunnelAutoencoder):
     def decoder_block_end(self, vae_state: QuantizedVAEState, dec_state: Tensor, enc_state: PaddedTensor, block_idx: int):
         enc_data = enc_state.data
         if dec_state.shape != enc_data.shape:
-            return self.quantizer.upsample_codes(enc_data, level=block_idx + 1)
+            return self.quantizers[block_idx + 1].upsample_codes(enc_data)
 
         # It might be better to use cross attention here
         x = self.combiners[block_idx](torch.cat([dec_state, enc_data], dim=-1))
-        quantizer_out = self.quantizer(x, level=block_idx + 1, quantize=True, mask=enc_state.padding)
+        quantizer_out = self.quantizers[block_idx + 1](x, quantize=True, mask=enc_state.padding)
         vae_state.code_indices.append(quantizer_out.code_indices)
 
         # End the forward pass early if we're gathering latent codes and we just computed the bottom latent feature map
-        if self.gathering_latents and block_idx + 2 == self.quantizer.num_levels:
+        if self.gathering_latents and block_idx + 2 == len(self.quantizers):
             return None
 
         # Don't use += operator to avoid autograd errors from doing an in-place operation- weirdly
@@ -175,7 +176,7 @@ class QuantizedVAE(FunnelAutoencoder):
         vae_state.embedding_loss = old_embed_loss + quantizer_out.embedding_loss
         vae_state.soft_codes.append(quantizer_out.soft_codes)
 
-        return self.quantizer.upsample_codes(quantizer_out.hard_codes, level=block_idx + 1)
+        return self.quantizers[block_idx + 1].upsample_codes(quantizer_out.hard_codes)
 
     def train_or_val_step(self, batch: Dict[str, Tensor], stage: str) -> Dict[str, Tensor]:
         vae_state = self.forward(batch)
@@ -183,19 +184,21 @@ class QuantizedVAE(FunnelAutoencoder):
         # Convert these sums into means over codebooks. Within each codebook we compute the commitment and
         # embedding losses as the *mean* squared distance between the encoder output and the corresponding code in the
         # codebook, and so in order to be consistent we need to mean across codebooks as well.
-        commitment_loss = vae_state.commitment_loss / self.quantizer.num_levels
-        embedding_loss = vae_state.embedding_loss / self.quantizer.num_levels
+        commitment_loss = vae_state.commitment_loss / len(self.quantizers)
+        embedding_loss = vae_state.embedding_loss / len(self.quantizers)
 
-        nll = F.cross_entropy(vae_state.logits.flatten(0, 1), vae_state.ground_truth.flatten(), ignore_index=0)
+        nll, ppl, entropy = self.stats_from_logits(vae_state.logits, batch, autoregressive=False)
         self.log('nll', nll, prog_bar=True, logger=False, on_step=True, on_epoch=False)
 
         log_prefix = stage + '_'
         self.log_dict({
             log_prefix + 'nll': nll,
+            log_prefix + 'ppl': ppl,
+            log_prefix + 'entropy': entropy,
             log_prefix + 'commitment_loss': commitment_loss,
             log_prefix + 'embedding_loss': embedding_loss
         })
-        self.log_dict(self.quantizer.used_code_info_dict())
+        self.log_dict(self.used_code_info_dict())
 
         logits = vae_state.logits.detach()
         if stage == 'val':
@@ -209,10 +212,12 @@ class QuantizedVAE(FunnelAutoencoder):
             self.log('val_bleu', bleu_score(reconstructed_words, real_words))
 
         elif stage == 'train':
-            return {
-                'logits': logits,
-                'loss': nll + embedding_loss + self.hparams.beta * commitment_loss
-            }
+            loss = nll + embedding_loss + self.hparams.beta * commitment_loss
+            if not loss.isfinite():
+                self.print("Warning: Got NaN loss. Skipping parameter update.")
+                return None
+
+            return {'logits': logits, 'loss': loss}
 
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, **kwargs) -> Dict[str, Tensor]:
         return self.train_or_val_step(batch, stage='train')
@@ -242,66 +247,17 @@ class QuantizedVAE(FunnelAutoencoder):
     def sample(self, max_length: int, count: int = 1, **kwargs):
         return None
 
-    @torch.no_grad()
-    def update_codebook_kmeans(self):
-        self.print("\nPerforming K means codebook update...")
+    # Used for logging to TensorBoard, mainly
+    def used_code_info_dict(self):
+        if len(self.quantizers) == 1:
+            return {'num_used_codes': self.quantizers[0].num_used_codes()}
 
-        # This turns off EMA updates in the quantizer
-        was_training = self.quantizer.training
-        if was_training:
-            self.quantizer.eval()
+        info_dict = {}
+        for level, quantizer in enumerate(self.quantizers):
+            info_dict[f'code_entropy_{level}'] = quantizer.entropy
+            info_dict[f'num_used_codes_{level}'] = quantizer.num_used_codes()
 
-        # Do encoder forward passes through the entire training dataset in order to gather the soft codes
-        loader = self.trainer.train_dataloader
-
-        min_code_count = self.hparams.codebook_size * 50  # Arbitrary
-        observed_codes = []
-        code_counts = []
-
-        pbar = tqdm(desc='Gathering encoder outputs', total=min_code_count * self.quantizer.num_levels, unit=' codes')
-        for batch in islice(loader, len(loader)):
-            outputs = self.forward(
-                # Annoyingly we have to do this device transfer manually since we're using the dataloader outside
-                # of the usual PyTorch Lightning training hooks
-                {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()},
-                quantize=False
-            ).soft_codes
-            soft_codes = [output.half().flatten(end_dim=-2) for output in outputs]
-            counts = [codes.shape[0] for codes in soft_codes]
-
-            # Keep track of the total number of soft codes we've collected for each latent scale so far
-            if code_counts:
-                code_counts = [running_total + count for running_total, count in zip(code_counts, counts)]
-            else:
-                code_counts = counts
-
-            codes_added = 0
-            if not observed_codes:
-                # Wrap each soft code tensor in a list so we can append to it
-                observed_codes = [[codes] for codes in soft_codes]
-                codes_added = sum(counts)
-            else:
-                # For each latent scale, check if we already hit our minimum number of latent code vectors. If we have,
-                # we don't add any more to the list for that particular scale.
-                for i, (count, codes) in enumerate(zip(code_counts, soft_codes)):
-                    if count < min_code_count:
-                        observed_codes[i] += [codes]
-                        codes_added += codes.shape[0]
-
-                # We hit the minimum number of codes we need for all the latent scales, so we don't need
-                # to gather any more. Doing so will probably just make us OOM when we try to run K means anyway.
-                if not codes_added:
-                    break
-
-            pbar.update(codes_added)
-        pbar.close()
-
-        # List of list of tensors -> list of tensors
-        observed_codes = [torch.cat(codes, dim=0) for codes in observed_codes]
-        self.quantizer.perform_kmeans_update(observed_codes)
-
-        if was_training:
-            self.quantizer.train()
+        return info_dict
 
     @staticmethod
     def name_for_latent_level(level: int, num_levels: int):

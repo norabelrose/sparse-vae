@@ -1,10 +1,10 @@
 from .AttentionState import *
 from .FunnelOps import AttentionHparams, PositionwiseFFN, FunnelAttention
 from .RemoteModels import *
-from ..core import PaddedTensor, PositionalEncoding
+from ..core import PaddedTensor
 from ..core.Utilities import *
 from dataclasses import dataclass, field
-from numpy import prod
+# from numpy import prod
 from omegaconf import OmegaConf
 from pytorch_lightning.utilities import AttributeDict
 from torch import nn, Tensor
@@ -16,7 +16,7 @@ import torch
 @dataclass
 class FunnelTransformerHparams(AttentionHparams):
     block_sizes: Sequence[int] = (4, 4, 4)
-    scaling_factors: Sequence[int] = (2, 2)
+    scaling_factors: Sequence[int] = (2, 4)
 
     # If None, d_embedding is set to equal d_model. For the generator in ELECTRA pretraining they are different.
     d_embedding: Optional[int] = None
@@ -59,15 +59,6 @@ class FunnelTransformer(nn.Module):
 
         self.hparams = hparams
 
-        max_len = hparams.max_seq_length
-        if max_len:
-            if hparams.upsampling:
-                max_len //= prod(hparams.scaling_factors)
-
-            self.abs_pos_encodings = PositionalEncoding(max_len, hparams.d_model)
-        else:
-            self.abs_pos_encodings = None
-
         if hparams.use_convolutions:
             conv_type = nn.ConvTranspose1d if hparams.upsampling else nn.Conv1d
             self.scalers = nn.ModuleList([
@@ -82,7 +73,7 @@ class FunnelTransformer(nn.Module):
 
         if not hparams.upsampling and hparams.use_embedding:
             input_modules = [
-                nn.Embedding(hparams.vocab_size, hparams.d_embedding, padding_idx=hparams.padding_idx),
+                nn.Embedding(hparams.vocab_size, hparams.d_embedding, padding_idx=0),
                 nn.LayerNorm(hparams.d_embedding, eps=hparams.layer_norm_eps),
                 nn.Dropout(hparams.dropout)
             ]
@@ -114,15 +105,21 @@ class FunnelTransformer(nn.Module):
     def attention_state(self, value: AttentionState):
         self._attention_state = value
 
-    def layer_with_indices(self, block_idx: int, layer_idx: int) -> 'FunnelLayer':
-        layer_iter = iter(self.layers)
+    # Activates cross attention for the layers specified in the list of (block index, layer index) tuples
+    def configure_cross_attention(self, layers: List[Tuple[int, int]]):
+        layers.sort()
+        layer_iter, tuple_iter = iter(self.layers), iter(layers)
+
+        cur_tuple = next(tuple_iter)
         for i, block_size in enumerate(self.hparams.block_sizes):
             for j in range(block_size):
                 layer = next(layer_iter)
-                if i == block_idx and j == layer_idx:
-                    return layer
 
-        raise ValueError
+                if (i, j) == cur_tuple:
+                    layer.use_cross_attention = True
+                    cur_tuple = next(tuple_iter, None)
+                    if not cur_tuple:
+                        break
 
     # Vanilla function wrapper for forward_coroutine()
     def forward(self, x: Tensor, **kwargs) -> FunnelTransformerOutput:
@@ -140,9 +137,6 @@ class FunnelTransformer(nn.Module):
 
         if not hparams.upsampling and hparams.use_embedding:
             x = self.input_layer(x)  # x.shape == (...length, d_model)
-
-        if self.abs_pos_encodings:
-            x = self.abs_pos_encodings(x)
 
         # If the AttentionState object is shared, then it's not FunnelTransformer's responsibility to configure it
         # for the current input, because that could result in it getting configured twice
@@ -173,7 +167,7 @@ class FunnelTransformer(nn.Module):
                 layer = next(layer_iter)
 
                 q = kv = layer(q, kv, mask, attn_state, context=context)
-                if mask.shape[-1] != kv.shape[-2]:
+                if mask is not None and mask.shape[-1] != kv.shape[-2]:
                     padding = attn_state.padding_mask_with_length(kv.shape[-2])
                     mask = padding[:, None, None, :] if padding is not None else None
 

@@ -172,7 +172,7 @@ class AttentionState:
 def positional_encodings_for_strides(attn_type: str, q_stride: int, k_stride: int, seq_len: int, d_model: int,
                                      device: torch.device, separate_cls: bool) -> Union[Tensor, List[Tensor]]:
     # Either a Tensor or a list of Tensors
-    base_encodings = get_positional_encodings(attn_type, 1, seq_len, d_model, device)
+    base_encodings = get_base_positional_encodings(attn_type, 1, seq_len, d_model, device)
 
     if attn_type == 'rel_shift':
         # All possible relative positional offsets at this scale, from greatest to least
@@ -185,7 +185,7 @@ def positional_encodings_for_strides(attn_type: str, q_stride: int, k_stride: in
         return base_encodings.gather(0, rel_offsets)
     else:
         # With absolute positional encodings, we have two encoding tensors; one for queries and one for keys
-        if attn_type in ('absolute', 'learned'):
+        if attn_type == 'absolute':
             q_encodings = k_encodings = [base_encodings]
         # With factorized relative encodings, we have four encoding tensors; two for queries and two for keys
         elif attn_type == 'factorized':
@@ -204,8 +204,8 @@ def positional_encodings_for_strides(attn_type: str, q_stride: int, k_stride: in
 # sequence lengths. The functools.lru_cache() decorator automatically caches the result of this method for a given
 # set of parameters- which should be constant within a forward pass, and often across forward passes.
 @lru_cache(maxsize=5)
-def get_positional_encodings(attn_type: str, stride: int, seq_len: int, d_model: int,
-                             device: torch.device) -> Union[Tensor, List[Tensor]]:
+def get_base_positional_encodings(attn_type: str, stride: int, seq_len: int, d_model: int,
+                                  device: torch.device) -> Union[Tensor, List[Tensor]]:
     # Values and routines used by all three positional encoding types
     d_model_half = d_model // 2
     frequencies = torch.arange(d_model_half, dtype=torch.float32, device=device)

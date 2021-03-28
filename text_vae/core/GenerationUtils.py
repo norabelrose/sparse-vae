@@ -69,7 +69,8 @@ def autoregressive_decode(
         if current_idx < min_length:
             output_logits[:, :, end_symbol] = -float('inf')
 
-        word_ids = decode_next_token_from_logits(output_logits, strategy, k=k, beam_log_probs=beam_log_probs)
+        word_ids = decode_next_token_from_logits(output_logits.squeeze(1), strategy, k=k,
+                                                 beam_log_probs=beam_log_probs).unsqueeze(-1)
 
         word_ids[~live_sample_mask].zero_()  # After the [SEP] token, everything afterward should be the padding token
         output_tensor[:, current_idx] = word_ids
@@ -102,8 +103,8 @@ def decode_next_token_from_logits(logits: Tensor, strategy: GenerationStrategy, 
         hypothesis_log_probs = hypothesis_log_probs.view(num_samples, -1)  # (batch_size, k^2)
 
         indices_to_keep = torch.empty_like(beam_log_probs, dtype=torch.long)
-        hypothesis_log_probs.topk(k=k, sorted=False, out=(beam_log_probs, indices_to_keep))  # (batch_size, k)
-        return token_ids[indices_to_keep].flatten()  # (batch_size * k)
+        torch.topk(hypothesis_log_probs, k=k, sorted=False, out=(beam_log_probs, indices_to_keep))  # (batch_size, k))
+        return token_ids.flatten()[indices_to_keep].squeeze()  # (batch_size * k)
 
     elif strategy == GenerationStrategy.Greedy:
         return logits.argmax(dim=-1)  # (batch_size)
@@ -120,8 +121,11 @@ def decode_next_token_from_logits(logits: Tensor, strategy: GenerationStrategy, 
         sorted_probs = sorted_logits.softmax(dim=-1)
         cum_probs = sorted_probs.cumsum(dim=-1)
 
-        probs_to_keep = sorted_probs[cum_probs <= p]
-        subindices = probs_to_keep.multinomial(num_samples=1).view(*sorted_logits.shape[:-1], 1)
+        unlikely_token_mask = (cum_probs > p)
+        unlikely_token_mask[..., 0] = False     # Always exclude the very most probable token from being removed
+        sorted_probs[unlikely_token_mask] = 0.0
+
+        subindices = sorted_probs.multinomial(num_samples=1).view(*sorted_logits.shape[:-1], 1)
         return indices.gather(dim=-1, index=subindices).squeeze(-1)
 
     else:  # Regular sampling

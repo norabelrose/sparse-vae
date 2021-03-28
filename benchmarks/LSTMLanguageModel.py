@@ -19,12 +19,11 @@ class LSTMLanguageModel(LanguageModel):
         super(LSTMLanguageModel, self).__init__(hparams)
         self.save_hyperparameters(hparams)
 
-        vocab_size = self.tokenizer.get_vocab_size()
-        self.embedding = nn.Embedding(vocab_size, hparams.ni)
+        self.embedding = nn.Embedding(hparams.vocab_size, hparams.ni)
         self.decoder = nn.LSTM(input_size=hparams.ni, hidden_size=hparams.dec_nh, batch_first=True, num_layers=2)
         self.initial_state = nn.Parameter(torch.randn(2, 1, hparams.dec_nh))
 
-        output_embedding = nn.Linear(hparams.ni, vocab_size)
+        output_embedding = nn.Linear(hparams.ni, hparams.vocab_size)
         output_embedding.weight = self.embedding.weight
         self.logit_layer = nn.Sequential(
             nn.Linear(hparams.dec_nh, hparams.ni),
@@ -44,7 +43,7 @@ class LSTMLanguageModel(LanguageModel):
 
     def sample(self, max_length: int, count: int = 1, **kwargs):
         return autoregressive_decode(
-            strategy=kwargs.get('strategy', GenerationStrategy.SamplingTopK),
+            strategy=kwargs.get('strategy', GenerationStrategy.SamplingTopP),
             rnn=self.decoder,
             z=None,
             embedding=self.embedding,
