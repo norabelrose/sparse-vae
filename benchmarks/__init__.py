@@ -1,2 +1,2 @@
-from .LSTMAutoencoder import LSTMAutoencoder, LSTMAutoencoderHparams
-from .LSTMLanguageModel import LSTMLanguageModel, LSTMLanguageModelHparams
+from .lstm_autoencoder import LSTMAutoencoder, LSTMAutoencoderHparams
+from .lstm_language_model import LSTMLanguageModel, LSTMLanguageModelHparams
