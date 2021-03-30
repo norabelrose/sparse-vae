@@ -1,6 +1,7 @@
 from functools import lru_cache
 from einops import rearrange
 from torch import nn, Tensor
+from . import PaddedTensor
 import torch
 
 
@@ -20,9 +21,10 @@ class Attention(nn.Module):
         self.reset_kv_cache()
 
         if sparse:
-            from deepspeed.ops.sparse_attention import SparseSelfAttention, FixedSparsityConfig
-            config = FixedSparsityConfig(num_heads=num_heads, attention='unidirectional' if causal else 'bidirectional',
-                                         different_layout_per_head=True, num_different_global_patterns=4)
+            from deepspeed.ops.sparse_attention import SparseSelfAttention
+            from .SlidingWindowSparsityConfig import SlidingWindowSparsityConfig
+
+            config = SlidingWindowSparsityConfig(num_heads=num_heads)
             self.sparse_attention = SparseSelfAttention(sparsity_config=config, attn_mask_mode='add')
             self.register_buffer('_sparsity_mask', None)
         else:
@@ -39,7 +41,7 @@ class Attention(nn.Module):
         return self._sparsity_mask[:, query_index // block_size, :key_length]
 
     # Mask should be True where you DON'T want to attend.
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Tensor = None):
+    def forward(self, q: Tensor, k: PaddedTensor, v: Tensor, cache_mask: Tensor = None):
         q = q + positional_encodings_like(q, self.cache_index)  # Position-Infused Attention from "Shortformer" paper
         q = self.q_linear(q)
 
@@ -56,11 +58,13 @@ class Attention(nn.Module):
             if self.key_cache is not None:
                 # We're being fed new keys and values one token at a time- self-attention case
                 if k.shape[-2] == 1:
-                    self.key_cache[:, self.cache_index] = k.squeeze(-2)
-                    self.value_cache[:, self.cache_index] = v.squeeze(-2)
+                    batch_slice = cache_mask if cache_mask is not None else slice(None)
+                    self.key_cache[batch_slice, self.cache_index] = k.squeeze(-2)
+                    self.value_cache[batch_slice, self.cache_index] = v.squeeze(-2)
+
                     self.cache_index += 1
 
-                    k, v = self.key_cache[:, :self.cache_index], self.value_cache[:, :self.cache_index]
+                    k, v = self.key_cache[batch_slice, :self.cache_index], self.value_cache[batch_slice, :self.cache_index]
 
                 # We're being fed a bunch of keys and values all at once- cross-attention case. We set the
                 # cross_attention flag to True to indicate that we have all the keys and values pre-computed and can
@@ -73,6 +77,7 @@ class Attention(nn.Module):
 
         q, k, v = (rearrange(x, 'b l (h d) -> b h l d', h=self.num_heads) for x in (q, k, v))
 
+        mask = k.padding
         if self.sparse_attention:
             q_len = q.shape[-2]
 
@@ -115,7 +120,7 @@ class Attention(nn.Module):
 
         return output
 
-    def prepare_kv_cache(self, batch_size: int, max_length: int, dtype: torch.dtype):
+    def prepare_kv_cache(self, batch_size: int, max_length: int, dtype: torch.dtype = None):
         # Make sure our cache is a multiple of the sparse attention block size, if applicable
         # if self.sparse_attention:
         #     block_size = self.sparse_attention.sparsity_config.block

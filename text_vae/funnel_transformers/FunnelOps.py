@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from einops import rearrange
 from torch import nn, Tensor
 from typing import *
+from ..core import PaddedTensor
 import numpy as np
 import torch
 
@@ -19,13 +20,13 @@ class EinsumLayer(nn.Module):
         self.einsum_formula = einsum_formula
 
         # Initialize weights
-        fan_in = np.prod(input_shape)
-        fan_out = np.prod(output_shape)
-        std = np.sqrt(1.0 / float(fan_in + fan_out))
-
-        nn.init.normal_(self.weight, std=std)
-        if self.bias is not None:
-            nn.init.constant_(self.bias, 0.)
+        # fan_in = np.prod(input_shape)
+        # fan_out = np.prod(output_shape)
+        # std = np.sqrt(1.0 / float(fan_in + fan_out))
+#
+        # nn.init.normal_(self.weight, std=std)
+        # if self.bias is not None:
+        #     nn.init.constant_(self.bias, 0.)
     
     def forward(self, inputs):
         output = torch.einsum(self.einsum_formula, inputs, self.weight)
@@ -71,7 +72,6 @@ class AttentionHparams:
     ffn_dropout: float = 0.0
     layer_norm_eps: float = 1e-5
     separate_cls: bool = False
-    use_segment_attention: bool = False
 
     positional_attention_type: str = 'rel_shift'  # 'absolute', 'rel_shift' or 'factorized'
 
@@ -105,29 +105,22 @@ class FunnelAttention(nn.Module):
             self.r_r_bias = nn.Parameter(torch.zeros(n_head, 1, d_head))
             self.r_kernel = nn.Parameter(torch.zeros(n_head, d_model, d_head))
         else:
+            self.pos_enc_scale = nn.Parameter(torch.ones(d_model))
             self.r_w_bias = None
             self.r_r_bias = None
             self.r_kernel = None
 
-        if hparams.use_segment_attention:
-            self.r_s_bias = nn.Parameter(torch.zeros(n_head, d_head))
-            self.seg_embed = nn.Parameter(torch.zeros(2, n_head, d_head))
-        else:
-            self.r_s_bias = None
-            self.seg_embed = None
-
         self.post_proj = EinsumLayer("...lnh,nhd->...ld", [n_head, d_head], [d_model])
         self.layer_norm = nn.LayerNorm(d_model, eps=hparams.layer_norm_eps)
         
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Tensor = None, pos_encodings = None,
-                seg_matrix: Tensor = None) -> Tensor:
+    def forward(self, q: Tensor, k: PaddedTensor, v: Tensor, pos_encodings = None) -> Tensor:
         input_q = q  # Save for residual connection
 
         # Add absolute positional encodings to the queries and keys, but not the values, as described
         # in the Shortformer paper.
         if self.hparams.positional_attention_type == 'absolute':
             q = q + pos_encodings[0]
-            k = k + pos_encodings[1] if len(pos_encodings) > 0 else pos_encodings[0]
+            k = k + (pos_encodings[1] if len(pos_encodings) > 0 else pos_encodings[0])
 
         q = self.q_head(q)
         k = self.k_head(k)
@@ -141,10 +134,8 @@ class FunnelAttention(nn.Module):
         else:
             attn_score = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
 
-        if self.r_s_bias is not None:
-            attn_score = attn_score + self._attn_seg_term(q, seg_matrix)
-
         # Perform masking
+        mask = k.padding
         if self.causal:
             causal_mask = torch.ones(*attn_score.shape[-2:], device=attn_score.device, dtype=torch.bool).triu_(1)
             mask = causal_mask if mask is None else mask | causal_mask
@@ -211,20 +202,3 @@ class FunnelAttention(nn.Module):
             raise NotImplementedError
 
         return scores
-
-    def _attn_seg_term(self, q, seg_matrix: Tensor):
-        if seg_matrix is None:
-            seg_term = 0
-        else:
-            r_s_bias = self.r_s_bias.unsqueeze(-2) * q.shape[-1] ** -0.5
-
-            seg_term = torch.einsum("...ind,snd->...nis", (q + r_s_bias).movedim(2, 1), self.seg_embed)
-            tgt_shape = list(seg_matrix.shape)
-            tgt_shape.insert(-2, self.hparams.num_heads)
-            segment_matrix = seg_matrix.unsqueeze(-3).expand(tgt_shape)
-            different, same = seg_term.chunk(2, dim=-1)
-            different = different.expand(tgt_shape)
-            same = same.expand(tgt_shape)
-            seg_term = torch.where(segment_matrix, same, different)
-
-        return seg_term

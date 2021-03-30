@@ -56,10 +56,10 @@ class MLMDataModule(TextDataModule):
             seg_ids = self.pad_pack(token_types, pad_value=1)
             tokens = self.pad_pack(pairs)
 
-            batch = {'token_ids': tokens, 'padding_mask': tokens.eq(0), 'segment_ids': seg_ids}
+            batch = {'token_ids': PaddedTensor.from_raw(tokens), 'segment_ids': seg_ids}
         else:
             batch = super().collate(inputs)
-            tokens, padding_mask = batch['token_ids'], batch['padding_mask']
+            tokens = batch['token_ids']
 
         mask_prob = self.hparams.mask_token_prob
         random_prob = self.hparams.random_token_prob
@@ -79,7 +79,7 @@ class MLMDataModule(TextDataModule):
             probability_matrix = torch.full(labels.shape, noise_prob)
             special_tokens_mask = tokens.lt(self.special_token_threshold)  # Token IDs under 5 are special tokens
 
-            probability_matrix.masked_fill_(special_tokens_mask | padding_mask.bool(), value=0.0)
+            probability_matrix.masked_fill_(special_tokens_mask | tokens.padding, value=0.0)
             noise_mask = torch.bernoulli(probability_matrix).bool()
 
             # 80% of the time, we replace masked input tokens with [MASK]

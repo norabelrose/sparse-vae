@@ -1,15 +1,15 @@
 from .QuantizedVAE import *
 from .QuantizedLatentDataModule import *
-from .core import GenerationStrategy, LanguageModel, Transformer, select_best_gpu
+from .BatchGeneration import batch_generate_samples
+from .core import LanguageModel, Transformer, select_best_gpu
+from collections import defaultdict
 from contextlib import nullcontext
 from datasets import Dataset, DatasetDict, load_from_disk
+from functools import partial
 from numpy import cumprod
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pathlib import Path
-from tqdm.auto import tqdm
-import gc
 import re
 
 
@@ -20,7 +20,6 @@ class QuantizedVAESamplingOptions:
     decode_tokens: bool = True
     profile: bool = False
     max_length: int = 250
-    strategy: GenerationStrategy = GenerationStrategy.SamplingTopP
 
 
 @dataclass
@@ -53,7 +52,7 @@ class QuantizedVAESampler:
         # We've already trained the priors, so just load them
         vae = QuantizedVAE.load_from_checkpoint(ckpt_path, hparams_file=str(hparams_path), strict=False)
 
-        num_priors = vae.quantizer.num_levels
+        num_priors = len(vae.quantizers)
         priors = {}
 
         for x in os.scandir(sampler_path):
@@ -91,43 +90,46 @@ class QuantizedVAESampler:
 
         vae_dm_hparams = OmegaConf.structured(TextDataModuleHparams)
         vae_dm_hparams.dataset_name = dataset_name
+        vae_dm_hparams.batch_size = 64
         vae_datamodule = TextDataModule(vae_dm_hparams)
 
-        self.vae.datamodule = vae_datamodule
         self.vae.gathering_latents = True
-        self.vae.freeze()
-        self.vae.setup('test')
 
-        if torch.cuda.is_available():
-            gpu = select_best_gpu() if gpu is None else gpu
-            self.vae = self.vae.to('cuda:' + str(gpu))
+        gpu = gpu or select_best_gpu() if torch.cuda.is_available() else None
+        trainer = Trainer(precision=16, gpus=[gpu])
+        outputs = trainer.predict(model=self.vae, datamodule=vae_datamodule)
+        outputs = sum(outputs, [])  # Concatenate the results from the dataloaders
 
-        vae_datamodule.prepare_data()
-        vae_datamodule.setup(stage='predict')
-        text_dataset = vae_datamodule.dataset
-        text_cols = text_dataset.column_names['train']
+        z_dataset = defaultdict(list)
+        for features in outputs:
+            for name, result in features.items():
+                lengths = (~result['padding']).sum(-1)
+                trimmed_z = [z[:length] for z, length in zip(result['data'], lengths)]
 
-        datamodule.dataset = text_dataset.map(
-            _gather_latents, batched=True, batch_size=500, fn_kwargs=dict(vae=self.vae, datamodule=vae_datamodule),
-            load_from_cache_file=False, remove_columns=text_cols
-        )
-        datamodule.dataset.save_to_disk(latent_dir)
+                z_dataset[name].extend(trimmed_z)
+                if name == 'bottom':
+                    z_dataset['num_tokens'].extend(lengths)
+
+        z_dataset = Dataset.from_dict(z_dataset)
+        z_dataset = z_dataset.train_test_split(test_size=0.05, shuffle=False)
+        z_dataset.save_to_disk(latent_dir)
+        datamodule.dataset = z_dataset
 
         self.vae = self.vae.cpu()  # Save GPU memory for the prior models
         self.vae.datamodule = None
 
     def train_priors(self, hparams: DictConfig, force_retrain: bool = False):
-        for level in range(self.vae.quantizer.num_levels):
+        for level in range(len(self.vae.quantizers)):
             if not force_retrain and level in self.priors:
                 continue
 
             self.train_prior(level, hparams)
 
     def train_prior(self, level: int, hparams: DictConfig):
-        num_levels = self.vae.quantizer.num_levels
+        num_levels = len(self.vae.quantizers)
         prior_name = QuantizedVAE.name_for_latent_level(level, num_levels)
 
-        num_codes = self.vae.quantizer.num_codes
+        num_codes = self.vae.quantizers[level].num_codes
         start_code = num_codes
         end_code = num_codes + 1
 
@@ -146,28 +148,25 @@ class QuantizedVAESampler:
 
         prior_hparams = deepcopy(hparams.prior)
         prior_hparams.log_samples = False
-        prior_hparams.lr = 1e-4
         prior_hparams.num_layers = 6
         prior_hparams.start_token = start_code
         prior_hparams.end_token = end_code
         prior_hparams.cross_attention = level > 0
         prior_hparams.vocab_size = num_codes + 2  # Include the start and end codes
-        prior_hparams.warmup_steps = 250
         prior = Transformer(prior_hparams)
 
         if torch.cuda.is_available() and 'gpus' not in hparams.trainer:
             hparams.trainer.gpus = [select_best_gpu()]
 
-        ckpt_monitor = ModelCheckpoint(monitor='val_nll', mode='min')
         trainer = Trainer(**hparams.trainer, logger=TensorBoardLogger(
             save_dir='text-vae-logs',
             name='vq-vae-prior'
         ))
-        trainer.callbacks = [ckpt_monitor]
 
         print(f"Fitting {prior_name} prior...")
         trainer.fit(prior, datamodule=datamodule)
 
+        ckpt_monitor = trainer.checkpoint_callback
         ckpt_path = ckpt_monitor.best_model_path
         if not ckpt_path:
             print("Training seems to have failed.")
@@ -189,7 +188,7 @@ class QuantizedVAESampler:
     @torch.no_grad()
     def sample(self, options: QuantizedVAESamplingOptions):
         vae, priors = self.vae, self.priors
-        num_levels = vae.quantizer.num_levels
+        num_levels = len(vae.quantizers)
         assert len(priors) == num_levels,\
             "You need to train a prior for each latent level before you can sample"
 
@@ -240,98 +239,21 @@ class QuantizedVAESampler:
 
     @torch.no_grad()
     def write_samples_to_disk(self, path: Path, num_batches: int, options: QuantizedVAESamplingOptions):
-        vae, priors = self.vae, self.priors
+        sample_func = partial(self._raw_sample, self.vae, self.priors, options)
+        outputs = batch_generate_samples(sample_func, num_batches, options.batch_size, end_token=self.vae.end_token)
 
-        batches_left = num_batches
-        batch_size = options.batch_size
-        total_samples = num_batches * batch_size
-        pbar = tqdm(desc='Generating samples', total=total_samples, unit='samples')
-
-        assert options.decode_tokens
-        outputs = []
-
-        # CPU sampling
-        if not vae.on_gpu:
-            while batches_left > 0:
-                batch = self._raw_sample(vae, priors, options)
-                outputs.extend(batch.tolist())
-
-                # Let user know we've finished a batch right now
-                pbar.update(n=batch_size)
-                batches_left -= 1
-
-        # GPU sampling
-        else:
-            gpu_outputs = []
-            oom_count = 0
-
-            def flush_to_cpu():
-                nonlocal gpu_outputs, outputs
-
-                # Sequentially move batches from the GPU to the CPU, blocking the current thread for each one.
-                gpu_outputs.reverse()
-
-                while gpu_outputs:
-                    gpu_batch = gpu_outputs.pop()
-                    cpu_batch = gpu_batch.tolist()
-
-                    del gpu_batch  # Get it out of GPU memory ASAP
-                    outputs.extend(cpu_batch)
-
-                    # Let user know we've finished a batch right now
-                    pbar.update(n=batch_size)
-
-            # Dispatch all the instructions to the GPU all at once, without forcing a blocking
-            # device-host synchronization between each batch. If we get an OOM error, move everything
-            # to the CPU and flush to disk, then continue dispatching to the GPU.
-            while batches_left > 0:
-                try:
-                    gpu_batch = self._raw_sample(vae, priors, options)
-
-                # Catch OOM errors
-                except RuntimeError:
-                    # Normal case, we have outstanding GPU batches we need to flush
-                    if gpu_outputs:
-                        flush_to_cpu()
-                        gc.collect()
-
-                    # This shouldn't really happen, but we'll clear the memory cache as a last resort
-                    elif oom_count == 0:
-                        torch.cuda.empty_cache()
-                        oom_count += 1
-
-                    # Something is seriously wrong, we're getting OOMs even after we clear the CUDA cache
-                    else:
-                        raise
-                else:
-                    gpu_outputs.append(gpu_batch)
-                    batches_left -= 1
-
-            if gpu_outputs:
-                flush_to_cpu()
-
-        pbar.close()
-
-        # Remove padding/garbage tokens from the generated samples after [SEP]
-        sep = vae.end_token
-        last_index = options.max_length - 1
-        for sample in outputs:
-            try:
-                sep_index = sample.index(sep, 0, last_index)
-            except ValueError:
-                pass
-            else:
-                del sample[sep_index + 1:]
-
+        print("Writing to disk...")
         dataset = Dataset.from_dict({'text': outputs})
         dataset.save_to_disk(str(path))
+        print("Done.")
 
     @staticmethod
+    @torch.cuda.amp.autocast()
     def _raw_sample(vae: QuantizedVAE, priors: List[Transformer], options: QuantizedVAESamplingOptions):
         # Find the maximum sequence length that the top latent sequence can be allowed to have in order to ensure
         # that the final overt sequence length does not exceed max_length
         funnel_hparams = vae.hparams.funnel
-        num_codes = vae.quantizer.num_codes
+        num_codes = vae.quantizers[0].num_codes
         strides = cumprod(funnel_hparams.scaling_factors)[::-1]
 
         latent_seqs = []
@@ -340,20 +262,11 @@ class QuantizedVAESampler:
             context = latent_seqs[-1].data if latent_seqs else None
 
             max_z_length = options.max_length // stride
-            z = prior.sample(max_length=max_z_length + 2, count=options.batch_size, context=context)[..., 1:].squeeze(1)
+            z = prior.sample(max_length=max_z_length + 2, batch_size=options.batch_size, context=context)[..., 1:].squeeze(1)
             z[z > num_codes] = 0
-            latent_seqs.append(PaddedTensor(data=z, padding=z.eq(0)))
+            latent_seqs.append(PaddedTensor.from_raw(z))
 
-        vae.decoder.attention_state.configure_for_input(
-            seq_len=options.max_length
-        )
-        for i, z in enumerate(latent_seqs):
-            z.data = vae.quantizer.lookup_codes(z.data, i)
-
-        vae_input = QuantizedVAEState()
-        vae_input.decoder_input = vae.quantizer.upsample_codes(latent_seqs[0].data, level=0)
-        vae_input.encoder_states = latent_seqs[1:]
-        return vae.decoder_forward(vae_input, mask=latent_seqs[0].padding).logits.argmax(dim=-1)
+        return vae.decode_prior_samples(latent_seqs).argmax(dim=-1)
 
     def to(self, device: Union[torch.device, str]):
         self.vae = self.vae.to(device)  # noqa

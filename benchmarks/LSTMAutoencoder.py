@@ -3,12 +3,12 @@ from dataclasses import dataclass
 from einops import rearrange
 from omegaconf import DictConfig
 from text_vae import (
-    ContinuousVAE, ConditionalGaussian, ContinuousVAEHparams, autoregressive_decode, GenerationStrategy,
-    MutualInformation
+    ContinuousVAE, ConditionalGaussian, ContinuousVAEHparams, MutualInformation
 )
 from torch import nn, Tensor
 from torch.distributions import Normal
 from typing import *
+from .LSTMDecode import autoregressive_decode
 from .LSTMLanguageModel import LSTMLanguageModelHparams
 
 
@@ -122,10 +122,9 @@ class LSTMAutoencoder(ContinuousVAE):
 
         return output_logits, loss
 
-    def sample(self, max_length: int, count: int = 1, **kwargs):
-        latents = self.get_base_prior().sample([count])
+    def sample(self, max_length: int, batch_size: int = 1, **kwargs):
+        latents = self.get_base_prior().sample([batch_size])
         return autoregressive_decode(
-            strategy=kwargs.get('strategy', GenerationStrategy.Greedy),
             rnn=self.decoder,
             z=latents,
             embedding=self.embedding,

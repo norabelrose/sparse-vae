@@ -19,12 +19,12 @@ class TransformerLayer(nn.Module):
         self.cross_attention = Attention(d_model, num_heads) if cross_attention else None
         self.cross_attn_layer_norm = nn.LayerNorm(d_model) if cross_attention else None
 
-    def forward(self, x: Tensor, context: Tensor = None, mask: Tensor = None, context_mask: Tensor = None) -> Tensor:
-        y = self.attention(x, x, x, mask=mask)
+    def forward(self, x: PaddedTensor, context: PaddedTensor = None, cache_mask: Tensor = None) -> Tensor:
+        y = self.attention(x, x, x, cache_mask=cache_mask)
         x = y = self.attn_layer_norm(x + y)
 
         if self.cross_attention and context is not None:
-            x = self.cross_attention(x, context, context, mask=context_mask)
+            x = self.cross_attention(x, context, context)
             x = y = self.cross_attn_layer_norm(x + y)
 
         y = self.ffn(y)

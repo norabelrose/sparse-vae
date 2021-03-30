@@ -3,7 +3,8 @@ from omegaconf import DictConfig
 from torch import nn, Tensor
 from typing import *
 import torch
-from text_vae import LanguageModel, LanguageModelHparams, autoregressive_decode, GenerationStrategy
+from text_vae import LanguageModel, LanguageModelHparams
+from .LSTMDecode import autoregressive_decode
 
 
 @dataclass
@@ -41,16 +42,14 @@ class LSTMLanguageModel(LanguageModel):
         x, _ = self.decoder(x, (h0, c0))
         return self.logit_layer(x)
 
-    def sample(self, max_length: int, count: int = 1, **kwargs):
+    def sample(self, max_length: int, batch_size: int = 1, **kwargs):
         return autoregressive_decode(
-            strategy=kwargs.get('strategy', GenerationStrategy.SamplingTopP),
             rnn=self.decoder,
             z=None,
             embedding=self.embedding,
             logit_callable=self.logit_layer,
-            initial_hidden_state=self.initial_state.repeat(1, count, 1),
+            initial_hidden_state=self.initial_state.repeat(1, batch_size, 1),
             max_length=max_length,
             start_symbol=self.start_token,
-            end_symbol=self.end_token,
-            k=10
+            end_symbol=self.end_token
         )

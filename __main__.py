@@ -34,23 +34,7 @@ def main(args):
     model_class = None
     experiment = None
 
-    if model_str == 'electra':
-        data_class = ElectraDataModule
-        data_hparam_class = MLMDataModuleHparams
-        hparam_class = ElectraModelHparams
-        model_class = ElectraModel
-        experiment = 'electra'
-
-    elif model_str in ('adv-ae', 'daae'):
-        hparam_class = AdversarialAutoencoderHparams
-        model_class = AdversarialAutoencoder
-        experiment = model_str
-
-        if model_str == 'daae':
-            data_class = MLMDataModule
-            data_hparam_class = MLMDataModuleHparams
-
-    elif model_str == 'lstm':
+    if model_str == 'lstm':
         hparam_class = LSTMAutoencoderHparams
         model_class = LSTMAutoencoder
         experiment = 'lstm-vae'
@@ -88,50 +72,6 @@ def main(args):
         print(f"Training {experiment}...")
         if ckpt_name := config.get('from_checkpoint'):
             config.trainer.resume_from_checkpoint = str(get_checkpoint_path_for_name(experiment, ckpt_name))
-
-    elif command == 'sample':
-        ckpt_name = config.get('from_checkpoint')
-        assert ckpt_name, "We need a checkpoint to load a model from"
-
-        model = model_class.load_from_checkpoint(get_checkpoint_path_for_name(experiment, ckpt_name))
-        if gpu_idx := config.get('gpu'):
-            model = model.to('cuda:' + str(gpu_idx))
-
-        num_samples = config.get('samples', 1)
-        max_length = config.get('max_length', 40)
-        dataset_name = config.get('dataset_name', 'yelp_polarity')
-
-        vocab_path = Path.cwd() / 'text-vae-pretrained' / 'tokenizers' / (dataset_name + '.json')
-        assert vocab_path.exists(), f"Couldn't find pretrained tokenizer for {dataset_name}"
-
-        tokenizer = Tokenizer.from_file(str(vocab_path))
-        model.tokenizer = tokenizer
-
-        while True:
-            # Running the Markov chain takes a while so we want to print each iteration
-            # to the screen as it runs
-            if model_class == AdversarialAutoencoder:
-                num_iter = config.get('num_iter', 200)
-                masked_tokens_per_iter = config.get('masked_tokens_per_iter', 1)
-
-                for i, iteration in enumerate(model.markov_chain_sample(max_length, num_samples, num_iter=num_iter,
-                                                                        masked_tokens_per_iter=masked_tokens_per_iter)):
-                    if i == 0:
-                        print("Initial sample:")
-                    else:
-                        print(f"Iteration {i}:")
-
-                    text = tokenizer.decode_batch(iteration.tolist())
-                    if len(text) == 1:
-                        text = text[0]
-
-                    print(text)
-            else:
-                samples = model.sample(max_length, num_samples)
-                print(samples)
-
-            if input("Would you like to sample again? (y/n): ")[0].lower() != "y":
-                return
 
     model = model_class(config.model)
     data = data_class(hparams=config.data)

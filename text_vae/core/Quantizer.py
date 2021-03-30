@@ -1,16 +1,17 @@
 from dataclasses import dataclass
-from torch import nn, FloatTensor, LongTensor, Tensor
+from torch import nn, Tensor
 from typing import *
+from . import PaddedTensor
 import torch
 import torch.nn.functional as F
 
 
 @dataclass
 class QuantizationInfo:
-    soft_codes: FloatTensor
+    soft_codes: Tensor
 
-    code_indices: Optional[LongTensor] = None
-    hard_codes: Optional[FloatTensor] = None
+    code_indices: Optional[Tensor] = None
+    hard_codes: Optional[Tensor] = None
 
     # Both these are zero when not training or when the Quantizer is called with quantize=False
     commitment_loss: Union[float, Tensor] = 0.0
@@ -49,7 +50,7 @@ class Quantizer(nn.Module):
     def num_codes(self) -> int:
         return self.codebook.shape[0]
 
-    def forward(self, x: FloatTensor, quantize: bool = True, mask: Tensor = None) -> QuantizationInfo:
+    def forward(self, x: PaddedTensor, quantize: bool = True) -> QuantizationInfo:
         if self.gumbel:
             logits = self.logit_layer(x)
 
@@ -78,7 +79,7 @@ class Quantizer(nn.Module):
         # Note that the padding code at index 0 is excluded here- it is initialized to the zero vector and never changed
         distances = torch.cdist(x.detach(), self.codebook[1:])
         output.code_indices = distances.argmin(dim=-1) + 1  # Offset by 1 to account for padding code
-        if mask is not None:
+        if (mask := x.padding) is not None:
             output.code_indices = torch.where(mask, 0, output.code_indices)
 
         output.hard_codes = self.lookup_codes(output.code_indices)
@@ -154,11 +155,11 @@ class Quantizer(nn.Module):
 
         return output
 
-    def lookup_codes(self, x: LongTensor) -> Tensor:
+    def lookup_codes(self, x: Tensor) -> Tensor:
         return F.embedding(x, self.codebook, padding_idx=0)
 
     # Prepare the codes for the decoder
-    def upsample_codes(self, x: FloatTensor) -> FloatTensor:
+    def upsample_codes(self, x: Tensor) -> Tensor:
         return self.upsampler(x)
 
     def num_used_codes(self):

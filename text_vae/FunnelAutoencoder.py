@@ -26,10 +26,6 @@ class FunnelAutoencoder(LanguageModel, ABC):
         funnel_hparams = hparams.funnel
         funnel_hparams.max_seq_length = hparams.max_seq_length
 
-        # The encoder and decoder share an AttentionState object, which caches positional encodings and the
-        # padding mask for each scale
-        attn_state = AttentionState(funnel_hparams)
-        attn_state.shared = True
         decoder_hparams = deepcopy(funnel_hparams)
         decoder_hparams.update(
             block_sizes=list(reversed(funnel_hparams.block_sizes)),
@@ -37,14 +33,12 @@ class FunnelAutoencoder(LanguageModel, ABC):
             upsampling=True
         )
         self.encoder = FunnelTransformer(funnel_hparams)
-        self.encoder.attention_state = attn_state
 
         # Load pretrained weights
         if hparams.use_pretrained_encoder:
             self.encoder.load_pretrained_weights()
 
         self.decoder = FunnelTransformer(decoder_hparams)
-        self.decoder.attention_state = attn_state
 
         d_model = funnel_hparams.d_model
         output_embedding = nn.Linear(d_model, hparams.vocab_size)
@@ -64,9 +58,3 @@ class FunnelAutoencoder(LanguageModel, ABC):
 
         data: TextDataModule = self.trainer.datamodule if stage == 'fit' else self.datamodule
         data.hparams.pad_to_multiple_of = int(prod(self.decoder.hparams.scaling_factors))
-
-    def encoder_forward(self, batch: Dict[str, Any], **kwargs) -> FunnelTransformerOutput:
-        x, padding = batch['token_ids'], batch['padding_mask']
-
-        self.encoder.attention_state.configure_for_input(x.shape[-1], padding)
-        return self.encoder(x, padding_mask=padding, **kwargs)

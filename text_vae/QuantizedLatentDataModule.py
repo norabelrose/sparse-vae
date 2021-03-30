@@ -33,14 +33,11 @@ class QuantizedLatentDataModule(TextDataModule):
 
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         key = self.hparams.latent_key
-        codes = self.pad_pack([x[key] for x in inputs])
-        batch = {'token_ids': codes, 'padding_mask': codes.eq(0)}
+        batch = {'token_ids': PaddedTensor.from_raw(self.pad_pack([x[key] for x in inputs]))}
 
         ctx_key = self.hparams.context_key
         if ctx_key:
-            ctx = self.pad_pack([x[ctx_key] for x in inputs])
-            batch['context'] = ctx
-            batch['padding_mask_ctx'] = ctx.eq(0)
+            batch['context'] = PaddedTensor.from_raw(self.pad_pack([x[ctx_key] for x in inputs]))
 
         return batch
 

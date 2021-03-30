@@ -1,8 +1,7 @@
 from .FunnelAutoencoder import *
 from .core import PaddedTensor, Quantizer
 from .train_callbacks import ReconstructionSampler
-from pytorch_lightning.callbacks import EarlyStopping
-from pytorch_lightning.core.decorators import auto_move_data
+from functools import partial
 from torchtext.data.metrics import bleu_score
 
 
@@ -11,7 +10,7 @@ class QuantizedVAEHparams(FunnelAutoencoderHparams):
     beta: float = 0.25
     codebook_size: int = 1024
     ema_decay: float = 0.99
-    include_full_res_latents: bool = False
+    include_full_res_latents: bool = True
     num_style_codes: int = 0
 
     grad_clip_threshold: float = 25.0
@@ -24,7 +23,6 @@ class QuantizedVAEState:
     code_indices: List[Tensor] = field(default_factory=list)
     soft_codes: List[Tensor] = field(default_factory=list)
 
-    ground_truth: Optional[Tensor] = None
     decoder_input: Optional[Tensor] = None
     encoder_states: List[PaddedTensor] = field(default_factory=list)
 
@@ -75,7 +73,7 @@ class QuantizedVAE(FunnelAutoencoder):
 
     def configure_callbacks(self):
         callbacks = super().configure_callbacks()
-        return callbacks + [EarlyStopping(monitor='val_nll', mode='min'), ReconstructionSampler()]
+        return callbacks + [ReconstructionSampler()]
 
     def get_progress_bar_dict(self) -> Dict[str, Union[int, str]]:
         pbar_dict = super().get_progress_bar_dict()
@@ -99,9 +97,8 @@ class QuantizedVAE(FunnelAutoencoder):
 
     # quantize = False is used by update_codebook_kmeans()
     def forward(self, batch: Dict[str, Tensor], quantize: bool = True) -> QuantizedVAEState:
-        encoder_out = self.encoder_forward(batch)
-        mask = self.encoder.attention_state.padding_mask_with_length(encoder_out.final_state.shape[-2])
-        quant_out = self.quantizers[0](encoder_out.final_state, quantize=quantize, mask=mask)
+        encoder_out = self.encoder(batch['token_ids'])
+        quant_out = self.quantizers[0](encoder_out.final_state, quantize=quantize)
 
         vae_state = QuantizedVAEState()
         vae_state.commitment_loss = quant_out.commitment_loss
@@ -112,57 +109,27 @@ class QuantizedVAE(FunnelAutoencoder):
         if not self.hparams.include_full_res_latents:
             del encoder_states[-1]
 
-        vae_state.ground_truth = encoder_out.original_ids
         vae_state.decoder_input = self.quantizers[0].upsample_codes(quant_out.hard_codes)
         vae_state.encoder_states = encoder_states
         vae_state.code_indices = [quant_out.code_indices]
         vae_state.soft_codes = [quant_out.soft_codes]
 
-        return self.decoder_forward(vae_state)
+        callback = partial(self.decoder_block_end, vae_state)
+        results = self.decoder(vae_state.decoder_input, block_end_callback=callback)
+        vae_state.logits = self.output_layer(results.final_state) if results else None
 
-    def decoder_forward(self, vae_state: QuantizedVAEState, mask: Tensor = None) -> QuantizedVAEState:
-        self.decoder.attention_state.upsampling = True
+        return vae_state
 
-        coroutine = self.decoder.forward_coroutine(vae_state.decoder_input, padding_mask=mask)
-        enc_state_iter = iter(vae_state.encoder_states)
-        last_dec_state = None
+    def decoder_block_end(self, vae_state: QuantizedVAEState, dec_state: Tensor, block_idx: int):
+        cross_attn_kv = vae_state.encoder_states[block_idx - 1] if block_idx > 0 else None
+        if block_idx >= len(vae_state.encoder_states):
+            return dec_state, cross_attn_kv
 
-        for block_idx, decoder_state in coroutine:
-            # Final output
-            if isinstance(decoder_state, FunnelTransformerOutput):
-                vae_state.decoder_output = decoder_state
-                vae_state.logits = self.output_layer(decoder_state.final_state)
-
-                return vae_state
-
-            encoder_state = next(enc_state_iter, None)
-            if encoder_state is None:
-                continue
-
-            dec_state = self.decoder_block_end(vae_state, decoder_state, encoder_state, block_idx)
-            if dec_state is not None:
-                if block_idx == 0:
-                    coroutine.send(dec_state)
-                elif block_idx == 1:
-                    coroutine.send((dec_state, vae_state.decoder_input))
-                else:
-                    coroutine.send((dec_state, last_dec_state))
-
-                last_dec_state = dec_state
-
-            # Abort the forward pass. Used when gathering latent codes for training the prior model. After we get
-            # the bottom latent feature map we don't actually need to run the last few layers.
-            else:
-                return vae_state
-
-    def decoder_block_end(self, vae_state: QuantizedVAEState, dec_state: Tensor, enc_state: PaddedTensor, block_idx: int):
-        enc_data = enc_state.data
-        if dec_state.shape != enc_data.shape:
-            return self.quantizers[block_idx + 1].upsample_codes(enc_data)
+        enc_state = vae_state.encoder_states[block_idx]
 
         # It might be better to use cross attention here
-        x = self.combiners[block_idx](torch.cat([dec_state, enc_data], dim=-1))
-        quantizer_out = self.quantizers[block_idx + 1](x, quantize=True, mask=enc_state.padding)
+        x = self.combiners[block_idx](torch.cat([dec_state, enc_state], dim=-1))
+        quantizer_out = self.quantizers[block_idx + 1](x, quantize=True)
         vae_state.code_indices.append(quantizer_out.code_indices)
 
         # End the forward pass early if we're gathering latent codes and we just computed the bottom latent feature map
@@ -176,7 +143,7 @@ class QuantizedVAE(FunnelAutoencoder):
         vae_state.embedding_loss = old_embed_loss + quantizer_out.embedding_loss
         vae_state.soft_codes.append(quantizer_out.soft_codes)
 
-        return self.quantizers[block_idx + 1].upsample_codes(quantizer_out.hard_codes)
+        return self.quantizers[block_idx + 1].upsample_codes(quantizer_out.hard_codes), cross_attn_kv
 
     def train_or_val_step(self, batch: Dict[str, Tensor], stage: str) -> Dict[str, Tensor]:
         vae_state = self.forward(batch)
@@ -206,7 +173,7 @@ class QuantizedVAE(FunnelAutoencoder):
             reconstructions = self.tokenizer.decode_batch(logits.argmax(dim=-1).tolist())
             reconstructed_words = [sample.split() for sample in reconstructions]
 
-            ground_truth = self.tokenizer.decode_batch(vae_state.ground_truth.tolist())
+            ground_truth = self.tokenizer.decode_batch(batch['token_ids'].tolist())
             real_words = [[sample.split()] for sample in ground_truth]
 
             self.log('val_bleu', bleu_score(reconstructed_words, real_words))
@@ -219,32 +186,41 @@ class QuantizedVAE(FunnelAutoencoder):
 
             return {'logits': logits, 'loss': loss}
 
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int, **kwargs) -> Dict[str, Tensor]:
+    def training_step(self, batch: Dict[str, PaddedTensor], batch_index: int, **kwargs) -> Dict[str, Tensor]:
         return self.train_or_val_step(batch, stage='train')
 
     def on_after_backward(self):
         grad_norm = nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
         self.log('grad_norm', grad_norm, on_step=True)
 
-    def validation_step(self, batch: Dict[str, Tensor], batch_index: int):
+    def validation_step(self, batch: Dict[str, PaddedTensor], batch_index: int):
         self.train_or_val_step(batch, stage='val')
 
     # Return the quantized latent feature maps only
-    @auto_move_data
-    def predict(self, batch: Dict[str, Tensor], batch_idx: int, dataloader_idx: Optional[int] = None):
+    def predict(self, batch: Dict[str, PaddedTensor], batch_idx: int, dataloader_idx: Optional[int] = None):
         latent_codes = self.forward(batch).code_indices
-        attn_state = self.decoder.attention_state
 
         result = {}
         for i, z in enumerate(latent_codes):
             level_name = self.name_for_latent_level(i, len(latent_codes))
-            padding = attn_state.padding_mask_with_length(z.shape[-1])
-            result[level_name] = {'data': z, 'padding': padding}
+            result[level_name] = z.to_dict()
 
         return result
 
+    def decode_prior_samples(self, samples: List[PaddedTensor]) -> Tensor:
+        # Get the embeddings for each of the latent codes
+        last_z = self.quantizers[-1].lookup_codes(samples[-1])
+        if len(samples) > 1:
+            penultimate_z = self.quantizers[-2].lookup_codes(samples[-2])
+        else:
+            penultimate_z = None
+
+        # Don't modify the Transformer's hidden state, but have it cross-attend to the penultimate latent sequence
+        callback = lambda i, x: (x, penultimate_z)
+        return self.decoder(last_z, start_block=-1, block_end_callback=callback).logits
+
     # We can't sample without a separately trained prior
-    def sample(self, max_length: int, count: int = 1, **kwargs):
+    def sample(self, max_length: int, batch_size: int = 1, **kwargs):
         return None
 
     # Used for logging to TensorBoard, mainly
@@ -261,7 +237,7 @@ class QuantizedVAE(FunnelAutoencoder):
 
     @staticmethod
     def name_for_latent_level(level: int, num_levels: int):
-        assert num_levels > 1
+        assert num_levels > 0
 
         if num_levels > 3:
             return f'level {level}'

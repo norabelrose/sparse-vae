@@ -5,6 +5,7 @@ from pathlib import Path
 from tokenizers.implementations import BertWordPieceTokenizer
 from tokenizers.processors import BertProcessing
 from torch.utils.data import DataLoader  # noqa
+from .core import PaddedTensor
 from .DataUtils import *
 import os
 import numpy as np
@@ -238,6 +239,9 @@ class TextDataModule(pl.LightningDataModule):
     def test_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
         return self.val_dataloader()
 
+    def predict_dataloader(self) -> Union[DataLoader, List[DataLoader]]:
+        return [self.train_dataloader(), self.val_dataloader()]
+
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         if self.hparams.batching_strategy == 'uniform_size_prebatched':
             text = inputs[0]['text']
@@ -246,8 +250,7 @@ class TextDataModule(pl.LightningDataModule):
             text = [x['text'] for x in inputs]
             word_counts = [x['num_words'] for x in inputs]
 
-        tokens = self.pad_pack(text)
-        return {'padding_mask': tokens.eq(0), 'token_ids': self.pad_pack(text), 'word_count': torch.stack(word_counts)}
+        return {'token_ids': PaddedTensor.from_raw(self.pad_pack(text)), 'word_count': torch.stack(word_counts)}
 
     def pad_pack(self, batch: List[Tensor], pad_value: int = 0) -> Tensor:
         buffer_len = max(len(x) for x in batch)

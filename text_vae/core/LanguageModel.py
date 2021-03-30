@@ -6,9 +6,11 @@ from abc import ABC
 from dataclasses import dataclass
 from functools import partial
 from omegaconf import DictConfig
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from torch import nn, Tensor
 from torch.optim.lr_scheduler import LambdaLR
 from typing import *
+from . import PaddedTensor
 from ..train_callbacks import UnconditionalSampler
 
 
@@ -36,15 +38,18 @@ class LanguageModel(pl.LightningModule, ABC):
         self.save_hyperparameters(hparams)
 
         self.example_input_array = {'batch': {
-            'token_ids': torch.zeros(1, 256, dtype=torch.long),
-            'padding_mask': torch.zeros(1, 256, dtype=torch.bool)}
+            'token_ids': PaddedTensor.from_raw(torch.zeros(1, 256, dtype=torch.long))}
         }
         self.tokenizer = None
         self.start_token = hparams.start_token
         self.end_token = hparams.end_token
 
     def configure_callbacks(self):
-        return [UnconditionalSampler()] if self.hparams.log_samples else []
+        callbacks = [
+            EarlyStopping(monitor='val_nll', mode='min'),
+            ModelCheckpoint(monitor='val_nll', mode='min')
+        ]
+        return callbacks + [UnconditionalSampler()] if self.hparams.log_samples else callbacks
 
     # The callbacks need to have access to a tokenizer, so let's get a reference to the datamodule's tokenizer.
     def setup(self, stage: str):
@@ -80,7 +85,7 @@ class LanguageModel(pl.LightningModule, ABC):
     def initialize_weights(self, scale: float = 0.02):
         # Default BERT weight initialization
         for module in self.modules():
-            if isinstance(module, nn.LayerNorm) or getattr(module, 'no_initialize', False):
+            if isinstance(module, nn.LayerNorm):
                 continue
 
             if hasattr(module, 'weight'):
@@ -88,8 +93,8 @@ class LanguageModel(pl.LightningModule, ABC):
             if getattr(module, 'bias', None) is not None:
                 module.bias.data.zero_()
 
-    def stats_from_logits(self, logits: Tensor, batch: Dict[str, Tensor], autoregressive: bool = False):
-        ground_truth, word_counts = batch['token_ids'], batch.get('num_words')
+    def stats_from_logits(self, logits: Tensor, batch: Dict[str, PaddedTensor], autoregressive: bool = False):
+        ground_truth, word_counts = batch.get('labels') or batch['token_ids'], batch.get('num_words')
         if autoregressive:
             logits = logits[:, :-1]             # Remove final [SEP] token
             ground_truth = ground_truth[:, 1:]  # Remove initial [CLS] token
@@ -100,7 +105,7 @@ class LanguageModel(pl.LightningModule, ABC):
         # Normalize the NLL using the number of words, not number of tokens, so that it's comparable across
         # different subword vocabularies
         if word_counts is not None:
-            token_counts = batch['num_tokens'] if 'num_tokens' in batch else (~batch['padding_mask']).sum(dim=-1)
+            token_counts = batch['num_tokens'] if 'num_tokens' in batch else (~ground_truth.padding).sum(dim=-1)
             ppl_loss = loss * token_counts / word_counts
         else:
             ppl_loss = loss
@@ -125,7 +130,7 @@ class LanguageModel(pl.LightningModule, ABC):
         return self.training_step(batch, batch_index, val=True)
 
     # Called by UnconditionalSampler callback
-    def sample(self, max_length: int, count: int = 1, **kwargs):
+    def sample(self, max_length: int, batch_size: int = 1, **kwargs):
         return None
 
 # The actual lambda to pass into LambdaLR
