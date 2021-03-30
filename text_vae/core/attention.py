@@ -1,7 +1,7 @@
 from functools import lru_cache
 from einops import rearrange
 from torch import nn, Tensor
-from . import PaddedTensor
+from .padded_tensor import PaddedTensor
 import torch
 
 

@@ -10,7 +10,7 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from torch import nn, Tensor
 from torch.optim.lr_scheduler import LambdaLR
 from typing import *
-from . import PaddedTensor
+from .padded_tensor import PaddedTensor
 from ..train_callbacks import UnconditionalSampler
 
 

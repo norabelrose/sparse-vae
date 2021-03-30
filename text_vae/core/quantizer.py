@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from torch import nn, Tensor
 from typing import *
-from . import PaddedTensor
+from .padded_tensor import PaddedTensor
 import torch
 import torch.nn.functional as F
 
