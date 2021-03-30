@@ -22,7 +22,7 @@ class Attention(nn.Module):
 
         if sparse:
             from deepspeed.ops.sparse_attention import SparseSelfAttention
-            from .SlidingWindowSparsityConfig import SlidingWindowSparsityConfig
+            from .sliding_window_sparsity_config import SlidingWindowSparsityConfig
 
             config = SlidingWindowSparsityConfig(num_heads=num_heads)
             self.sparse_attention = SparseSelfAttention(sparsity_config=config, attn_mask_mode='add')
