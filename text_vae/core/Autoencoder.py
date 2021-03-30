@@ -1,7 +1,6 @@
 from abc import abstractmethod
-from pytorch_lightning.callbacks import EarlyStopping
 from torch.distributions import Normal
-from .LanguageModel import *
+from .language_model import *
 from ..train_callbacks import KLAnnealing, ReconstructionSampler
 
 
