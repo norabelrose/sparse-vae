@@ -126,6 +126,7 @@ class FunnelAttention(nn.Module):
         k = self.k_head(k)
         v = self.v_head(v)
 
+        mask = k.padding; mask = mask[:, None, None, :] if mask is not None else None
         q, k, v = (rearrange(x, '... l h d -> ... h l d') for x in (q, k, v))
 
         if self.r_w_bias is not None:
@@ -135,7 +136,6 @@ class FunnelAttention(nn.Module):
             attn_score = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
 
         # Perform masking
-        mask = k.padding
         if self.causal:
             causal_mask = torch.ones(*attn_score.shape[-2:], device=attn_score.device, dtype=torch.bool).triu_(1)
             mask = causal_mask if mask is None else mask | causal_mask

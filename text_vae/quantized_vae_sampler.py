@@ -46,11 +46,11 @@ class QuantizedVAESampler:
             if not hparams_exist:
                 old_hparams_path.link_to(hparams_path)
 
-            vae = QuantizedVAE.load_from_checkpoint(ckpt_path, hparams_file=str(hparams_path), strict=False)
+            vae = QuantizedVAE.load_from_checkpoint(ckpt_path, hparams_file=str(hparams_path))
             return QuantizedVAESampler(vae_name=name, vae=vae)  # noqa
 
         # We've already trained the priors, so just load them
-        vae = QuantizedVAE.load_from_checkpoint(ckpt_path, hparams_file=str(hparams_path), strict=False)
+        vae = QuantizedVAE.load_from_checkpoint(ckpt_path, hparams_file=str(hparams_path))
 
         num_priors = len(vae.quantizers)
         priors = {}
@@ -199,7 +199,16 @@ class QuantizedVAESampler:
         else:
             start = None; end = None
 
-        with torch.autograd.profiler.profile(use_cuda=vae.on_gpu) if options.profile else nullcontext():
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA
+            ],
+            with_stack=True, record_shapes=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(os.getcwd(), 'text-vae-profiling'))
+        ) if options.profile else nullcontext()
+
+        with profiler:
             logits = self._raw_sample(vae, priors, options)
 
         if end:

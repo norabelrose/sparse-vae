@@ -21,7 +21,6 @@ def main(args):
     tokenizer_path = Path.cwd() / 'text-vae-pretrained' / 'tokenizers' / 'yelp_polarity.json'
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     outputs = tokenizer.decode_batch([x.tolist() for x in outputs])
-    breakpoint()
 
 
 if __name__ == "__main__":

@@ -39,9 +39,6 @@ class FunnelTransformer(nn.Module):
         if isinstance(hparams, FunnelTransformerHparams):
             hparams = OmegaConf.structured(hparams)
 
-        if not hparams.d_embedding:
-            hparams.d_embedding = hparams.d_model
-
         self.hparams = hparams
 
         if hparams.use_convolutions:
@@ -73,7 +70,7 @@ class FunnelTransformer(nn.Module):
     def strides(self) -> List[int]:
         scaling_factors = [1] + list(self.hparams.scaling_factors)
         encoder_strides = cumprod(scaling_factors).tolist()
-        return encoder_strides if not self.hparams.upsampling else self.hparams.upsampling[::-1]
+        return encoder_strides if not self.hparams.upsampling else encoder_strides[::-1]
 
     # Activates cross attention for the layers specified in the list of (block index, layer index) tuples
     def configure_cross_attention(self, layers: List[Tuple[int, int]]):

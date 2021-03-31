@@ -68,6 +68,7 @@ def main(args):
                     setattr(options, key, value)
 
         elif command == 's':
+            breakpoint()
             output = sampler.sample(options)
             samples = tokenizer.decode_batch(output.tolist())
             for sample in samples:

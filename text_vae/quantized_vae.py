@@ -125,7 +125,7 @@ class QuantizedVAE(FunnelAutoencoder):
 
         return vae_state
 
-    def decoder_block_end(self, vae_state: QuantizedVAEState, dec_state: Tensor, block_idx: int):
+    def decoder_block_end(self, vae_state: QuantizedVAEState, block_idx: int, dec_state: Tensor):
         cross_attn_kv = vae_state.encoder_states[block_idx - 1] if block_idx > 0 else None
         if block_idx >= len(vae_state.encoder_states):
             return dec_state, cross_attn_kv
