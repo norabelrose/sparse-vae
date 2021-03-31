@@ -21,26 +21,44 @@ class PaddedTensor(Tensor):
         return tensor
 
     @classmethod
+    def unpadded(cls, data: Tensor) -> 'PaddedTensor':
+        tensor = data.as_subclass(cls)
+        tensor._padding = None
+        return tensor
+
+    @classmethod
     def from_dict(cls, data: Dict[str, Tensor]) -> 'PaddedTensor':
         return cls.from_raw(data['data'], padding=data['padding'])
 
     def to_dict(self) -> Dict[str, Tensor]:
-        return {'data': self.as_subclass(Tensor), 'padding': self.padding}
+        return {'data': self.as_raw(), 'padding': self.padding}
+
+    def as_raw(self) -> Tensor:
+        return self.as_subclass(Tensor)
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         results = super().__torch_function__(func, types, args, kwargs)
 
-        if isinstance(results, PaddedTensor):
-            results._padding = self._padding.to(results.device)
+        if results == NotImplemented:
+            raw_kwargs = {k: v.as_raw() if isinstance(v, PaddedTensor) else v for k, v in kwargs.items()} if kwargs else {}
+            raw_args = [arg.as_raw() if isinstance(arg, PaddedTensor) else arg for arg in args]
+            results = func(*raw_args, **raw_kwargs)
+            if isinstance(results, Tensor):
+                results = self.unpadded(results)
+                results._padding = self._padding
+                return results
+            else:
+                _logger.warning(f"A PaddedTensor was passed to the function '{func}' in an unsupported fashion. Types"
+                                f"of parameters were '{types}'. The padding mask will not be propagated.")
+
+        elif isinstance(results, PaddedTensor):
+            results._padding = self._padding.to(results.device) if self._padding is not None else None
 
         # Should handle functions like topk which return a (named) tuple
         elif isinstance(results, Iterable):
             for x in results:
                 if isinstance(x, PaddedTensor):
-                    x._padding = self._padding.to(x.device)
-        else:
-            _logger.warning(f"A PaddedTensor was passed to the unsupported PyTorch function '{func}'. "
-                            f"The padding mask will not be automatically propagated.")
+                    x._padding = self._padding.to(x.device) if self._padding is not None else None
 
         return results
 
@@ -64,7 +82,7 @@ class PaddedTensor(Tensor):
             if pad_size < data_size:
                 scaled_padding = F.interpolate(scaled_padding, size=data_size)
             elif pad_size > data_size:
-                scaled_padding = F.adaptive_max_pool1d(scaled_padding.unsqueeze(1), output_size=data_size)
+                scaled_padding = F.adaptive_max_pool1d(scaled_padding, output_size=data_size)
 
             scaled_padding = scaled_padding.squeeze(1).to(padding_dtype)
             break
@@ -78,7 +96,8 @@ class PaddedTensor(Tensor):
             for dim, (pad_size, data_size) in enumerate(zip(value.shape, self.shape)):
                 assert pad_size == data_size, f"Padding size {pad_size} must match data size {data_size} at dim {dim}"
 
-        self._padding = value.to(self.device)
+        self._padding = value.to(self.device) if value is not None else None
 
     def __repr__(self):
-        return f"PaddedTensor of shape {list(self.shape)}:\n{super().__repr__()}\nPadding:\n{list(self.padding.shape)}"
+        padding_repr = list(self._padding.shape) if self._padding is not None else "(None)"
+        return f"PaddedTensor of shape {list(self.shape)}:\n{super().__repr__()}\nPadding:\n{padding_repr}"

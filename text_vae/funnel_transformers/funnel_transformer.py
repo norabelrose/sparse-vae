@@ -63,7 +63,7 @@ class FunnelTransformer(nn.Module):
                 nn.Dropout(hparams.dropout)
             )
 
-        q_strides = [[stride] * num_layers for stride, num_layers in zip(self.strides(), hparams.block_sizes)]
+        q_strides = sum(([stride] * num_layers for stride, num_layers in zip(self.strides(), hparams.block_sizes)), [])
         kv_strides = [1] + q_strides[:-1] if not hparams.upsampling else q_strides
         self.layers = nn.ModuleList([
             FunnelLayer(hparams, q_stride=q_stride, kv_stride=kv_stride)
@@ -71,14 +71,9 @@ class FunnelTransformer(nn.Module):
         ])
 
     def strides(self) -> List[int]:
-        scaling_factors = [1] + self.hparams.scaling_factors
-        if self.hparams.upsampling:
-            scaling_factors = scaling_factors[::-1]             # Switch to encoder order
-            strides = cumprod(scaling_factors)[::-1].tolist()   # Now switch back to decoder order; e.g. [32, 8, 2, 1]
-        else:
-            strides = cumprod(scaling_factors).tolist()
-
-        return strides
+        scaling_factors = [1] + list(self.hparams.scaling_factors)
+        encoder_strides = cumprod(scaling_factors).tolist()
+        return encoder_strides if not self.hparams.upsampling else self.hparams.upsampling[::-1]
 
     # Activates cross attention for the layers specified in the list of (block index, layer index) tuples
     def configure_cross_attention(self, layers: List[Tuple[int, int]]):
@@ -277,6 +272,7 @@ class FunnelLayer(nn.Module):
         self.q_stride = q_stride
         self.kv_stride = kv_stride
         self.hparams = hparams
+        self.cross_attention = None
         self.feedforward = PositionwiseFFN(hparams.d_model, hparams.d_model * 4, hparams.dropout, hparams.ffn_dropout,
                                            layer_norm_eps=hparams.layer_norm_eps)
 
@@ -302,7 +298,7 @@ class FunnelLayer(nn.Module):
 
         # These custom attention and feedforward layers have built-in residual connections
         q = self.attention(q, kv, kv, pos_encodings=pos_encodings)
-        if context is not None:
+        if context is not None and self.cross_attention is not None:
             q = self.cross_attention(q, context, context, pos_encodings=pos_encodings)  # noqa
 
         q = self.feedforward(q)

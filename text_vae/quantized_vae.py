@@ -222,7 +222,7 @@ class QuantizedVAE(FunnelAutoencoder):
 
         # Don't modify the Transformer's hidden state, but have it cross-attend to the penultimate latent sequence
         callback = lambda i, x: (x, penultimate_z)
-        return self.decoder(last_z, start_block=-1, block_end_callback=callback).logits
+        return self.decoder(last_z, start_block=-1, block_end_callback=callback)
 
     # We can't sample without a separately trained prior
     def sample(self, max_length: int, batch_size: int = 1, **kwargs):

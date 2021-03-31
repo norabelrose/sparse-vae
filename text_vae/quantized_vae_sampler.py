@@ -6,7 +6,6 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datasets import Dataset, DatasetDict, load_from_disk
 from functools import partial
-from numpy import cumprod
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -20,7 +19,7 @@ class QuantizedVAESamplingOptions:
     benchmark: bool = False
     decode_tokens: bool = True
     profile: bool = False
-    max_length: int = 250
+    max_length: int = 512
 
 
 @dataclass
@@ -253,9 +252,10 @@ class QuantizedVAESampler:
     def _raw_sample(vae: QuantizedVAE, priors: List[Transformer], options: QuantizedVAESamplingOptions):
         # Find the maximum sequence length that the top latent sequence can be allowed to have in order to ensure
         # that the final overt sequence length does not exceed max_length
-        funnel_hparams = vae.hparams.funnel
         num_codes = vae.quantizers[0].num_codes
-        strides = cumprod(funnel_hparams.scaling_factors)[::-1]
+        strides = vae.decoder.strides()
+        if not vae.hparams.include_full_res_latents:
+            del strides[-1]
 
         latent_seqs = []
         for level, stride in enumerate(strides):

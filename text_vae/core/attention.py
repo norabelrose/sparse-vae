@@ -75,9 +75,8 @@ class Attention(nn.Module):
                     self.precomputed_kv = True
                     self.cache_index += 1
 
-        q, k, v = (rearrange(x, 'b l (h d) -> b h l d', h=self.num_heads) for x in (q, k, v))
-
         mask = k.padding
+        q, k, v = (rearrange(x, 'b l (h d) -> b h l d', h=self.num_heads) for x in (q, k, v))
         if self.sparse_attention:
             q_len = q.shape[-2]
 
@@ -120,7 +119,7 @@ class Attention(nn.Module):
 
         return output
 
-    def prepare_kv_cache(self, batch_size: int, max_length: int, dtype: torch.dtype = None):
+    def prepare_kv_cache(self, batch_size: int, max_length: int, dtype: torch.dtype = torch.float16):
         # Make sure our cache is a multiple of the sparse attention block size, if applicable
         # if self.sparse_attention:
         #     block_size = self.sparse_attention.sparsity_config.block

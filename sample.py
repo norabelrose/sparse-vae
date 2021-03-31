@@ -43,8 +43,9 @@ def main(args):
                 else:
                     idx = try_type_conversion(value, int)
                     if idx is not None:
+                        print(f"Moving model to GPU {idx}...")
                         sampler = sampler.to('cuda:' + str(idx))
-                        print(f"Model moved to GPU {idx}.")
+                        print("Done.")
 
             # For loading different VAE versions
             elif key == 'version':
