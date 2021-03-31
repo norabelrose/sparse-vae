@@ -1,22 +1,34 @@
-from .funnel_autoencoder import *
-from .core import PaddedTensor, Quantizer
+from .core import LanguageModel, LanguageModelHparams, Quantizer
+from .funnel_transformer import FunnelTransformer, FunnelTransformerHparams
+from .text_data_module import *
 from .train_callbacks import ReconstructionSampler
-from dataclasses import field
+from dataclasses import dataclass, field
 
+from copy import deepcopy
 from functools import partial
+from numpy import prod
+from omegaconf import DictConfig
 from torchtext.data.metrics import bleu_score
-from torch import Tensor
+from torch import nn, Tensor
 from typing import *
 import torch
 
 
 @dataclass
-class QuantizedVAEHparams(FunnelAutoencoderHparams):
+class QuantizedVAEHparams(LanguageModelHparams):
+    funnel: FunnelTransformerHparams = FunnelTransformerHparams(
+        d_model=512,
+        num_heads=8,
+        block_sizes=(4, 2),  # Number of layers in each encoder block; reversed for the decoder
+        scaling_factors=(2,),  # How much the hidden state is downsampled between each encoder block
+    )
+
     beta: float = 0.25
     codebook_size: int = 1024
     ema_decay: float = 0.99
+
+    autoregressive: bool = False
     include_full_res_latents: bool = True
-    num_style_codes: int = 0
 
     grad_clip_threshold: float = 25.0
     latent_depth: int = 64
@@ -36,9 +48,29 @@ class QuantizedVAEState:
     logits: Optional[Tensor] = None
 
 
-class QuantizedVAE(FunnelAutoencoder):
+class QuantizedVAE(LanguageModel):
     def __init__(self, hparams: DictConfig):
         super(QuantizedVAE, self).__init__(hparams)
+
+        funnel_hparams = hparams.funnel
+        decoder_hparams = deepcopy(funnel_hparams)
+        decoder_hparams.update(
+            block_sizes=list(reversed(funnel_hparams.block_sizes)),
+            scaling_factors=list(reversed(funnel_hparams.scaling_factors)),
+            upsampling=True
+        )
+        self.encoder = FunnelTransformer(funnel_hparams)
+        self.decoder = FunnelTransformer(decoder_hparams)
+
+        d_model = funnel_hparams.d_model
+        output_embedding = nn.Linear(d_model, hparams.vocab_size)
+        self.output_layer = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            output_embedding
+        )
+        self.encoder.input_layer[0].weight = output_embedding.weight
 
         num_latent_scales = len(hparams.funnel.scaling_factors)
         if hparams.include_full_res_latents:
@@ -61,20 +93,15 @@ class QuantizedVAE(FunnelAutoencoder):
         ])
         self.gathering_latents = False
 
-        if hparams.num_style_codes > 0:
-            self.style_query = nn.Parameter(torch.randn(hparams.latent_depth))
-            self.style_quantizer = Quantizer(
-                num_codes=hparams.num_style_codes,
-                code_depth=hparams.latent_depth,
-                d_model=d_model,
-                ema_decay=hparams.ema_decay
-            )
-        else:
-            self.style_quantizer = None
-
         blocks = self.decoder.hparams.block_sizes[1:1 + num_latent_scales]
         self.decoder.configure_cross_attention([(block, 0) for block, length in enumerate(blocks, start=1)])
         self.initialize_weights()
+
+    def setup(self, stage: str):
+        super().setup(stage)
+
+        data: TextDataModule = self.trainer.datamodule if stage == 'fit' else self.datamodule
+        data.hparams.pad_to_multiple_of = int(prod(self.decoder.hparams.scaling_factors))
 
     def configure_callbacks(self):
         callbacks = super().configure_callbacks()
@@ -101,7 +128,7 @@ class QuantizedVAE(FunnelAutoencoder):
             quantizer.reset_code_usage_info()
 
     # quantize = False is used by update_codebook_kmeans()
-    def forward(self, batch: Dict[str, Tensor], quantize: bool = True) -> QuantizedVAEState:
+    def forward(self, batch: Dict[str, PaddedTensor], quantize: bool = True) -> QuantizedVAEState:
         encoder_hiddens = self.encoder(batch['token_ids'])
         quant_out = self.quantizers[0](encoder_hiddens[-1], quantize=quantize)
 
@@ -214,9 +241,9 @@ class QuantizedVAE(FunnelAutoencoder):
 
     def decode_prior_samples(self, samples: List[PaddedTensor]) -> Tensor:
         # Get the embeddings for each of the latent codes
-        last_z = self.quantizers[-1].lookup_codes(samples[-1])
+        last_z = self.quantizers[-1].upsample_codes(self.quantizers[-1].lookup_codes(samples[-1]))
         if len(samples) > 1:
-            penultimate_z = self.quantizers[-2].lookup_codes(samples[-2])
+            penultimate_z = self.quantizers[-2].upsample_codes(self.quantizers[-2].lookup_codes(samples[-2]))
         else:
             penultimate_z = None
 

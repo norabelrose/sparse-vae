@@ -4,14 +4,10 @@ from .language_model import *
 from ..train_callbacks import KLAnnealing, ReconstructionSampler
 
 
-@dataclass
-class AutoencoderHparams(LanguageModelHparams, ABC):
-    latent_depth: int = 16  # Depth of the latent tensors/vectors
-
-
 # Abstract base classes for autoencoders with continuous latent spaces
 @dataclass
-class ContinuousVAEHparams(AutoencoderHparams, ABC):
+class ContinuousVAEHparams(LanguageModelHparams, ABC):
+    latent_depth: int = 16  # Depth of the latent tensors/vectors
     kl_weight: float = 1.0
 
 class ContinuousVAE(LanguageModel):

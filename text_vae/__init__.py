@@ -4,12 +4,10 @@ from .core.distributions import *
 from .core.utilities import *
 from .core.generation import *
 from .core.transformer import *
-from .funnel_transformers.remote_models import *
 from .autoencoder_metrics import *
-from .funnel_transformers.funnel_ops import *
 from .core.language_model import *
 from .core.autoencoder import *
-from .funnel_transformers.funnel_transformer import *
+from text_vae.funnel_transformer import *
 from .quantized_vae import *
 from .text_data_module import *
 from .quantized_vae_sampler import *

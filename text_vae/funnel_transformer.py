@@ -1,22 +1,20 @@
-from .funnel_ops import AttentionHparams, PositionwiseFFN, FunnelAttention
-from .remote_models import *
-from ..core import PaddedTensor
-from ..core.utilities import *
+from text_vae.core import PaddedTensor, TransformerLayer
 from dataclasses import dataclass
 from functools import lru_cache
 from numpy import cumprod, prod
 from omegaconf import OmegaConf, DictConfig
-from pytorch_lightning.utilities import AttributeDict
 from torch import nn, Tensor
 from typing import *
-import logging
 import torch
 
 
 @dataclass
-class FunnelTransformerHparams(AttentionHparams):
+class FunnelTransformerHparams:
     block_sizes: Sequence[int] = (4, 4, 4)
     scaling_factors: Sequence[int] = (2, 4)
+
+    d_model: int = 768
+    num_heads: int = 12
 
     max_seq_length: Optional[int] = None
     padding_idx: Optional[int] = 0
@@ -174,117 +172,19 @@ class FunnelTransformer(nn.Module):
 
                 abs_layer_idx += 1
 
-    # Convenient method for loading old checkpoints
-    def enumerate_parameters_by_layer(self) -> Iterator[Tuple[str, torch.nn.Parameter, int]]:
-        for block_idx, abs_layer_idx, layer in self.enumerate_blocks_and_layers():
-            for var_name, param in layer.named_parameters():
-                yield var_name, param, abs_layer_idx
 
-    def path_to_pretrained_checkpoint(self) -> Path:
-        url = remote_model_url_for_hparams(self.hparams, suffix="-PT")
-        return load_remote_model(url)
-
-    def load_pretrained_weights(self, freeze: bool = True, verbose: bool = False):
-        model_path = self.path_to_pretrained_checkpoint()
-
-        # Our parameter names will look like this: 'blocks.0.layers.2.attention.v_head.bias', but the training
-        # files will have the form 'attn_layers.2.v_head.bias'. We need to convert here.
-        state_dict = torch.load(str(model_path / "model.pt"))
-        noninitialized_keys = []
-
-        # Don't forget about the embeddings
-        assert len(self.input_layer) == 3   # We don't support loading PyTorch weights where d_embedding != d_model
-        self.input_layer.load_state_dict({  # noqa
-            '0.weight': state_dict['input_layer.0.lookup_table'],
-            '1.weight': state_dict['input_layer.1.weight'],
-            '1.bias': state_dict['input_layer.1.bias']
-        }, strict=True)
-        self.input_layer.requires_grad_(not freeze)
-
-        for var_name, param, absolute_index in self.enumerate_parameters_by_layer():
-            keys = var_name.split('.')
-            keys[0] = replace_all(keys[0], {  # attention.v_head.bias -> attn_layers.v_head.bias
-                'attention': 'attn_layers',
-                'feedforward': 'pffn_layers'
-            })
-
-            keys.insert(1, str(absolute_index))  # attn_layers.v_head.bias -> attn_layers.2.v_head.bias
-            old_name = '.'.join(keys)
-
-            try:
-                old_weights: Tensor = state_dict[old_name]
-
-                if old_weights.shape != param.data.shape:
-                    if "r_kernel" in var_name:
-                        old_weights = old_weights.permute(1, 0, 2)
-                    else:
-                        old_weights = old_weights.reshape(*param.data.shape)
-
-                param.data = old_weights
-                param.requires_grad = not freeze
-            except KeyError:
-                noninitialized_keys.append({'new_name': var_name, 'old_name': old_name})
-
-        if len(noninitialized_keys) > 0 and verbose:
-            logger = logging.getLogger(__name__)
-            logger.warning(f'Failed to initialize weights: {noninitialized_keys}')
-
-    # For the "args" parameter in the old FunnelTFM.__init__()
-    def get_backward_compatible_args(self) -> AttributeDict:
-        return transmute(
-            self.hparams,
-            attn_type='positional_attention_type',
-            num_class='0',
-            pad_id='None',
-            seg_id_cls='2',
-            truncate_seq='True'
-        )
-    
-    # Get a dictionary compatible with the old ModelConfig class from Funnel-Transformers
-    def get_backward_compatible_dict(self) -> Dict:
-        return transmute(
-            self.hparams,
-            'vocab_size', 'd_model', 'dropout', 'separate_cls',
-            d_embed='d_model',
-            n_head='num_heads',
-            d_head='d_model // num_heads',
-            d_inner='d_model * 4',
-            dropatt='attention_dropout',
-            dropact='ffn_dropout',
-            block_size="'_'.join([str(x) for x in block_sizes])",
-            
-            # We lose info here since Funnel-Transformers doesn't support different scaling factors for each block
-            pooling_size='scaling_factors[0]',
-            pooling_type='"mean"',
-            pool_q_only='True'
-        )
-
-
-class FunnelLayer(nn.Module):
+class FunnelLayer(TransformerLayer):
     def __init__(self, hparams, q_stride: int, kv_stride: int):
-        super().__init__()
+        super().__init__(d_model=hparams.d_model, num_heads=hparams.num_heads, rel_pos_attn=True)
 
-        # d_model = hparams.d_model
-        self.attention = FunnelAttention(hparams)
         self.q_stride = q_stride
         self.kv_stride = kv_stride
         self.hparams = hparams
-        self.cross_attention = None
-        self.feedforward = PositionwiseFFN(hparams.d_model, hparams.d_model * 4, hparams.dropout, hparams.ffn_dropout,
-                                           layer_norm_eps=hparams.layer_norm_eps)
-
-    @property
-    def use_cross_attention(self):
-        return bool(self.cross_attention)
-
-    @use_cross_attention.setter
-    def use_cross_attention(self, value: bool):
-        self.cross_attention = FunnelAttention(self.hparams) if value else None
 
     # Q is different from K and V right after pooling; K and V are always the same
     def forward(self, q: Tensor, kv: PaddedTensor, full_seq_len: int, context: PaddedTensor = None) -> PaddedTensor:
         pos_encodings = positional_encodings_for_strides(
-            attn_type=self.hparams.positional_attention_type,
+            attn_type='rel_shift',
             q_stride=self.q_stride,
             k_stride=self.kv_stride,
             seq_len=full_seq_len,
@@ -292,14 +192,7 @@ class FunnelLayer(nn.Module):
             device=kv.device,
             separate_cls=self.hparams.separate_cls
         )
-
-        # These custom attention and feedforward layers have built-in residual connections
-        q = self.attention(q, kv, kv, pos_encodings=pos_encodings)
-        if context is not None and self.cross_attention is not None:
-            q = self.cross_attention(q, context, context, pos_encodings=pos_encodings)  # noqa
-
-        q = self.feedforward(q)
-        return q
+        return super().forward(q, kv, context, pos_enc=pos_encodings)
 
 
 # Returns a Tensor or a list of Tensors containing positional encodings appropriate for the given strides.
@@ -318,15 +211,8 @@ def positional_encodings_for_strides(attn_type: str, q_stride: int, k_stride: in
         rel_offsets = rel_offsets[:, None] + zero_offset
         rel_offsets = rel_offsets.expand(rel_offsets.size(0), d_model)
         return base_encodings.gather(0, rel_offsets)
-    else:
-        # With absolute positional encodings, we have two encoding tensors; one for queries and one for keys
-        if attn_type == 'absolute':
-            q_encodings = k_encodings = [base_encodings]
-        # With factorized relative encodings, we have four encoding tensors; two for queries and two for keys
-        elif attn_type == 'factorized':
-            q_encodings, k_encodings = base_encodings[:2], base_encodings[2:]
-        else:
-            raise ValueError(f"Invalid attention type '{attn_type}'")
+    elif attn_type == 'absolute':
+        q_encodings = k_encodings = [base_encodings]
 
         q_encodings = [_prepare_for_pooling(x, q_stride, separate_cls)[::q_stride] for x in q_encodings]
         k_encodings = [_prepare_for_pooling(x, k_stride, separate_cls)[::k_stride] for x in k_encodings]
@@ -357,20 +243,10 @@ def get_base_positional_encodings(attn_type: str, stride: int, seq_len: int, d_m
         # Create sinusoidal encodings for all posible offsets (positive and negative) between tokens
         sines, cosines = get_sinusoidal_encodings(-seq_len * 2, seq_len * 2)
         return torch.cat([sines, cosines], dim=-1)
-    else:
-        # Factorized relative positional encodings are just absolute encodings with extra steps
+
+    elif attn_type == 'absolute':
         sines, cosines = get_sinusoidal_encodings(0, seq_len)
-
-        if attn_type == 'absolute':
-            return torch.cat([sines, cosines], dim=-1)
-
-        elif attn_type == 'factorized':
-            query_enc1 = torch.cat([sines, sines], dim=-1)
-            query_enc2 = torch.cat([cosines, sines], dim=-1)
-            key_enc1 = torch.cat([cosines, cosines], dim=-1)
-            key_enc2 = torch.cat([-sines, cosines], dim=-1)
-
-            return [query_enc1, query_enc2, key_enc1, key_enc2]
+        return torch.cat([sines, cosines], dim=-1)
 
 def _prepare_for_pooling(x: Tensor, scaling_factor: int, separate_cls: bool):
     # Copy the [CLS] token (scaling_factor - 1) times to make sure it doesn't get pooled into the adjacent tokens

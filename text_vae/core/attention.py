@@ -6,7 +6,7 @@ import torch
 
 
 class Attention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, causal: bool = False, sparse: bool = False):
+    def __init__(self, d_model: int, num_heads: int, causal = False, sparse = False, rel_pos_attn = False):
         super().__init__()
 
         self.causal = causal
@@ -19,6 +19,13 @@ class Attention(nn.Module):
         self.v_linear = nn.Linear(d_model, d_model)
         self.output_linear = nn.Linear(d_model, d_model)
         self.reset_kv_cache()
+
+        self.rel_pos_attn = rel_pos_attn
+        if rel_pos_attn:
+            d_head = d_model // num_heads
+            self.r_w_bias = nn.Parameter(torch.zeros(num_heads, 1, d_head))
+            self.r_r_bias = nn.Parameter(torch.zeros(num_heads, 1, d_head))
+            self.r_kernel = nn.Parameter(torch.zeros(num_heads, d_model, d_head))
 
         if sparse:
             from deepspeed.ops.sparse_attention import SparseSelfAttention
@@ -41,8 +48,9 @@ class Attention(nn.Module):
         return self._sparsity_mask[:, query_index // block_size, :key_length]
 
     # Mask should be True where you DON'T want to attend.
-    def forward(self, q: Tensor, k: PaddedTensor, v: Tensor, cache_mask: Tensor = None):
-        q = q + positional_encodings_like(q, self.cache_index)  # Position-Infused Attention from "Shortformer" paper
+    def forward(self, q: Tensor, k: PaddedTensor, v: Tensor, cache_mask: Tensor = None, pos_enc = None):
+        if not self.rel_pos_attn:
+            q = q + positional_encodings_like(q, self.cache_index)  # Position-Infused Attention from "Shortformer" paper
         q = self.q_linear(q)
 
         # This will be True only when we're using cached keys and values with cross attention
@@ -52,7 +60,8 @@ class Attention(nn.Module):
 
         # Normal case
         else:
-            k = k + positional_encodings_like(k, self.cache_index)
+            if not self.rel_pos_attn:
+                k = k + positional_encodings_like(k, self.cache_index)
             k, v = self.k_linear(k), self.v_linear(v)
 
             if self.key_cache is not None:
@@ -97,8 +106,13 @@ class Attention(nn.Module):
                 attn_mask = torch.ones(q_len, q_len, device=q.device, dtype=torch.bool).triu(1) * -1e7 if self.causal else None
                 output = self.sparse_attention(q, k, v, attn_mask=attn_mask, key_padding_mask=mask)
         else:
-            # [batch, heads, target length, source length]
-            scores = q @ k.transpose(-1, -2) * k.shape[-1] ** -0.5
+            # Apply relative positional attention scores here if needed
+            if self.rel_pos_attn:
+                assert pos_enc
+                scores = (q + self.r_w_bias) @ k.transpose(-1, -2) * k.shape[-1] ** -0.5
+                scores = scores + self._rel_pos_attn_term(q, k.shape[-2], pos_enc)
+            else:
+                scores = q @ k.transpose(-1, -2) * k.shape[-1] ** -0.5
 
             # Note that we only apply the upper triangular causal mask during training;
             # during autoregressive decoding there's no "right context" to mask out
@@ -120,11 +134,6 @@ class Attention(nn.Module):
         return output
 
     def prepare_kv_cache(self, batch_size: int, max_length: int, dtype: torch.dtype = torch.float16):
-        # Make sure our cache is a multiple of the sparse attention block size, if applicable
-        # if self.sparse_attention:
-        #     block_size = self.sparse_attention.sparsity_config.block
-        #     max_length += block_size - (max_length % block_size)
-
         device = self.output_linear.weight.device
         self.key_cache = torch.zeros(batch_size, max_length, self.d_model, device=device, dtype=dtype)
         self.value_cache = torch.zeros(batch_size, max_length, self.d_model, device=device, dtype=dtype)
@@ -134,6 +143,35 @@ class Attention(nn.Module):
         self.value_cache = None
         self.cache_index = 0
         self.precomputed_kv = False
+
+    def _rel_pos_attn_term(self, q, k_len, pos_enc):
+        # The formula below is from the Funnel Transformer paper, page 13.
+        # Q is (B, H, L, D); pos_enc is (L * 4, H * D), r_kernel is (H, H * D, D), so (pos_enc @ r_kernel) is
+        # (H, L * 4, D) and that transposed is (H, D, L * 4), yielding a scores tensor (B, H, L, L * 4) which
+        # we now have to cleverly manipulate into (B, H, L, L). Apparently this gives the same results as
+        # a gather operation, although to be honest I don't understand why.
+        scores = (q + self.r_r_bias) @ (pos_enc @ self.r_kernel).transpose(-2, -1) * q.shape[-1] ** -0.5
+
+        temp_shape1 = list(scores.shape)
+        temp_shape2 = temp_shape1.copy()
+
+        # While this operation yields a tensor with the same dimensions as if we had simply transposed
+        # the last two dimensions of `scores` (B, H, L * 4, L), it is important to understand that the
+        # elements of the resulting tensor are NOT laid out in the same way as if we had simply called
+        # `scores.transpose(-1, -2)`; the strides are different.
+        temp_shape1[-2], temp_shape1[-1] = temp_shape1[-1], temp_shape1[-2]
+        scores = scores.reshape(temp_shape1)
+
+        # Remove 1 or 2 positions from the left end of the tensor across the long L * 4 dimension
+        shift = 1 + (q.shape[-2] != k_len)
+        temp_shape2[-1] -= shift
+        scores = scores.narrow(-2, shift, temp_shape2[-1])
+
+        # Now reshape to (B, H, L, (L * 4) - (1 or 2))
+        scores = scores.reshape(temp_shape2)
+        scores = scores.narrow(-1, 0, k_len)  # Chop off the rightmost elements to get (B, H, L, L)
+
+        return scores
 
 
 def positional_encodings_like(x: Tensor, start: int = 0):

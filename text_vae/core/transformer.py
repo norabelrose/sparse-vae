@@ -55,7 +55,7 @@ class Transformer(LanguageModel):
             output_embedding.weight = input_embedding.weight
 
         self.transformer_layers = nn.ModuleList([
-            TransformerLayer(d_model, hparams.num_heads, causal=True, cross_attention=hparams.cross_attention,
+            TransformerLayer(d_model, hparams.num_heads, causal=True, use_cross_attention=hparams.cross_attention,
                              sparse_self_attention=hparams.sparse_self_attention)
             for _ in range(hparams.num_layers)
         ])
