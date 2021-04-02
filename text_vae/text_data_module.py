@@ -16,17 +16,17 @@ import warnings
 
 @dataclass
 class TextDataModuleHparams:
-    batch_size: int = 8
+    batch_size: int = 16
 
-    batching_strategy: str = 'uniform_size'  # 'uniform_size', 'uniform_size_prebatched', 'uniform_length', 'random'
-    chunking_strategy: str = 'none'  # 'sentence', 'token', or 'none'
+    batching_strategy: str = 'uniform_size'     # 'uniform_size', 'uniform_size_prebatched', 'uniform_length', 'random'
+    chunking_strategy: str = 'none'             # 'sentence', 'token', or 'none'
     dataset_name: str = 'yelp_polarity'
     dataset_config: Optional[str] = None
     max_sentences_per_sample: Optional[int] = None
     min_tokens_per_sample: int = 16
     max_tokens_per_sample: int = 512
     pad_to_multiple_of: int = 1
-    split: Optional[str] = None    # Any string of the format supported by the HuggingFace datasets library
+    split: Optional[str] = None                 # Any string of the format supported by the HuggingFace datasets library
     use_finetuned_tokenizer: bool = True
     vocab_size: int = 30522
     dataset_save_dir: str = os.path.join(os.getcwd(), 'text-vae-datasets')

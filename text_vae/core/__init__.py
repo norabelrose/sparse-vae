@@ -2,7 +2,7 @@ from .auto_select_gpu import select_best_gpu
 from .attention import *
 from .autoencoder import *
 from .quantizer import *
-from .distributions import *
+from .conditional_gaussian import *
 from .language_model import *
 from .padded_tensor import PaddedTensor
 from .transformer import *

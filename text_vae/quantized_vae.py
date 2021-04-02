@@ -19,8 +19,8 @@ class QuantizedVAEHparams(LanguageModelHparams):
     funnel: FunnelTransformerHparams = FunnelTransformerHparams(
         d_model=512,
         num_heads=8,
-        block_sizes=(4, 2),  # Number of layers in each encoder block; reversed for the decoder
-        scaling_factors=(2,),  # How much the hidden state is downsampled between each encoder block
+        block_sizes=(6,),  # Number of layers in each encoder block; reversed for the decoder
+        scaling_factors=tuple(),  # How much the hidden state is downsampled between each encoder block
     )
 
     beta: float = 0.25
@@ -94,7 +94,9 @@ class QuantizedVAE(LanguageModel):
         self.gathering_latents = False
 
         blocks = self.decoder.hparams.block_sizes[1:1 + num_latent_scales]
-        self.decoder.configure_cross_attention([(block, 0) for block, length in enumerate(blocks, start=1)])
+        if blocks:
+            self.decoder.configure_cross_attention([(block, 0) for block, length in enumerate(blocks, start=1)])
+
         self.initialize_weights()
 
     def setup(self, stage: str):
@@ -128,9 +130,9 @@ class QuantizedVAE(LanguageModel):
             quantizer.reset_code_usage_info()
 
     # quantize = False is used by update_codebook_kmeans()
-    def forward(self, batch: Dict[str, PaddedTensor], quantize: bool = True) -> QuantizedVAEState:
+    def forward(self, batch: Dict[str, PaddedTensor]) -> QuantizedVAEState:
         encoder_hiddens = self.encoder(batch['token_ids'])
-        quant_out = self.quantizers[0](encoder_hiddens[-1], quantize=quantize)
+        quant_out = self.quantizers[0](encoder_hiddens[-1])
 
         vae_state = QuantizedVAEState()
         vae_state.commitment_loss = quant_out.commitment_loss
@@ -161,7 +163,7 @@ class QuantizedVAE(LanguageModel):
 
         # It might be better to use cross attention here
         x = self.combiners[block_idx](torch.cat([dec_state, enc_state], dim=-1))
-        quantizer_out = self.quantizers[block_idx + 1](x, quantize=True)
+        quantizer_out = self.quantizers[block_idx + 1](x)
         vae_state.code_indices.append(quantizer_out.code_indices)
 
         # End the forward pass early if we're gathering latent codes and we just computed the bottom latent feature map
@@ -232,7 +234,7 @@ class QuantizedVAE(LanguageModel):
     def predict(self, batch: Dict[str, PaddedTensor], batch_idx: int, dataloader_idx: Optional[int] = None):
         latent_codes = self.forward(batch).code_indices
 
-        result = {}
+        result = {'num_tokens': batch['num_tokens']}
         for i, z in enumerate(latent_codes):
             level_name = self.name_for_latent_level(i, len(latent_codes))
             result[level_name] = z.to_dict()

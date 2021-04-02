@@ -47,7 +47,6 @@ class Attention(nn.Module):
 
         return self._sparsity_mask[:, query_index // block_size, :key_length]
 
-    # Mask should be True where you DON'T want to attend.
     def forward(self, q: Tensor, k: PaddedTensor, v: Tensor, cache_mask: Tensor = None, pos_enc = None):
         if not self.rel_pos_attn:
             q = q + positional_encodings_like(q, self.cache_index)  # Position-Infused Attention from "Shortformer" paper
@@ -108,7 +107,7 @@ class Attention(nn.Module):
         else:
             # Apply relative positional attention scores here if needed
             if self.rel_pos_attn:
-                assert pos_enc
+                assert pos_enc is not None
                 scores = (q + self.r_w_bias) @ k.transpose(-1, -2) * k.shape[-1] ** -0.5
                 scores = scores + self._rel_pos_attn_term(q, k.shape[-2], pos_enc)
             else:

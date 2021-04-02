@@ -1,14 +1,13 @@
 from pytorch_lightning import seed_everything
-from benchmarks import *
 from text_vae import *
 import sys
 import torch
 
 
 def main(args):
-    command = args[1]
-    model_str = args[2]
+    model_str = args[1]
 
+    seed_everything(7295)  # Reproducibility
     config = OmegaConf.create({
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
@@ -17,16 +16,6 @@ def main(args):
             'num_sanity_val_steps': 2
         }
     })
-
-    if command == 'train-prior':
-        sampler = QuantizedVAESampler.for_vae(model_str)
-
-        config.data = OmegaConf.structured(QuantizedLatentDataModuleHparams)
-        config.prior = OmegaConf.structured(TransformerHparams)
-
-        config.merge_with_dotlist(args[2:])
-        sampler.train_priors(config)
-        return
 
     data_class = TextDataModule
     data_hparam_class = TextDataModuleHparams
@@ -54,6 +43,7 @@ def main(args):
         model_class = QuantizedVAE
         experiment = 'vq-vae'
     else:
+        print(f"Unrecognized model type '{model_str}'.")
         exit(1)
 
     config.data = OmegaConf.structured(data_hparam_class)
@@ -66,12 +56,9 @@ def main(args):
     if config.get('anomaly_detection'):
         torch.autograd.set_detect_anomaly(True)
 
-    if command == 'train':
-        seed_everything(7295)  # Reproducibility
-
-        print(f"Training {experiment}...")
-        if ckpt_name := config.get('from_checkpoint'):
-            config.trainer.resume_from_checkpoint = str(get_checkpoint_path_for_name(experiment, ckpt_name))
+    print(f"Training {experiment}...")
+    if ckpt_name := config.get('from_checkpoint'):
+        config.trainer.resume_from_checkpoint = str(get_checkpoint_path_for_name(experiment, ckpt_name))
 
     model = model_class(config.model)
     data = data_class(hparams=config.data)

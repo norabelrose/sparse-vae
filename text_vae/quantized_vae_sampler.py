@@ -105,10 +105,7 @@ class QuantizedVAESampler:
             for name, result in features.items():
                 lengths = (~result['padding']).sum(-1)
                 trimmed_z = [z[:length] for z, length in zip(result['data'], lengths)]
-
                 z_dataset[name].extend(trimmed_z)
-                if name == 'bottom':
-                    z_dataset['num_tokens'].extend(lengths)
 
         z_dataset = Dataset.from_dict(z_dataset)
         z_dataset = z_dataset.train_test_split(test_size=0.05, shuffle=False)

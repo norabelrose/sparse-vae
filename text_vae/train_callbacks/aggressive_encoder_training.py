@@ -1,5 +1,6 @@
 from torch import Tensor
 from .autoencoder_callback import *
+from ..core import ContinuousVAE
 
 
 # Update encoder parameters more frequently than those of the decoder until the mutual information between
@@ -37,7 +38,7 @@ class AggressiveEncoderTraining(AutoencoderCallback):
             self._last_decoder_update = cur_step
             self._last_loss = new_loss
 
-    def on_validation_end(self, trainer, autoencoder):
+    def on_validation_end(self, trainer, autoencoder: ContinuousVAE):
         if trainer.running_sanity_check or self._aggressive_stage_complete:
             return
 

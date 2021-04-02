@@ -54,8 +54,8 @@ class FunnelTransformer(nn.Module):
         if not hparams.upsampling and hparams.use_embedding:
             self.input_layer = nn.Sequential(
                 nn.Embedding(hparams.vocab_size, hparams.d_model, padding_idx=0),
-                nn.LayerNorm(hparams.d_model, eps=hparams.layer_norm_eps),
-                nn.Dropout(hparams.dropout)
+                nn.LayerNorm(hparams.d_model),
+                nn.Dropout(p=0.1)
             )
 
         q_strides = sum(([stride] * num_layers for stride, num_layers in zip(self.strides(), hparams.block_sizes)), [])
@@ -190,7 +190,6 @@ class FunnelLayer(TransformerLayer):
             seq_len=full_seq_len,
             d_model=kv.shape[-1],
             device=kv.device,
-            separate_cls=self.hparams.separate_cls
         )
         return super().forward(q, kv, context, pos_enc=pos_encodings)
 
@@ -198,7 +197,7 @@ class FunnelLayer(TransformerLayer):
 # Returns a Tensor or a list of Tensors containing positional encodings appropriate for the given strides.
 @lru_cache(maxsize=10)
 def positional_encodings_for_strides(attn_type: str, q_stride: int, k_stride: int, seq_len: int, d_model: int,
-                                     device: torch.device, separate_cls: bool) -> Union[Tensor, List[Tensor]]:
+                                     device: torch.device) -> Union[Tensor, List[Tensor]]:
     # Either a Tensor or a list of Tensors
     base_encodings = get_base_positional_encodings(attn_type, 1, seq_len, d_model, device)
 
@@ -213,9 +212,8 @@ def positional_encodings_for_strides(attn_type: str, q_stride: int, k_stride: in
         return base_encodings.gather(0, rel_offsets)
     elif attn_type == 'absolute':
         q_encodings = k_encodings = [base_encodings]
-
-        q_encodings = [_prepare_for_pooling(x, q_stride, separate_cls)[::q_stride] for x in q_encodings]
-        k_encodings = [_prepare_for_pooling(x, k_stride, separate_cls)[::k_stride] for x in k_encodings]
+        q_encodings = [x[::q_stride] for x in q_encodings]
+        k_encodings = [x[::k_stride] for x in k_encodings]
 
         return q_encodings + k_encodings
 
@@ -247,14 +245,3 @@ def get_base_positional_encodings(attn_type: str, stride: int, seq_len: int, d_m
     elif attn_type == 'absolute':
         sines, cosines = get_sinusoidal_encodings(0, seq_len)
         return torch.cat([sines, cosines], dim=-1)
-
-def _prepare_for_pooling(x: Tensor, scaling_factor: int, separate_cls: bool):
-    # Copy the [CLS] token (scaling_factor - 1) times to make sure it doesn't get pooled into the adjacent tokens
-    if separate_cls:
-        cls_token = x.narrow(-2, 0, 1)  # The [CLS] token across all batches etc.
-
-        shift = scaling_factor - 1  # We're magnifying [CLS] by scaling_factor
-        x = x.roll(shift, -2)  # Roll to the right to make room for the bigger [CLS] token
-        x.narrow(-2, 0, shift).copy_(cls_token)  # Overwrite the last few tokens with [CLS]
-
-    return x

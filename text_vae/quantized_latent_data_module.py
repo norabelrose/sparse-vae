@@ -6,9 +6,9 @@ import torch.nn.functional as F
 @dataclass
 class QuantizedLatentDataModuleHparams(TextDataModuleHparams):
     codebook_size: int = 4096
-    gpu: Optional[int] = None  # GPU to use if we need to gather latent codes
-    latent_key: str = 'top'  # The key to use to look up the latents in the dataset
-    context_key: Optional[str] = None  # Key to look up the next level up latents, used by the prior as context
+    gpu: Optional[int] = None               # GPU to use if we need to gather latent codes
+    latent_key: str = 'top'                 # The key to use to look up the latents in the dataset
+    context_key: Optional[str] = None       # Key to look up the next level up latents, used by the prior as context
     vae_version_name: Optional[str] = None  # If None, the most recent version is used
 
 

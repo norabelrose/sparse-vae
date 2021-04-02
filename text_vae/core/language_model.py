@@ -16,18 +16,21 @@ from ..train_callbacks import UnconditionalSampler
 
 @dataclass
 class LanguageModelHparams(ABC):
-    batch_size: int = 0  # This is here just for compatibility with pl.Trainer's auto_scale_batch_size feature
+    batch_size: int = 0                 # Just for compatibility with pl.Trainer's auto_scale_batch_size feature
     grad_clip_threshold: float = 150.0
+    init_scale: float = 0.02            # Std. deviation of Gaussian used to initialize the weights
     lr: float = 2.5e-4
     lr_decay_steps: Optional[int] = 150_000
     warmup_steps: int = 1000
     adam_beta1: float = 0.9
-    adam_eps: float = 1e-6  # We need to use 1e-6 and not the default 1e-8 since 1e-8 underflows to 0 on fp16
+    adam_eps: float = 1e-6              # We need to use 1e-6 since 1e-8 underflows to 0 on fp16
     weight_decay: float = 0.01
 
     vocab_size: int = 30522
-    start_token: Optional[int] = None  # If None, it's read off the datamodule's Tokenizer object
+    start_token: Optional[int] = None   # If None, it's read off the datamodule's Tokenizer object
     end_token: Optional[int] = None
+
+    early_stopping_metric: str = 'val_nll'
     log_samples: bool = True
 
 
@@ -45,9 +48,10 @@ class LanguageModel(pl.LightningModule, ABC):
         self.end_token = hparams.end_token
 
     def configure_callbacks(self):
+        metric = self.hparams.early_stopping_metric
         callbacks = [
-            EarlyStopping(monitor='val_nll', mode='min'),
-            ModelCheckpoint(monitor='val_nll', mode='min')
+            EarlyStopping(monitor=metric, mode='min'),
+            ModelCheckpoint(monitor=metric, mode='min')
         ]
         return callbacks + [UnconditionalSampler()] if self.hparams.log_samples else callbacks
 
@@ -82,36 +86,43 @@ class LanguageModel(pl.LightningModule, ABC):
             'interval': 'step'
         }]
 
-    def initialize_weights(self, scale: float = 0.02):
+    def initialize_weights(self):
         # Default BERT weight initialization
         for module in self.modules():
             if isinstance(module, nn.LayerNorm):
                 continue
 
             if hasattr(module, 'weight'):
-                module.weight.data.normal_(0.0, scale)
+                module.weight.data.normal_(0.0, self.hparams.init_scale)
             if getattr(module, 'bias', None) is not None:
                 module.bias.data.zero_()
 
+    @staticmethod
+    def ppl_from_nll(nll: Tensor, batch: Dict[str, PaddedTensor]):
+        # Normalize the NLL using the number of words, not number of tokens, so that it's comparable across
+        # different subword vocabularies
+        word_counts = batch.get('num_words')
+        if word_counts is not None:
+            token_counts = batch['num_tokens'] if 'num_tokens' in batch else (~batch['token_ids'].padding).sum(dim=-1)
+            ppl_loss = nll * token_counts / word_counts
+        else:
+            ppl_loss = nll
+
+        # For some reason it's convention to use base 2 for perplexity scores
+        return 2 ** (ppl_loss / math.log(2))
+
     def stats_from_logits(self, logits: Tensor, batch: Dict[str, PaddedTensor], autoregressive: bool = False):
-        ground_truth, word_counts = batch.get('labels') or batch['token_ids'], batch.get('num_words')
+        ground_truth = batch.get('labels') or batch['token_ids']
         if autoregressive:
             logits = logits[:, :-1]             # Remove final [SEP] token
             ground_truth = ground_truth[:, 1:]  # Remove initial [CLS] token
 
         log_probs = logits.log_softmax(dim=-1)
-        loss = F.nll_loss(input=log_probs.flatten(0, 1), target=ground_truth.flatten(), ignore_index=0)
-
-        # Normalize the NLL using the number of words, not number of tokens, so that it's comparable across
-        # different subword vocabularies
-        if word_counts is not None:
-            token_counts = batch['num_tokens'] if 'num_tokens' in batch else (~ground_truth.padding).sum(dim=-1)
-            ppl_loss = loss * token_counts / word_counts
-        else:
-            ppl_loss = loss
+        loss = F.nll_loss(input=log_probs.flatten(end_dim=-2), target=ground_truth.flatten(), ignore_index=0)
+        loss = loss.view(*logits[:-2])  # Add extra batch / MC sample dimension(s) if needed
 
         # For some reason it's convention to use base 2 for perplexity scores
-        ppl = 2 ** (ppl_loss / math.log(2))
+        ppl = self.ppl_from_nll(loss, batch)
         entropy = -(log_probs * log_probs.exp()).sum(dim=-1).mean()
         return loss, ppl, entropy
 

@@ -13,7 +13,7 @@ class QuantizationInfo:
     code_indices: Optional[Tensor] = None
     hard_codes: Optional[Tensor] = None
 
-    # Both these are zero when not training or when the Quantizer is called with quantize=False
+    # Both these are zero when not training
     commitment_loss: Union[float, Tensor] = 0.0
     embedding_loss: Union[float, Tensor] = 0.0
 
@@ -50,7 +50,7 @@ class Quantizer(nn.Module):
     def num_codes(self) -> int:
         return self.codebook.shape[0]
 
-    def forward(self, x: PaddedTensor, quantize: bool = True) -> QuantizationInfo:
+    def forward(self, x: PaddedTensor) -> QuantizationInfo:
         if self.gumbel:
             logits = self.logit_layer(x)
 
@@ -145,11 +145,7 @@ class Quantizer(nn.Module):
 
         # Keep track of the codes we've used
         self.used_code_mask.index_fill_(0, output.code_indices.flatten().detach(), True)
-
-        if not quantize:
-            output.hard_codes = x
-
-        elif self.training:
+        if self.training:
             # Copy the gradients from the soft codes to the hard codes
             output.hard_codes = output.soft_codes + (output.hard_codes - output.soft_codes).detach()
 
