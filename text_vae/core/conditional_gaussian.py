@@ -4,15 +4,16 @@ from typing import *
 
 
 class ConditionalGaussian(nn.Module):
-    def __init__(self, in_features: int, out_features: int, zero_initialized: bool = False):
+    def __init__(self, in_features: int, out_features: int, zero_initialized: bool = False, bias: bool = True):
         super(ConditionalGaussian, self).__init__()
 
-        linear = nn.Linear(in_features, out_features * 2)
+        linear = nn.Linear(in_features, out_features * 2, bias=bias)
         if zero_initialized:
-            linear.bias.data.zero_()
             linear.weight.data.zero_()
+            if bias:
+                linear.bias.data.zero_()
 
-        self.linear = nn.Sequential(nn.GELU(), linear)
+        self.linear = linear
 
     def forward(self, x: Tensor, temperature: float = 1.0, get_kl: bool = False) -> Union[Normal, Tuple[Normal, Tensor]]:
         mu, logsigma = self.linear(x).chunk(2, dim=-1)

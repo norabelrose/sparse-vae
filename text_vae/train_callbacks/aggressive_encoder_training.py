@@ -1,13 +1,12 @@
 from torch import Tensor
 from .autoencoder_callback import *
-from ..core import ContinuousVAE
 
 
 # Update encoder parameters more frequently than those of the decoder until the mutual information between
 # z and x stops going up (from "Lagging Inference Networks and Posterior Collapse in Variational Autoencoders")
 @dataclass
 class AggressiveEncoderTraining(AutoencoderCallback):
-    min_inner_loop_steps: int = 10
+    min_inner_loop_steps: int = 100
     max_inner_loop_steps: int = 100    # Maximum number of encoder updates before we update the decoder
 
     _aggressive_stage_complete: bool = field(default=False, init=False)
@@ -38,7 +37,7 @@ class AggressiveEncoderTraining(AutoencoderCallback):
             self._last_decoder_update = cur_step
             self._last_loss = new_loss
 
-    def on_validation_end(self, trainer, autoencoder: ContinuousVAE):
+    def on_validation_end(self, trainer, autoencoder):
         if trainer.running_sanity_check or self._aggressive_stage_complete:
             return
 

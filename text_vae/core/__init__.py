@@ -1,6 +1,6 @@
 from .auto_select_gpu import select_best_gpu
 from .attention import *
-from .autoencoder import *
+from .continuous_autoencoder import *
 from .quantizer import *
 from .conditional_gaussian import *
 from .language_model import *

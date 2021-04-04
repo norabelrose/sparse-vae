@@ -8,7 +8,7 @@ from functools import partial
 from omegaconf import DictConfig
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from torch import nn, Tensor
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from typing import *
 from .padded_tensor import PaddedTensor
 from ..train_callbacks import UnconditionalSampler
@@ -17,12 +17,16 @@ from ..train_callbacks import UnconditionalSampler
 @dataclass
 class LanguageModelHparams(ABC):
     batch_size: int = 0                 # Just for compatibility with pl.Trainer's auto_scale_batch_size feature
-    grad_clip_threshold: float = 150.0
+    grad_clip_threshold: float = 5.0
     init_scale: float = 0.02            # Std. deviation of Gaussian used to initialize the weights
     lr: float = 2.5e-4
     lr_decay_steps: Optional[int] = 150_000
+    lr_plateau_patience: Optional[int] = None  # If non-None, ReduceLROnPlateau scheduler is used w/ specified patience
     warmup_steps: int = 1000
+
+    # If beta2 ie set to 0.0, we just use SGD (with momentum set to beta1)- useful for replicating papers that use it
     adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
     adam_eps: float = 1e-6              # We need to use 1e-6 since 1e-8 underflows to 0 on fp16
     weight_decay: float = 0.01
 
@@ -30,6 +34,9 @@ class LanguageModelHparams(ABC):
     start_token: Optional[int] = None   # If None, it's read off the datamodule's Tokenizer object
     end_token: Optional[int] = None
 
+    # Whether to divide the loss by the number of tokens in each sequence. This is pretty much always done
+    # for vanilla language models, but often not done for text VAEs.
+    divide_loss_by_length: bool = True
     early_stopping_metric: str = 'val_nll'
     log_samples: bool = True
 
@@ -66,25 +73,45 @@ class LanguageModel(pl.LightningModule, ABC):
             self.end_token = vocab['[SEP]']
 
     def configure_optimizers(self, lr: float = None, params = None):
-        try:
-            from deepspeed.ops.adam import FusedAdam as Adam
-        except ImportError:
-            print("Couldn't import fused Adam kernel from DeepSpeed, falling back on PyTorch version.")
-            from torch.optim import Adam
+        beta1, beta2 = self.hparams.adam_beta1, self.hparams.adam_beta2
+        if beta2 == 0.0:
+            opt = torch.optim.SGD(
+                params or self.parameters(),
+                lr=lr or self.hparams.lr,
+                momentum=beta1
+            )
+        else:
+            try:
+                from deepspeed.ops.adam import FusedAdam as Adam
+            except ImportError:
+                print("Couldn't import fused Adam kernel from DeepSpeed, falling back on PyTorch version.")
+                from torch.optim import Adam
 
-        adam = Adam(
-            params or self.parameters(),
-            lr=lr or self.hparams.lr,
-            betas=(self.hparams.adam_beta1, 0.999),
-            weight_decay=self.hparams.weight_decay,
-            eps=self.hparams.adam_eps
-        )
-        lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, self.hparams.warmup_steps)
+            opt = Adam(
+                params or self.parameters(),
+                lr=lr or self.hparams.lr,
+                betas=(beta1, beta2),
+                weight_decay=self.hparams.weight_decay,
+                eps=self.hparams.adam_eps
+            )
 
-        return [adam], [{
-            'scheduler': LambdaLR(adam, lr_lambda),
-            'interval': 'step'
-        }]
+        # This is mainly just here to reproduce the Lagging Inference Networks paper (He et al. 2019) which uses a
+        # ReduceLROnPlateau-type learning rate schedule
+        on_plateau_patience = self.hparams.lr_plateau_patience
+        if on_plateau_patience is not None:
+            lr_dict = {
+                'scheduler': ReduceLROnPlateau(opt, factor=0.5, patience=on_plateau_patience),
+                'monitor': self.hparams.early_stopping_metric,
+                'interval': 'epoch'
+            }
+        else:
+            lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, self.hparams.warmup_steps)
+            lr_dict = {
+                'scheduler': LambdaLR(opt, lr_lambda),
+                'interval': 'step'
+            }
+
+        return [opt], [lr_dict]
 
     def initialize_weights(self):
         # Default BERT weight initialization
@@ -94,48 +121,44 @@ class LanguageModel(pl.LightningModule, ABC):
 
             if hasattr(module, 'weight'):
                 module.weight.data.normal_(0.0, self.hparams.init_scale)
-            if getattr(module, 'bias', None) is not None:
-                module.bias.data.zero_()
 
-    @staticmethod
-    def ppl_from_nll(nll: Tensor, batch: Dict[str, PaddedTensor]):
-        # Normalize the NLL using the number of words, not number of tokens, so that it's comparable across
-        # different subword vocabularies
-        word_counts = batch.get('num_words')
-        if word_counts is not None:
-            token_counts = batch['num_tokens'] if 'num_tokens' in batch else (~batch['token_ids'].padding).sum(dim=-1)
-            ppl_loss = nll * token_counts / word_counts
+            bias = getattr(module, 'bias', None)
+            bias = getattr(bias, 'data', None)
+            if bias is not None:
+                bias.zero_()
+
+    # If reduce_batch == False, then this method will not reduce across any dimensions other than sequence length
+    def stats_from_logits(self, logits: Tensor, labels: Tensor, word_counts: Tensor = None, reduce_batch: bool = True):
+        nll = F.cross_entropy(input=logits.flatten(end_dim=-2), target=labels.flatten(), ignore_index=0, reduction='none')
+        nll_sum = nll.view(*logits.shape[:-1]).sum(dim=-1)  # Add batch dim(s) back; sum across sequence length
+
+        # Divide by the number of non-padding tokens
+        nll = nll_sum / labels.ne(0).sum(dim=-1) if self.hparams.divide_loss_by_length else nll_sum
+
+        if reduce_batch:
+            # Perplexity is normalized using the number of words, not the number of tokens, so that it's comparable
+            # across different subword vocabularies
+            if word_counts is not None:
+                per_word_nll = (nll_sum / word_counts).mean()
+                ppl = 2 ** (per_word_nll / math.log(2))
+                return nll.mean(), ppl.mean()
+            else:
+                return nll.mean()
         else:
-            ppl_loss = nll
-
-        # For some reason it's convention to use base 2 for perplexity scores
-        return 2 ** (ppl_loss / math.log(2))
-
-    def stats_from_logits(self, logits: Tensor, batch: Dict[str, PaddedTensor], autoregressive: bool = False):
-        ground_truth = batch.get('labels') or batch['token_ids']
-        if autoregressive:
-            logits = logits[:, :-1]             # Remove final [SEP] token
-            ground_truth = ground_truth[:, 1:]  # Remove initial [CLS] token
-
-        log_probs = logits.log_softmax(dim=-1)
-        loss = F.nll_loss(input=log_probs.flatten(end_dim=-2), target=ground_truth.flatten(), ignore_index=0)
-        loss = loss.view(*logits[:-2])  # Add extra batch / MC sample dimension(s) if needed
-
-        # For some reason it's convention to use base 2 for perplexity scores
-        ppl = self.ppl_from_nll(loss, batch)
-        entropy = -(log_probs * log_probs.exp()).sum(dim=-1).mean()
-        return loss, ppl, entropy
+            return nll
 
     # These implementations are used by LSTMLanguageModel and TransformerLanguageModel, but are overriden by others
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Tensor:
-        logits = self.forward(batch)
-        loss, ppl, entropy = self.stats_from_logits(logits, batch, autoregressive=True)
+        logits = self.forward(batch)  # Remove initial [CLS] token from the labels; autoregressive by default
+        loss, ppl = self.stats_from_logits(logits, batch['token_ids'][..., 1:], word_counts = batch['num_words'])
 
-        # Log the entropy of the model's probability distribution over words to see how confident it is
-        self.log('pred_entropy', entropy)
         self.log('train_nll' if not val else 'val_nll', loss, on_step=not val, on_epoch=val)
         self.log('train_ppl' if not val else 'val_ppl', ppl, on_step=not val, on_epoch=val)
         return loss
+
+    def on_after_backward(self):
+        grad_norm = nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
+        self.log('grad_norm', grad_norm, on_step=True)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         return self.training_step(batch, batch_index, val=True)

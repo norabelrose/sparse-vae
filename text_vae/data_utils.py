@@ -1,5 +1,6 @@
 from typing import *
 from dataclasses import dataclass
+from itertools import chain
 from math import ceil
 from tokenizers import Tokenizer
 from torch import Tensor
@@ -7,25 +8,10 @@ import random
 import torch
 
 
-# Flattens large lists faster than list(itertools.chain.from_iterable(x))
-def fast_flatten(original: List[List]) -> List:
-    # Pre-allocate memory
-    total_size = sum(len(x) for x in original)
-    output = [None] * total_size
-
-    cur_idx = 0
-    for x in original:
-        next_idx = cur_idx + len(x)
-        output[cur_idx:next_idx] = x
-        cur_idx = next_idx
-
-    return output
-
-
 # Convert text into WordPiece tokens, while also saving some important stats. This is set up as a freestanding
 # function to avoid an annoying crash that happens when dill, a HuggingFace dependency, tries to pickle the function
 def tokenize(batch: Dict[str, list], tokenizer: Tokenizer, should_chunk: bool, min_tokens: int,
-              max_tokens: int) -> Dict[str, list]:
+             max_tokens: int) -> Dict[str, list]:
     if should_chunk:
         # Tokenizer has had .enable_truncation(max_tokens) called on it
         encodings = tokenizer.encode_batch(batch['text'])
@@ -34,7 +20,7 @@ def tokenize(batch: Dict[str, list], tokenizer: Tokenizer, should_chunk: bool, m
             if len(sample[-1].ids) < min_tokens:  # Only the last sequence might possibly be too short
                 encodings.pop()
 
-        encodings = fast_flatten(encodings)
+        encodings = list(chain.from_iterable(encodings))
     else:
         encodings = tokenizer.encode_batch(batch['text'])
         encodings = [x for x in encodings if min_tokens <= len(x.ids) <= max_tokens]

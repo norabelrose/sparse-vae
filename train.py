@@ -1,5 +1,6 @@
 from pytorch_lightning import seed_everything
 from text_vae import *
+from hparam_presets import hparam_presets
 import sys
 import torch
 
@@ -48,7 +49,12 @@ def main(args):
 
     config.data = OmegaConf.structured(data_hparam_class)
     config.model = OmegaConf.structured(hparam_class)
+
     config.merge_with_dotlist(args[2:])
+    if preset := config.get('preset'):
+        preset_config = hparam_presets.get(preset)
+        assert preset_config, f"Preset name '{preset}' not recognized."
+        config.merge_with(preset_config)
 
     if torch.cuda.is_available() and 'gpus' not in config.trainer:
         config.trainer.gpus = [select_best_gpu()]

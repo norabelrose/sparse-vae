@@ -1,4 +1,3 @@
-from abc import abstractmethod
 from contextlib import contextmanager
 from torch.distributions import Normal
 from .language_model import *
@@ -21,13 +20,13 @@ class ContinuousVAEHparams(LanguageModelHparams, ABC):
     early_stopping_metric: str = 'val_loss'  # For continuous VAEs we should monitor the whole loss, not just the NLL
 
 class ContinuousVAE(LanguageModel, ABC):
-    def __init__(self, hparams: DictConfig):
-        super(LanguageModel, self).__init__(hparams)
-        self.decoder_frozen = False
-
     def configure_callbacks(self):
         callbacks = super().configure_callbacks()
         return callbacks + [ReconstructionSampler()]
+
+    def setup(self, stage: str):
+        super().setup(stage)
+        self.decoder_frozen = False
 
     # Performs a backward pass for both the encoder and decoder networks, using the DReG gradient estimator for the
     # encoder parameters. Returns the IWAE importance-weighted estimate of log p(x).
@@ -62,9 +61,9 @@ class ContinuousVAE(LanguageModel, ABC):
             self.manual_backward(decoder_loss * loss_weight, retain_graph=retain_graph)
             return iwae
 
-        log_cond = self.log_prob(x, z, labels)  # log p(x|z_i) for all z_i
-        log_joint = log_p_of_z + log_cond  # log p(x, z_i) for all z_i
-        log_w = log_joint - log_q_of_z  # log w_i = log [p(x|z_i)/q(z_i|x)]
+        log_cond = self.p_of_x_given_z(x, z, labels)    # log p(x|z_i) for all z_i
+        log_joint = log_p_of_z + log_cond               # log p(x, z_i) for all z_i
+        log_w = log_joint - log_q_of_z                  # log w_i = log [p(x|z_i)/q(z_i|x)]
         normalized_w = log_w.softmax(dim=0)
 
         s_hat_weight = 1.0  # The weight placed on the standard DReG loss terms
@@ -98,7 +97,7 @@ class ContinuousVAE(LanguageModel, ABC):
         log_ws = []
 
         for z, log_p, log_q in zip(latents, log_p_of_z, log_q_of_z):
-            log_joint = log_p + self.log_prob(x, z, labels)
+            log_joint = log_p + self.p_of_x_given_z(x, z, labels)
             log_ws += [log_joint - log_q]
 
         log_ws = torch.cat(log_ws)  # [chunks * samples, batch]
@@ -114,8 +113,8 @@ class ContinuousVAE(LanguageModel, ABC):
         return -conditional_q.entropy().sum(dim=-1).mean() - marginal_q.mean()
 
     # Should return p(x|z)
-    @abstractmethod
-    def log_prob(self, x, z, labels) -> Tensor:
+    # @abstractmethod
+    def p_of_x_given_z(self, x, z, labels) -> Tensor:
         raise NotImplementedError
 
     # Called by AggressiveEncoderTraining callback
@@ -124,7 +123,7 @@ class ContinuousVAE(LanguageModel, ABC):
         for param in self.decoder_params():
             param.requires_grad = requires_grad
 
-    @abstractmethod
+    # @abstractmethod
     def decoder_params(self) -> Iterable[nn.Parameter]:
         raise NotImplementedError
 

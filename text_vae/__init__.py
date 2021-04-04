@@ -5,7 +5,7 @@ from .core.utilities import *
 from .core.generation import *
 from .core.transformer import *
 from .core.language_model import *
-from .core.autoencoder import *
+from .core.continuous_autoencoder import *
 from .funnel_transformer import *
 from .lstm_autoencoder import *
 from .lstm_language_model import *

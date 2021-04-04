@@ -3,9 +3,9 @@ from .autoencoder_callback import *
 
 @dataclass
 class KLAnnealing(AutoencoderCallback):
-    kl_weight_start: float = 0.1
+    kl_weight_start: float = 1e-5
     kl_weight_end: float = 1.0
-    num_annealing_steps: int = 50_000
+    num_annealing_steps: int = 500_000
 
     def on_train_start(self, trainer, autoencoder):
         autoencoder.hparams.kl_weight = self.kl_weight_start

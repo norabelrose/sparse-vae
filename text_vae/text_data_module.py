@@ -16,13 +16,12 @@ import warnings
 
 @dataclass
 class TextDataModuleHparams:
-    batch_size: int = 16
+    batch_size: int = 8
 
     batching_strategy: str = 'uniform_size'     # 'uniform_size', 'uniform_size_prebatched', 'uniform_length', 'random'
     chunking_strategy: str = 'none'             # 'sentence', 'token', or 'none'
     dataset_name: str = 'yelp_polarity'
     dataset_config: Optional[str] = None
-    max_sentences_per_sample: Optional[int] = None
     min_tokens_per_sample: int = 16
     max_tokens_per_sample: int = 512
     pad_to_multiple_of: int = 1
@@ -100,10 +99,10 @@ class TextDataModule(pl.LightningDataModule):
             columns = next(iter(cols_by_split))
 
             assert all(cols == columns for cols in cols_by_split), "All splits must have the same columns"
-            nontext_cols = columns
+            cols_to_remove = columns
         else:
-            nontext_cols = self.dataset.column_names
-        nontext_cols.remove('text')
+            cols_to_remove = self.dataset.column_names
+        cols_to_remove.remove('text')
 
         # Weirdly the yelp_polarity dataset uses the sequence '\ n' instead of actual newlines, and
         # '\ " "' instead of simple double quotes, so we fix that here.
@@ -113,11 +112,9 @@ class TextDataModule(pl.LightningDataModule):
 
             self.dataset = self.dataset.map(remove_backslashes, batched=True, batch_size=self.preproc_batch_size)
 
+        # We're generating single-sentence samples
         chunk_strategy = self.hparams.chunking_strategy
-        # We're either generating single-sentence samples, or multi-sentence samples that respect sentence boundaries
         if chunk_strategy == 'sentence':
-            max_sents = self.hparams.max_sentences_per_sample or int(1e9)
-
             # The NLTK Punkt tokenizer is actually a fancy learned model that needs to be downloaded
             import nltk.data
             nltk_dir = os.path.join(os.getcwd(), 'text-vae-pretrained/nltk/')
@@ -130,63 +127,24 @@ class TextDataModule(pl.LightningDataModule):
             def sentence_split(batch: Dict[str, list]) -> Dict[str, list]:
                 sent_tokenizer = nltk.data.load(punkt_dir, cache=True)
                 sentences = sent_tokenizer.tokenize_sents(batch['text'])
-                return {'text': fast_flatten(sentences)}  # Chain lists of sentences together from different samples
+                return {'text': list(chain.from_iterable(sentences))}  # Chain lists of sentences from different samples
 
             print(f"Finding sentence boundaries for '{self.hparams.dataset_name}'...")
             self.dataset = self.dataset.map(sentence_split, batched=True, batch_size=self.preproc_batch_size,
-                                            remove_columns=nontext_cols)
+                                            remove_columns=cols_to_remove)
+            cols_to_remove.clear()
 
-            print(f"Tokenizing '{self.hparams.dataset_name}'...")
-            self.dataset = self.dataset.map(
-                tokenize, batched=True, batch_size=self.preproc_batch_size * max(10, cpu_count()),
-                fn_kwargs=dict(
-                    should_chunk=False,
-                    tokenizer=self.tokenizer,
-                    min_tokens=min_tokens,
-                    max_tokens=max_tokens
-                )
+        print(f"Tokenizing '{self.hparams.dataset_name}'...")
+        self.dataset = self.dataset.map(
+            tokenize, batched=True, batch_size=self.preproc_batch_size,
+            remove_columns=cols_to_remove,
+            fn_kwargs=dict(
+                should_chunk=self.hparams.chunking_strategy == 'token',
+                tokenizer=self.tokenizer,
+                min_tokens=min_tokens,
+                max_tokens=max_tokens
             )
-
-            # This is for when we're generating batches of multiple full sentences
-            if max_sents > 1:
-                def chunk_getter(batch: Dict[str, list]):
-                    current_batch = []
-                    current_length = 0
-
-                    for sentence in batch['text']:
-                        next_length = len(sentence)
-
-                        # This sentence is so long it exceeds the max length by itself, so skip it
-                        if next_length > max_tokens:
-                            continue
-
-                        # Adding this sentence would make the current batch too long, so yield the current batch,
-                        # start a new batch and add this sentence too it
-                        elif next_length + current_length > max_tokens or len(current_batch) >= max_sents:
-                            chunk_to_yield = fast_flatten(current_batch)
-                            current_batch.clear()
-                            current_batch.append(sentence)
-
-                            yield chunk_to_yield
-                        else:
-                            current_batch.append(sentence)
-
-                print(f"Grouping '{self.hparams.dataset_name}' into batches...")
-                self.dataset = self.dataset.map(lambda batch: {'text': list(chunk_getter(batch))}, batched=True)
-
-        # We're ignoring sentence boundaries
-        else:
-            print(f"Tokenizing '{self.hparams.dataset_name}'...")
-
-            self.dataset = self.dataset.map(
-                tokenize, batched=True, batch_size=self.preproc_batch_size, remove_columns=nontext_cols,
-                fn_kwargs=dict(
-                    should_chunk=self.hparams.chunking_strategy == 'token',
-                    tokenizer=self.tokenizer,
-                    min_tokens=min_tokens,
-                    max_tokens=max_tokens
-                )
-            )
+        )
 
         # Silence annoying warnings from the tokenizers package after we spawn DataLoader processes
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'

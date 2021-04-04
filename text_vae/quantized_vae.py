@@ -30,7 +30,6 @@ class QuantizedVAEHparams(LanguageModelHparams):
     autoregressive: bool = False
     include_full_res_latents: bool = True
 
-    grad_clip_threshold: float = 25.0
     latent_depth: int = 64
     lr: float = 3e-4  # From the OpenAI Jukebox VQ-VAE hyperparameters
 
@@ -188,14 +187,13 @@ class QuantizedVAE(LanguageModel):
         commitment_loss = vae_state.commitment_loss / len(self.quantizers)
         embedding_loss = vae_state.embedding_loss / len(self.quantizers)
 
-        nll, ppl, entropy = self.stats_from_logits(vae_state.logits, batch, autoregressive=False)
+        nll, ppl = self.stats_from_logits(vae_state.logits, batch['token_ids'], word_counts = batch['num_words'])
         self.log('nll', nll, prog_bar=True, logger=False, on_step=True, on_epoch=False)
 
         log_prefix = stage + '_'
         self.log_dict({
             log_prefix + 'nll': nll,
             log_prefix + 'ppl': ppl,
-            log_prefix + 'entropy': entropy,
             log_prefix + 'commitment_loss': commitment_loss,
             log_prefix + 'embedding_loss': embedding_loss
         })
@@ -222,10 +220,6 @@ class QuantizedVAE(LanguageModel):
 
     def training_step(self, batch: Dict[str, PaddedTensor], batch_index: int, **kwargs) -> Dict[str, Tensor]:
         return self.train_or_val_step(batch, stage='train')
-
-    def on_after_backward(self):
-        grad_norm = nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
-        self.log('grad_norm', grad_norm, on_step=True)
 
     def validation_step(self, batch: Dict[str, PaddedTensor], batch_index: int):
         self.train_or_val_step(batch, stage='val')

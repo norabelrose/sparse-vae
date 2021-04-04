@@ -9,10 +9,10 @@ from .core import GenerationState, LanguageModel, LanguageModelHparams
 @dataclass
 class LSTMLanguageModelHparams(LanguageModelHparams):
     d_embedding: int = 512  # Dimensionality of the input embedding vectors
-    d_model: int = 1024  # Dimensionality of the LSTM hidden state
+    d_model: int = 1024     # Dimensionality of the LSTM hidden state
     num_layers: int = 1
 
-    tie_logit_weights: bool = False  # Tie the logit layer weights to the embedding weights
+    tie_logit_weights: bool = False     # Tie the logit layer weights to the embedding weights
 
 
 class LSTMLanguageModel(LanguageModel):
@@ -21,12 +21,15 @@ class LSTMLanguageModel(LanguageModel):
 
         self.decoder_embedding = nn.Embedding(hparams.vocab_size, hparams.d_embedding)
         self.decoder = nn.LSTM(
-            input_size=hparams.d_embedding,
+            input_size=hparams.d_embedding + self.context_depth(),
             hidden_size=hparams.d_model,
             batch_first=True,
             num_layers=hparams.num_layers
         )
-        self.initial_state = nn.Parameter(torch.randn(hparams.num_layers, 1, hparams.d_model))
+        if self.learned_initial_state:
+            self.initial_state = nn.Parameter(torch.randn(hparams.num_layers, 1, hparams.d_model))
+        else:
+            self.initial_state = None
 
         if hparams.tie_logit_weights:
             output_embedding = nn.Linear(hparams.d_embedding, hparams.vocab_size)
@@ -72,7 +75,7 @@ class LSTMLanguageModel(LanguageModel):
         h_init = initial_state.tanh()
         decoder_hidden = (h_init, initial_state)
 
-        for current_idx in range(1, max_length):
+        while not state.should_stop():
             # Concatenate the word embedding of the previous token with the latent state to get the RNN input
             prev_word_embedding = self.decoder_embedding(state.prev_tokens())
             if context is not None:
@@ -82,9 +85,14 @@ class LSTMLanguageModel(LanguageModel):
 
             output, decoder_hidden = self.decoder(lstm_input, decoder_hidden)
             logits = self.output_layer(output)
-
             state.process_logits(logits.squeeze(1))
-            if state.should_stop():  # All samples in the batch have produced the end symbol
-                break
 
         return state.final_output()
+
+    # Size of the context vectors optionally concatenated to the input of the LSTM at each time step
+    def context_depth(self) -> int:
+        return 0
+
+    @classmethod
+    def learned_initial_state(cls) -> bool:
+        return True
