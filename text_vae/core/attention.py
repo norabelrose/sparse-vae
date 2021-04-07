@@ -1,12 +1,14 @@
 from functools import lru_cache
 from einops import rearrange
 from torch import nn, Tensor
+from typing import Optional
 from .padded_tensor import PaddedTensor
 import torch
 
 
 class Attention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, causal = False, sparse = False, rel_pos_attn = False):
+    def __init__(self, d_model: int, num_heads: int, causal = False, sparse = False, rel_pos_attn = False,
+                 learned_queries: int = None, d_input: int = None):
         super().__init__()
 
         self.causal = causal
@@ -14,9 +16,16 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         assert d_model % num_heads == 0, "num_heads must divide d_model evenly"
 
-        self.q_linear = nn.Linear(d_model, d_model)
-        self.k_linear = nn.Linear(d_model, d_model)
-        self.v_linear = nn.Linear(d_model, d_model)
+        # We can use learned queries to extract a single vector or a fixed size sequence of vectors out of a sequence
+        d_input = d_input or d_model
+        if learned_queries:
+            self.learned_queries = nn.Parameter(torch.randn(1, learned_queries, d_model))
+        else:
+            self.q_linear = nn.Linear(d_input, d_model)
+            self.learned_queries = None
+
+        self.k_linear = nn.Linear(d_input, d_model)
+        self.v_linear = nn.Linear(d_input, d_model)
         self.output_linear = nn.Linear(d_model, d_model)
         self.reset_kv_cache()
 
@@ -31,7 +40,7 @@ class Attention(nn.Module):
             from deepspeed.ops.sparse_attention import SparseSelfAttention
             from .sliding_window_sparsity_config import SlidingWindowSparsityConfig
 
-            config = SlidingWindowSparsityConfig(num_heads=num_heads)
+            config = SlidingWindowSparsityConfig(num_heads=num_heads, window_size=2)
             self.sparse_attention = SparseSelfAttention(sparsity_config=config, attn_mask_mode='add')
             self.register_buffer('_sparsity_mask', None)
         else:
@@ -47,10 +56,15 @@ class Attention(nn.Module):
 
         return self._sparsity_mask[:, query_index // block_size, :key_length]
 
-    def forward(self, q: Tensor, k: PaddedTensor, v: Tensor, cache_mask: Tensor = None, pos_enc = None):
-        if not self.rel_pos_attn:
-            q = q + positional_encodings_like(q, self.cache_index)  # Position-Infused Attention from "Shortformer" paper
-        q = self.q_linear(q)
+    def forward(self, q: Optional[Tensor], k: PaddedTensor, v: Tensor, cache_mask: Tensor = None, pos_enc = None):
+        # When using learned queries, we ignore the q argument- it's expected that you'll set that to None
+        if self.learned_queries is not None:
+            q = self.learned_queries.expand(k.shape[0], *self.learned_queries.shape[1:])
+        else:
+            # Position-Infused Attention from "Shortformer" paper
+            if not self.rel_pos_attn:
+                q = q + positional_encodings_like(q, self.cache_index)
+            q = self.q_linear(q)
 
         # This will be True only when we're using cached keys and values with cross attention
         if self.precomputed_kv:
@@ -132,7 +146,7 @@ class Attention(nn.Module):
 
         return output
 
-    def prepare_kv_cache(self, batch_size: int, max_length: int, dtype: torch.dtype = torch.float16):
+    def prepare_kv_cache(self, batch_size: int, max_length: int, dtype: torch.dtype = None):
         device = self.output_linear.weight.device
         self.key_cache = torch.zeros(batch_size, max_length, self.d_model, device=device, dtype=dtype)
         self.value_cache = torch.zeros(batch_size, max_length, self.d_model, device=device, dtype=dtype)

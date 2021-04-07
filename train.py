@@ -25,8 +25,8 @@ def main(args):
     experiment = None
 
     if model_str == 'lstm':
-        hparam_class = LSTMAutoencoderHparams
-        model_class = LSTMAutoencoder
+        hparam_class = LSTMVAEHparams
+        model_class = LSTMVAE
         experiment = 'lstm-vae'
 
     elif model_str == 'lstm-lm':
@@ -38,6 +38,11 @@ def main(args):
         hparam_class = TransformerHparams
         model_class = Transformer
         experiment = 'transformer-lm'
+
+    elif model_str == 'transformer-vae':
+        hparam_class = TransformerVAEHparams
+        model_class = TransformerVAE
+        experiment = 'transformer-vae'
 
     elif model_str == 'vq-vae':
         hparam_class = QuantizedVAEHparams

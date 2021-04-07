@@ -5,6 +5,7 @@ from .quantizer import *
 from .conditional_gaussian import *
 from .language_model import *
 from .padded_tensor import PaddedTensor
+from .perceiver import Perceiver
 from .transformer import *
 from .transformer_layer import *
 from .utilities import *

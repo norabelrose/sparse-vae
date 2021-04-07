@@ -7,10 +7,11 @@ from .core.transformer import *
 from .core.language_model import *
 from .core.continuous_autoencoder import *
 from .funnel_transformer import *
-from .lstm_autoencoder import *
+from .lstm_vae import *
 from .lstm_language_model import *
 from .quantized_vae import *
 from .text_data_module import *
+from .transformer_vae import *
 from .quantized_vae_sampler import *
 from .mlm_data_module import *
 

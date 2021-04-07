@@ -1,4 +1,3 @@
-from copy import deepcopy
 from .attention import *
 
 
@@ -10,11 +9,14 @@ class TransformerLayer(nn.Module):
             causal: bool = False,
             rel_pos_attn: bool = False,
             use_cross_attention: bool = False,
-            sparse_self_attention: bool = False
+            sparse_self_attention: bool = False,
+            learned_queries: int = None,
+            d_input: int = None
     ):
         super(TransformerLayer, self).__init__()
 
-        self.attention = Attention(d_model, num_heads, causal, rel_pos_attn=rel_pos_attn, sparse=sparse_self_attention)
+        self.attention = Attention(d_model, num_heads, causal, rel_pos_attn=rel_pos_attn, sparse=sparse_self_attention,
+                                   learned_queries=learned_queries, d_input=d_input)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -31,19 +33,34 @@ class TransformerLayer(nn.Module):
 
     @use_cross_attention.setter
     def use_cross_attention(self, value: bool):
-        self.cross_attention = deepcopy(self.attention) if value else None
-        self.cross_attn_layer_norm = nn.LayerNorm(self.attention.d_model) if value else None
+        if value:
+            self_attn = self.attention
+            self.cross_attention = Attention(
+                d_model=self_attn.d_model,
+                num_heads=self_attn.num_heads,
+                rel_pos_attn=self_attn.rel_pos_attn
+            )
+            self.cross_attn_layer_norm = nn.LayerNorm(self_attn.d_model)
+            self.context_layer_norm = nn.LayerNorm(self_attn.d_model)
+        else:
+            self.cross_attention = None
 
-    def forward(self, x: PaddedTensor, context: PaddedTensor = None, cache_mask: Tensor = None, pos_enc = None) -> Tensor:
-        y = self.attention(x, x, x, cache_mask=cache_mask, pos_enc=pos_enc)
-        x = y = self.attn_layer_norm(x + y)
+    def forward(self, x: PaddedTensor, context: PaddedTensor = None,
+                cache_mask: Tensor = None, pos_enc = None) -> Tensor:
+        # We use the pre-LayerNorm variant of the Transformer architecture because it tends to train more
+        # stably across a wider range of hyperparameter configurations
+        y = self.attn_layer_norm(x)
+        y = self.attention(y, y, y, cache_mask=cache_mask, pos_enc=pos_enc)
+        x = x + y if x.shape == y.shape else y
 
         if self.cross_attention and context is not None:
-            x = self.cross_attention(x, context, context, pos_enc=pos_enc)
-            x = y = self.cross_attn_layer_norm(x + y)
+            context, y = self.context_layer_norm(context), self.cross_attn_layer_norm(x)
+            y = self.cross_attention(y, context, context, pos_enc=pos_enc)
+            x = x + y
 
+        y = self.ffn_layer_norm(x)
         y = self.ffn(y)
         y = self.dropout(y)
-        y = self.ffn_layer_norm(x + y)
+        y = x + y
 
         return y

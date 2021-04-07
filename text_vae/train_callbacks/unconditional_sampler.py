@@ -24,26 +24,9 @@ class UnconditionalSampler(AutoencoderCallback):
         logger = logger.experiment
         tokenizer = trainer.datamodule.tokenizer
 
-        # List of Markov chain MLM iterations
-        if isinstance(samples, list):
-            samples = [tokenizer.decode_batch(sample.tolist(), skip_special_tokens=False) for sample in samples]
+        samples = samples.tolist()  # Tensor -> List of lists of ints
+        samples = [[token for token in sample if token != 0] for sample in samples]
+        samples = tokenizer.decode_batch(samples, skip_special_tokens=False)  # List of strings
 
-            for batch in zip(*samples):
-                buffer = ""
-                for i, iteration in enumerate(batch):
-                    if i == 0:
-                        buffer += "Original sample:\n"
-                    else:
-                        buffer += f"Iteration {i}:\n"
-
-                    buffer += iteration + "\n\n"
-
-                logger.add_text("unconditional_sample", buffer, global_step=langmodel.global_step)
-
-        # Normal case
-        else:
-            samples = samples.tolist()  # Tensor -> List of lists of ints
-            samples = tokenizer.decode_batch(samples, skip_special_tokens=False)  # List of strings
-
-            for sample in samples:
-                logger.add_text("unconditional_sample", sample, global_step=langmodel.global_step)
+        for sample in samples:
+            logger.add_text("unconditional_sample", sample, global_step=langmodel.global_step)

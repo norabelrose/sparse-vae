@@ -187,13 +187,11 @@ class QuantizedVAE(LanguageModel):
         commitment_loss = vae_state.commitment_loss / len(self.quantizers)
         embedding_loss = vae_state.embedding_loss / len(self.quantizers)
 
-        nll, ppl = self.stats_from_logits(vae_state.logits, batch['token_ids'], word_counts = batch['num_words'])
-        self.log('nll', nll, prog_bar=True, logger=False, on_step=True, on_epoch=False)
+        nll = self.get_nll(vae_state.logits, batch['token_ids'], word_counts = batch['num_words'])
+        self.log('nll', nll, prog_bar=True, logger=False)
 
         log_prefix = stage + '_'
         self.log_dict({
-            log_prefix + 'nll': nll,
-            log_prefix + 'ppl': ppl,
             log_prefix + 'commitment_loss': commitment_loss,
             log_prefix + 'embedding_loss': embedding_loss
         })

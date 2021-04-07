@@ -54,12 +54,11 @@ class Transformer(LanguageModel):
         if hparams.tie_embedding_weights and d_embedding == d_model:
             output_embedding.weight = input_embedding.weight
 
-        self.transformer_layers = nn.ModuleList([
+        self.decoder_layers = nn.ModuleList([
             TransformerLayer(d_model, hparams.num_heads, causal=True, use_cross_attention=hparams.cross_attention,
                              sparse_self_attention=hparams.sparse_self_attention)
             for _ in range(hparams.num_layers)
         ])
-        self.initialize_weights()
 
     def setup(self, stage: str):
         super().setup(stage)
@@ -68,23 +67,24 @@ class Transformer(LanguageModel):
             datamodule = self.trainer.datamodule if stage == 'fit' else self.datamodule
             datamodule.hparams.pad_to_multiple_of = 16
 
+        self.initialize_weights()
+
     def embed_context(self, context: Tensor):
         return self.context_layer(context) if self.context_layer else self.input_layer(context)
 
-    def forward(self, batch: Dict[str, PaddedTensor], embed_context: bool = True):
+    def forward(self, batch: Dict[str, PaddedTensor]):
         x, context = batch['token_ids'], batch.get('context')
-        if context is not None and embed_context:
+        if context is not None:
             context = self.embed_context(context)
 
         x = self.input_layer(x)
-
-        for layer in self.transformer_layers:
-            x = layer(x, context=context, cache_mask=batch.get('cache_mask'))
+        for layer in self.decoder_layers:
+            x = layer(x, context=context)
 
         return self.output_layer(x)
 
     @torch.no_grad()
-    def sample(self, max_length: int, batch_size: int = 1, context: Tensor = None,
+    def sample(self, max_length: int, batch_size: int = 1, context: Tensor = None, initial_embedding: Tensor = None,
                beam_size: int = 1, top_k: int = 0, top_p: float = 0.92, temperature: float = 1.0,
                length_penalty: float = 1.0, dtype: torch.dtype = torch.long):
         context = self.embed_context(context) if context is not None else None
@@ -95,21 +95,35 @@ class Transformer(LanguageModel):
         )
         num_samples = batch_size * beam_size
         state.output_ids[:, 0] = self.start_token
-
-        for layer in self.transformer_layers:
-            layer.attention.prepare_kv_cache(batch_size=num_samples, max_length=max_length)
-            if layer.cross_attention is not None:
-                layer.cross_attention.prepare_kv_cache(batch_size=num_samples, max_length=context.shape[-2])
+        has_created_cache = False
 
         while not state.should_stop():
-            next_logits = self.forward({
-                'token_ids': state.prev_tokens(),
-                'context': context,
-                'cache_mask': state.live_sample_mask
-            }, embed_context=False).squeeze(-2)
+            if initial_embedding is not None:
+                x = initial_embedding
+                initial_embedding = None
+            else:
+                x = self.input_layer(state.prev_tokens())
+
+            # We need to know what dtype to make the key-value caches, and it has to be the same dtype as
+            # whatever the embedding layer outputs. We might be in a torch.cuda.amp.autocast() context, so
+            # can't hard-code this. This is why we lazily create the caches after the first token gets embedded
+            if not has_created_cache:
+                has_created_cache = True
+                dtype = x.dtype
+
+                for layer in self.decoder_layers:
+                    layer.attention.prepare_kv_cache(batch_size=num_samples, max_length=max_length, dtype=dtype)
+                    if layer.cross_attention is not None:
+                        layer.cross_attention.prepare_kv_cache(batch_size=num_samples, max_length=context.shape[-2],
+                                                               dtype=dtype)
+
+            for layer in self.decoder_layers:
+                x = layer(x, context=context, cache_mask=state.live_sample_mask)
+
+            next_logits = self.output_layer(x).squeeze(-2)
             state.process_logits(next_logits)
 
-        for layer in self.transformer_layers:
+        for layer in self.decoder_layers:
             layer.attention.reset_kv_cache()
             if layer.cross_attention is not None:
                 layer.cross_attention.reset_kv_cache()

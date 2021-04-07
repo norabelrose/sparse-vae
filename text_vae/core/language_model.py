@@ -17,9 +17,9 @@ from ..train_callbacks import UnconditionalSampler
 @dataclass
 class LanguageModelHparams(ABC):
     batch_size: int = 0                 # Just for compatibility with pl.Trainer's auto_scale_batch_size feature
-    grad_clip_threshold: float = 5.0
-    init_scale: float = 0.02            # Std. deviation of Gaussian used to initialize the weights
-    lr: float = 2.5e-4
+    grad_clip_threshold: float = 50.0
+    init_scale: Optional[float] = 0.02  # Stddev of Gaussian weight initialization. If None, default PyTorch init. is used
+    lr: float = 3e-4
     lr_decay_steps: Optional[int] = 150_000
     lr_plateau_patience: Optional[int] = None  # If non-None, ReduceLROnPlateau scheduler is used w/ specified patience
     warmup_steps: int = 1000
@@ -114,13 +114,17 @@ class LanguageModel(pl.LightningModule, ABC):
         return [opt], [lr_dict]
 
     def initialize_weights(self):
+        scale = self.hparams.init_scale
+        if scale is None:   # Use default PyTorch initialization
+            return
+
         # Default BERT weight initialization
         for module in self.modules():
             if isinstance(module, nn.LayerNorm):
                 continue
 
             if hasattr(module, 'weight'):
-                module.weight.data.normal_(0.0, self.hparams.init_scale)
+                module.weight.data.normal_(0.0, scale)
 
             bias = getattr(module, 'bias', None)
             bias = getattr(bias, 'data', None)
@@ -128,32 +132,36 @@ class LanguageModel(pl.LightningModule, ABC):
                 bias.zero_()
 
     # If reduce_batch == False, then this method will not reduce across any dimensions other than sequence length
-    def stats_from_logits(self, logits: Tensor, labels: Tensor, word_counts: Tensor = None, reduce_batch: bool = True):
+    def get_nll(self, logits: Tensor, labels: Tensor, token_counts: Tensor = None, word_counts: Tensor = None,
+                reduce_batch: bool = True, stage: str = 'train'):
         nll = F.cross_entropy(input=logits.flatten(end_dim=-2), target=labels.flatten(), ignore_index=0, reduction='none')
         nll_sum = nll.view(*logits.shape[:-1]).sum(dim=-1)  # Add batch dim(s) back; sum across sequence length
 
         # Divide by the number of non-padding tokens
-        nll = nll_sum / labels.ne(0).sum(dim=-1) if self.hparams.divide_loss_by_length else nll_sum
+        if self.hparams.divide_loss_by_length:
+            token_counts = labels.ne(0).sum(dim=-1) if token_counts is None else token_counts
+            nll = nll_sum / token_counts
+        else:
+            nll = nll_sum
 
         if reduce_batch:
             # Perplexity is normalized using the number of words, not the number of tokens, so that it's comparable
             # across different subword vocabularies
+            log_prefix = stage + '_'
             if word_counts is not None:
                 per_word_nll = (nll_sum / word_counts).mean()
                 ppl = 2 ** (per_word_nll / math.log(2))
-                return nll.mean(), ppl.mean()
-            else:
-                return nll.mean()
-        else:
-            return nll
+                self.log(log_prefix + 'ppl', ppl)
+
+            nll = nll.mean()
+            self.log(log_prefix + 'nll', nll)
+
+        return nll
 
     # These implementations are used by LSTMLanguageModel and TransformerLanguageModel, but are overriden by others
-    def training_step(self, batch: Dict[str, Tensor], batch_index: int, val: bool = False) -> Tensor:
+    def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         logits = self.forward(batch)  # Remove initial [CLS] token from the labels; autoregressive by default
-        loss, ppl = self.stats_from_logits(logits, batch['token_ids'][..., 1:], word_counts = batch['num_words'])
-
-        self.log('train_nll' if not val else 'val_nll', loss, on_step=not val, on_epoch=val)
-        self.log('train_ppl' if not val else 'val_ppl', ppl, on_step=not val, on_epoch=val)
+        loss = self.get_nll(logits, batch['token_ids'][..., 1:], word_counts=batch['num_words'])
         return loss
 
     def on_after_backward(self):
@@ -161,7 +169,7 @@ class LanguageModel(pl.LightningModule, ABC):
         self.log('grad_norm', grad_norm, on_step=True)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
-        return self.training_step(batch, batch_index, val=True)
+        return self.training_step(batch, batch_index)
 
     # Called by UnconditionalSampler callback
     def sample(self, max_length: int, batch_size: int = 1, **kwargs):

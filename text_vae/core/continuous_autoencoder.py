@@ -1,15 +1,21 @@
+from abc import abstractmethod
 from contextlib import contextmanager
 from torch.distributions import Normal
 from .language_model import *
-from ..train_callbacks import ReconstructionSampler
+import math
 
 
 # Abstract base classes for autoencoders with continuous latent spaces
 @dataclass
 class ContinuousVAEHparams(LanguageModelHparams, ABC):
-    latent_depth: int = 32  # Dimensionality of the latent variable vector(s)
-    kl_weight: float = 1.0  # Ignored when using multi-sample Monte Carlo objectives
+    latent_depth: int = 32     # Dimensionality of the latent variable vector(s)
     train_mc_samples: int = 0  # Number of Monte Carlo samples used when training. If 0, use single-sample VAE estimator
+
+    # Ignored when using multi-sample Monte Carlo objectives
+    kl_annealing_steps: int = 10_000
+    kl_weight_start: float = 0.3
+    kl_weight_end: float = 1.0
+    kl_weight: float = 1.0
 
     # Weight placed placed on the mutual information term in the augmented maximum likelihood objective from the
     # "Mutual Information Constraints for Monte-Carlo Objectives" DeepMind paper (Melis et al. 2020). Note that
@@ -20,13 +26,45 @@ class ContinuousVAEHparams(LanguageModelHparams, ABC):
     early_stopping_metric: str = 'val_loss'  # For continuous VAEs we should monitor the whole loss, not just the NLL
 
 class ContinuousVAE(LanguageModel, ABC):
-    def configure_callbacks(self):
-        callbacks = super().configure_callbacks()
-        return callbacks + [ReconstructionSampler()]
-
     def setup(self, stage: str):
         super().setup(stage)
         self.decoder_frozen = False
+
+    def on_train_start(self):
+        self.hparams.kl_weight = self.hparams.kl_weight_start
+
+    def on_after_backward(self):
+        super().on_after_backward()
+
+        cur_step = self.global_step
+        max_steps = self.hparams.kl_annealing_steps
+        kl_end = self.hparams.kl_weight_end
+        if not max_steps or self.hparams.kl_weight >= kl_end:
+            return
+
+        # progress = 1.0 / (1.0 + math.exp(-10.0 * (cur_step / max_steps - 0.5)))
+        # if 1.0 - progress < 1e-3:   # Snap to the full 1.0 weight if we're within 0.1% of it
+        #     progress = 1.0
+
+        progress = cur_step / max_steps
+        total_distance = kl_end - self.hparams.kl_weight_start
+        self.hparams.kl_weight = self.hparams.kl_weight_start + total_distance * progress
+
+    # Returns the latent tensor and the KL
+    def sample_z(self, encoder_out: Tensor, token_counts: Tensor, stage: str = 'train') -> Tuple[Tensor, Tensor]:
+        q_of_z, kl = self.q_of_z_given_x(encoder_out, get_kl=True)
+        z = q_of_z.rsample()
+
+        raw_kl = kl.flatten(1).sum(dim=-1)  # Sum across everything but the batch dimension
+        kl = raw_kl / token_counts if self.hparams.divide_loss_by_length else raw_kl
+        kl = kl.mean()
+
+        log_prefix = stage + '_'
+        self.log_dict({
+            log_prefix + 'kl': raw_kl.mean(),
+            log_prefix + 'mutual_info': self.estimate_mutual_info(q_of_z, z)
+        })
+        return z, kl
 
     # Performs a backward pass for both the encoder and decoder networks, using the DReG gradient estimator for the
     # encoder parameters. Returns the IWAE importance-weighted estimate of log p(x).
@@ -113,7 +151,7 @@ class ContinuousVAE(LanguageModel, ABC):
         return -conditional_q.entropy().sum(dim=-1).mean() - marginal_q.mean()
 
     # Should return p(x|z)
-    # @abstractmethod
+    @abstractmethod
     def p_of_x_given_z(self, x, z, labels) -> Tensor:
         raise NotImplementedError
 
@@ -123,7 +161,7 @@ class ContinuousVAE(LanguageModel, ABC):
         for param in self.decoder_params():
             param.requires_grad = requires_grad
 
-    # @abstractmethod
+    @abstractmethod
     def decoder_params(self) -> Iterable[nn.Parameter]:
         raise NotImplementedError
 

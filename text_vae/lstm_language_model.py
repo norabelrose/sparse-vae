@@ -12,6 +12,7 @@ class LSTMLanguageModelHparams(LanguageModelHparams):
     d_model: int = 1024     # Dimensionality of the LSTM hidden state
     num_layers: int = 1
 
+    rnn_type: str = 'LSTM'
     tie_logit_weights: bool = False     # Tie the logit layer weights to the embedding weights
 
 
@@ -19,17 +20,15 @@ class LSTMLanguageModel(LanguageModel):
     def __init__(self, hparams: DictConfig):
         super().__init__(hparams)
 
+        rnn_class = getattr(nn, hparams.rnn_type)
         self.decoder_embedding = nn.Embedding(hparams.vocab_size, hparams.d_embedding)
-        self.decoder = nn.LSTM(
+        self.decoder = rnn_class(
             input_size=hparams.d_embedding + self.context_depth(),
             hidden_size=hparams.d_model,
             batch_first=True,
             num_layers=hparams.num_layers
         )
-        if self.learned_initial_state:
-            self.initial_state = nn.Parameter(torch.randn(hparams.num_layers, 1, hparams.d_model))
-        else:
-            self.initial_state = None
+        self.c0 = nn.Parameter(torch.randn(hparams.num_layers, 1, hparams.d_model))
 
         if hparams.tie_logit_weights:
             output_embedding = nn.Linear(hparams.d_embedding, hparams.vocab_size)
@@ -43,7 +42,7 @@ class LSTMLanguageModel(LanguageModel):
         else:
             self.output_layer = nn.Linear(hparams.d_model, hparams.vocab_size)
 
-    # Just here as a subclass hook for LSTMAutoencoder, which will make this d_embedding + latent_depth
+    # Just here as a subclass hook for LSTMVAE, which will make this d_embedding + latent_depth
     def decoder_input_size(self) -> int:
         return self.hparams.d_embedding
 
@@ -51,7 +50,7 @@ class LSTMLanguageModel(LanguageModel):
     def forward(self, batch: Dict[str, Tensor]) -> Tensor:
         x = batch['token_ids']
         batch_size = x.shape[0]
-        c0 = self.initial_state.repeat(1, batch_size, 1)
+        c0 = self.c0.repeat(1, batch_size, 1)
         h0 = c0.tanh()
 
         x = self.decoder_embedding(x)
@@ -59,7 +58,7 @@ class LSTMLanguageModel(LanguageModel):
         return self.output_layer(x)
 
     def sample(self, max_length: int, batch_size: int = 1, initial_state: Tensor = None, context = None, **kwargs):
-        initial_state = initial_state if initial_state is not None else self.initial_state.repeat(1, batch_size, 1)
+        initial_state = initial_state if initial_state is not None else self.c0.repeat(1, batch_size, 1)
 
         state = GenerationState(
             max_length=max_length,
@@ -68,6 +67,7 @@ class LSTMLanguageModel(LanguageModel):
             device=self.device,
             dtype=torch.long,
             end_token=self.end_token,
+            top_k=0,
             top_p=0.92  # Nucleus sampling
         )
         state.output_ids[:, 0] = self.start_token  # Every sample starts with [CLS]
@@ -92,7 +92,3 @@ class LSTMLanguageModel(LanguageModel):
     # Size of the context vectors optionally concatenated to the input of the LSTM at each time step
     def context_depth(self) -> int:
         return 0
-
-    @classmethod
-    def learned_initial_state(cls) -> bool:
-        return True

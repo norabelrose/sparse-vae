@@ -203,12 +203,18 @@ class TextDataModule(pl.LightningDataModule):
     def collate(self, inputs: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
         if self.hparams.batching_strategy == 'uniform_size_prebatched':
             text = inputs[0]['text']
+            token_counts = inputs[0]['num_tokens']
             word_counts = inputs[0]['num_words']
         else:
             text = [x['text'] for x in inputs]
+            token_counts = [x['num_tokens'] for x in inputs]
             word_counts = [x['num_words'] for x in inputs]
 
-        return {'token_ids': PaddedTensor.from_raw(self.pad_pack(text)), 'word_count': torch.stack(word_counts)}
+        return {
+            'token_ids': PaddedTensor.from_raw(self.pad_pack(text)),
+            'token_count': torch.stack(token_counts),
+            'word_count': torch.stack(word_counts)
+        }
 
     def pad_pack(self, batch: List[Tensor], pad_value: int = 0) -> Tensor:
         buffer_len = max(len(x) for x in batch)
