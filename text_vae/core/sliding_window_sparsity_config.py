@@ -7,8 +7,10 @@ import torch
 # *block* sparse matrices, you still need to apply a causal attention mask in order to
 # make sure all the right-context is hidden.
 class SlidingWindowSparsityConfig(SparsityConfig):
-    def __init__(self, num_heads: int, block: int = 16, window_size: int = 1, include_cls: bool = True):
+    def __init__(self, num_heads: int, block: int = 16, window_size: int = 4, causal: bool = True,
+                 include_cls: bool = True):
         super().__init__(num_heads, block, different_layout_per_head=False)
+        self.causal = causal
         self.include_cls = include_cls
         self.window_size = window_size
 
@@ -18,9 +20,17 @@ class SlidingWindowSparsityConfig(SparsityConfig):
 
         layout = torch.zeros(num_blocks, num_blocks, dtype=torch.int64)
 
-        for offset in range(self.window_size):
-            shifted = layout[offset:]   # Remove top N rows
-            shifted.fill_diagonal_(1)   # ...and fill the diagonal of this submatrix
+        num_sides = 1 if self.causal else 2
+        left_context = sum(divmod(self.window_size, num_sides))  # Round up
+        right_context = self.window_size - left_context
+
+        for offset in range(left_context):
+            shifted = layout[offset:]       # Remove top N rows
+            shifted.fill_diagonal_(1)       # ...and fill the diagonal of this submatrix
+
+        for offset in range(1, right_context):
+            shifted = layout[:, offset:]    # Remove left N columns
+            shifted.fill_diagonal_(1)       # ...and fill the diagonal of this submatrix
 
         # Always attend to the blocks containing the [CLS] token (the first block in the sequence)
         if self.include_cls:

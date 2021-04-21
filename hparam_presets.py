@@ -3,7 +3,6 @@ hparam_presets = {
     'he2019': {
         'data': dict(
             batch_size=32,
-            batching_strategy='uniform_length',
             chunking_strategy='sentence',
         ),
         'model': dict(
@@ -28,7 +27,6 @@ hparam_presets = {
     'sentence-vae': {
         'data': dict(
             batch_size=32,
-            batching_strategy='uniform_length',
             chunking_strategy='sentence',
         ),
         'model': dict(
@@ -47,11 +45,35 @@ hparam_presets = {
             precision=32
         )
     },
-    'belrose-lstm': {
+    'lstm-benchmark': {
+        'model': dict(
+            bidirectional_encoder=True,
+            divide_loss_by_length=True,
+            d_model=1024,
+            d_embedding=512,
+            grad_clip_threshold=5.0,
+            init_scale=None,
+            kl_weight_start=0.2,
+            kl_annealing_steps=8000,
+            latent_depth=64,
+            lr=3e-4,
+            num_latent_vectors=1,
+            tie_embedding_weights=True,
+            tie_logit_weights=True,
+            transformer_encoder=False,
+            warmup_steps=500
+        ),
+        'trainer': dict(
+            accumulate_grad_batches=2
+        )
+    },
+    'lstm-wikipedia': {
         'data': dict(
-            batch_size=64,
-            batching_strategy='uniform_length',
             chunking_strategy='none',
+            dataset_name='wikipedia',
+            dataset_config='20200501.en',
+            tokens_per_batch=50_000,
+            max_tokens_per_sample=12_500
         ),
         'model': dict(
             bidirectional_encoder=True,
@@ -59,43 +81,94 @@ hparam_presets = {
             d_model=1024,
             d_embedding=512,
             grad_clip_threshold=5.0,
-            init_scale=0.02,
-            kl_weight_start=0.3,
-            kl_annealing_steps=8_000,
-            latent_depth=512,
-            lr=5e-4,
+            init_scale=None,
+            kl_weight_start=0.2,
+            kl_annealing_steps=8000,
+            latent_depth=64,
+            lr=3e-4,
             num_latent_vectors=1,
             tie_embedding_weights=True,
             tie_logit_weights=True,
-            transformer_encoder=True,
+            transformer_encoder=False,
             warmup_steps=500
         ),
         'trainer': dict(
-            accumulate_grad_batches=1
+            accumulate_grad_batches=2,
+            val_check_interval=0.25
         )
     },
-    'belrose-transformer': {
-        'data': dict(
-            batch_size=64,
-            batching_strategy='uniform_length',
-            chunking_strategy='none',
-        ),
+    'dense-benchmark': {
         'model': dict(
             divide_loss_by_length=True,
             d_model=512,
             grad_clip_threshold=5.0,
             init_scale=0.02,
-            kl_weight_start=0.0,
-            kl_annealing_steps=50_000,
+            kl_weight_start=0.2,
+            kl_annealing_steps=8000,
             latent_depth=64,
-            lr=1e-4,
+            lr=3e-4,
             num_latent_vectors=1,
             num_layers=3,
+            sparse_self_attention=False,
             tie_embedding_weights=True,
             warmup_steps=500
         ),
         'trainer': dict(
-            accumulate_grad_batches=1
+            accumulate_grad_batches=2
+        )
+    },
+    'sparse-benchmark': {
+        'model': dict(
+            divide_loss_by_length=True,
+            d_model=512,
+            grad_clip_threshold=5.0,
+            init_scale=0.02,
+            kl_weight_start=0.2,
+            kl_annealing_steps=8000,
+            latent_depth=64,
+            lr=3e-4,
+            num_latent_vectors=1,
+            num_layers=3,
+            sparse_self_attention=True,
+            tie_embedding_weights=True,
+            warmup_steps=500
+        ),
+        'trainer': dict(
+            accumulate_grad_batches=2
+        )
+    },
+    'wikipedia': {
+        'data': dict(
+            chunking_strategy='none',
+            dataset_name='wikipedia',
+            dataset_config='20200501.en',
+            tokens_per_batch=62_500,
+            # Stub articles (< 160 tokens) make up nearly 1/4 of the dataset and don't help
+            # the model learn long range dependencies. This way we force the model to get used
+            # to not having the whole document in its sliding window attention window
+            min_tokens_per_sample=160,
+            max_tokens_per_sample=12_500
+        ),
+        'model': dict(
+            divide_loss_by_length=True,
+            d_model=512,
+            grad_checkpointing=False,
+            grad_clip_threshold=5.0,
+            init_scale=0.02,
+            kl_weight_start=0.2,
+            kl_annealing_steps=8000,
+            latent_depth=128,
+            lr=3e-4,
+            # lr_decay_steps=1_000_000,
+            num_latent_vectors=1,
+            num_layers=6,
+            sparse_self_attention=True,
+            tie_embedding_weights=True,
+            warmup_steps=1000
+        ),
+        'trainer': dict(
+            accumulate_grad_batches=2,
+            val_check_interval=0.1
         )
     },
 }

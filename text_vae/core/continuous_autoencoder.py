@@ -42,10 +42,6 @@ class ContinuousVAE(LanguageModel, ABC):
         if not max_steps or self.hparams.kl_weight >= kl_end:
             return
 
-        # progress = 1.0 / (1.0 + math.exp(-10.0 * (cur_step / max_steps - 0.5)))
-        # if 1.0 - progress < 1e-3:   # Snap to the full 1.0 weight if we're within 0.1% of it
-        #     progress = 1.0
-
         progress = cur_step / max_steps
         total_distance = kl_end - self.hparams.kl_weight_start
         self.hparams.kl_weight = self.hparams.kl_weight_start + total_distance * progress
@@ -64,7 +60,21 @@ class ContinuousVAE(LanguageModel, ABC):
             log_prefix + 'kl': raw_kl.mean(),
             log_prefix + 'mutual_info': self.estimate_mutual_info(q_of_z, z)
         })
+        if stage == 'val':
+            self.log('val_active_units', q_of_z.mean, reduce_fx=self.compute_num_active_units)
+
         return z, kl
+
+    # 'Active' latent dimensions are those whose variance across a batch/epoch exceeds 0.01
+    @staticmethod
+    def compute_num_active_units(z_means: Tensor, threshold = 0.01) -> Tensor:
+        return z_means.flatten(0, -2).var(dim=0).ge(threshold).sum()
+
+    # Analytical formula for the joint log probability density of all z_i under a standard unit variance Gaussian.
+    # This is a highly optimized version; equivalently we could have put the -0.5 and -log(sqrt(2pi)) inside the sum.
+    @staticmethod
+    def prior_log_prob(z: Tensor):
+        return -0.5 * z.pow(2.0).sum(dim=-1) - math.log(math.sqrt(2 * math.pi)) * z.shape[-1]
 
     # Performs a backward pass for both the encoder and decoder networks, using the DReG gradient estimator for the
     # encoder parameters. Returns the IWAE importance-weighted estimate of log p(x).
@@ -84,7 +94,7 @@ class ContinuousVAE(LanguageModel, ABC):
         # weighted sum of the *partial* derivatives of the log w_i's w.r.t. to phi. Here we detach q(z|x) so
         # that autograd doesn't try to double-count the indirect effect of phi on the log w_i's, which we're
         # manually approximating using the weights.
-        detached_q = Normal(loc=proposal_dist.loc.detach(), scale=proposal_dist.scale.detach())
+        detached_q = Normal(loc=proposal_dist.loc.detach(), scale=proposal_dist.scale.detach(), validate_args=False)
         log_q_of_z = detached_q.log_prob(z).sum(dim=-1)  # log q(z_i|x) for each sample z_i; [sample, batch]
 
         # We call this twice w/ the Rényi objective
@@ -127,32 +137,41 @@ class ContinuousVAE(LanguageModel, ABC):
     def estimate_log_prob_iw(self, q_of_z: Normal, x: Tensor, labels: Tensor, num_samples: int, num_iter: int = 1):
         assert num_samples % num_iter == 0
         chunk_size = num_samples // num_iter
-
-        # Sample K latent vectors from the encoder's proposal distribution q(z|x)
-        latents = q_of_z.rsample([num_iter, chunk_size])  # [chunk, sample, batch, latent_depth]
-        log_p_of_z = self.prior_log_prob(latents)         # [chunk, sample, batch], log prob of z_i's under the prior
-        log_q_of_z = q_of_z.log_prob(latents).sum(dim=-1)   # log q(z_i|x) for each sample z_i
+        x = x.unsqueeze(0)
+        x.padding = x._padding.unsqueeze(0)
         log_ws = []
 
-        for z, log_p, log_q in zip(latents, log_p_of_z, log_q_of_z):
-            log_joint = log_p + self.p_of_x_given_z(x, z, labels)
-            log_ws += [log_joint - log_q]
+        # Sample K latent vectors from the encoder's proposal distribution q(z|x)
+        for _ in range(num_iter):
+            z = q_of_z.rsample([chunk_size])  # [sample, batch, latent_depth]
+            log_p_of_z = self.prior_log_prob(z)  # [sample, batch], log prob of z_i's under the prior
+            log_q_of_z = q_of_z.log_prob(z).sum(dim=-1)  # log q(z_i|x) for each sample z_i
+            log_p_of_x_given_z = self.p_of_x_given_z(x, z, labels)
 
-        log_ws = torch.cat(log_ws)  # [chunks * samples, batch]
-        return log_ws.logsumexp(dim=0) - math.log(num_samples)
+            log_ws += [log_p_of_z + log_p_of_x_given_z - log_q_of_z]
+
+        return torch.cat(log_ws).logsumexp(dim=0) - math.log(num_samples)
 
     @staticmethod
     def estimate_mutual_info(conditional_q: Normal, z: Tensor):
-        unsqueezed = Normal(loc=conditional_q.loc[:, None], scale=conditional_q.scale[:, None])
+        unsqueezed = Normal(loc=conditional_q.loc[:, None], scale=conditional_q.scale[:, None], validate_args=False)
         cross_densities = unsqueezed.log_prob(z[None]).sum(dim=-1)     # [batch, batch]
 
         # Approximate q(z) by averaging over the densities assigned to each z by the other q(z|x)s in the minibatch
         marginal_q = cross_densities.logsumexp(dim=0) - math.log(cross_densities.shape[0])
         return -conditional_q.entropy().sum(dim=-1).mean() - marginal_q.mean()
 
-    # Should return p(x|z)
-    @abstractmethod
+    # Returns log p(x|z) summed (not averaged!) over the sequence length, for each element in the batch
     def p_of_x_given_z(self, x, z, labels) -> Tensor:
+        logits = self.reconstruct(x, z)[..., :-1, :]  # Remove [SEP]
+        log_probs = logits.log_softmax(dim=-1)
+        log_probs[..., 0] = 0.0     # Ignore padding tokens in the calculation
+
+        return log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1).sum(dim=-1)
+
+    # Should return logits
+    @abstractmethod
+    def reconstruct(self, x, z) -> Tensor:
         raise NotImplementedError
 
     # Called by AggressiveEncoderTraining callback

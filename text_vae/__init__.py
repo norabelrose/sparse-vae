@@ -1,4 +1,5 @@
 # Sort of in order of how many internal dependencies each file has
+from .batch_generation import *
 from .core import select_best_gpu
 from .core.conditional_gaussian import *
 from .core.utilities import *

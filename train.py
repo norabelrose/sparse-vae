@@ -12,19 +12,16 @@ def main(args):
     config = OmegaConf.create({
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
-            'accumulate_grad_batches': 4,
-            'precision': 16,
-            'num_sanity_val_steps': 2
+            'accumulate_grad_batches': 2,
+            'precision': 16
         }
     })
 
-    data_class = TextDataModule
-    data_hparam_class = TextDataModuleHparams
     hparam_class = None
     model_class = None
     experiment = None
 
-    if model_str == 'lstm':
+    if model_str == 'lstm-vae':
         hparam_class = LSTMVAEHparams
         model_class = LSTMVAE
         experiment = 'lstm-vae'
@@ -52,7 +49,7 @@ def main(args):
         print(f"Unrecognized model type '{model_str}'.")
         exit(1)
 
-    config.data = OmegaConf.structured(data_hparam_class)
+    config.data = OmegaConf.structured(TextDataModuleHparams)
     config.model = OmegaConf.structured(hparam_class)
 
     config.merge_with_dotlist(args[2:])
@@ -72,7 +69,7 @@ def main(args):
         config.trainer.resume_from_checkpoint = str(get_checkpoint_path_for_name(experiment, ckpt_name))
 
     model = model_class(config.model)
-    data = data_class(hparams=config.data)
+    data = TextDataModule(hparams=config.data)
 
     # Find the appropriate batch size for this machine and task
     if config.trainer.auto_scale_batch_size or config.trainer.auto_lr_find:

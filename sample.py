@@ -1,88 +1,29 @@
-import sys
 from text_vae import *
-
-
-def try_type_conversion(value, target_type):
-    try:
-        return target_type(value)
-    except ValueError:
-        print(f"Invalid input- expected value of type {target_type.__name__}.")
-        return None
+import sys
 
 
 def main(args):
-    version_name = args[1]
-    sampler = QuantizedVAESampler.for_vae(version_name)
+    model_type, model_name = args[1:]
+    gpu = select_best_gpu()
 
-    vocab_path = Path.cwd() / 'text-vae-pretrained' / 'tokenizers' / 'yelp_polarity.json'
-    assert vocab_path.exists(), f"Couldn't find pretrained tokenizer for yelp_polarity"
+    path = get_checkpoint_path_for_name(model_type, model_name)
+    model_class = TransformerVAE if model_type == 'transformer-vae' else LSTMVAE
+    model = model_class.load_from_checkpoint(path).to('cuda:' + str(gpu))
+    model.eval()
+    model.start_token = 2
+    model.end_token = 3
 
-    tokenizer = Tokenizer.from_file(str(vocab_path))
-    options = QuantizedVAESamplingOptions()
+    sample_func = partial(model.sample, max_length=512, batch_size=1000)
+    outputs = batch_generate_samples(sample_func, num_samples=700_000, max_length=512, end_token=3)
+    # generator = model.sample_generator(512, 700_000, batch_size=1000)
+    # outputs = batch_generate_samples2(generator, num_samples=700_000, max_length=512, end_token=3)
 
-    print("Type 's' to generate a sample, or 'q' to quit. Type 'help' for a list of other commands.")
-    while True:
-        command = input()
-
-        if command.startswith('set '):
-            rest = command[4:]
-            parts = rest.split('=')
-
-            if len(parts) != 2:
-                print("Expected a command of the form 'set max_length=500'")
-                continue
-
-            parts = [part.strip() for part in parts]
-            key, value = parts
-
-            # For moving the model between devices
-            if key == 'gpu':
-                if value.lower() == 'none':
-                    sampler = sampler.to('cpu')
-                    print("Model moved to the CPU.")
-                else:
-                    idx = try_type_conversion(value, int)
-                    if idx is not None:
-                        print(f"Moving model to GPU {idx}...")
-                        sampler = sampler.to('cuda:' + str(idx))
-                        print("Done.")
-
-            # For loading different VAE versions
-            elif key == 'version':
-                try:
-                    new_sampler = QuantizedVAESampler.for_vae(value)
-                except AssertionError as ex:
-                    print(f"Creating a sampler for VAE '{value}' failed with error: {ex}")
-                else:
-                    sampler = new_sampler
-
-            # For changing the sampling options
-            else:
-                if not hasattr(options, key):
-                    print(f"'{key}' is not a valid configuration option.")
-                    continue
-
-                key_type = type(getattr(options, key))
-                value = try_type_conversion(value, key_type)
-                if value is not None:
-                    setattr(options, key, value)
-
-        elif command == 's':
-            breakpoint()
-            output = sampler.sample(options)
-            samples = tokenizer.decode_batch(output.tolist())
-            for sample in samples:
-                print(sample)
-
-        elif command == 'q':
-            return
-
-        elif command == 'config':
-            print("Current sampling options:")
-            print(asdict(options))
-
-        else:
-            print("Not a recognized command. ")
+    print("Saving to disk...")
+    dataset_path = Path.cwd() / 'text-vae-datasets' / 'samples' / model_name
+    dataset = Dataset.from_dict({'text': outputs})
+    dataset = dataset.train_test_split(test_size=50_000)
+    dataset.save_to_disk(str(dataset_path))
+    print("Done.")
 
 
 if __name__ == "__main__":

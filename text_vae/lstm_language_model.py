@@ -63,14 +63,10 @@ class LSTMLanguageModel(LanguageModel):
         state = GenerationState(
             max_length=max_length,
             batch_size=batch_size,
-            beam_size=1,
             device=self.device,
-            dtype=torch.long,
-            end_token=self.end_token,
-            top_k=0,
-            top_p=0.92  # Nucleus sampling
+            start_token=self.start_token,
+            end_token=self.end_token
         )
-        state.output_ids[:, 0] = self.start_token  # Every sample starts with [CLS]
 
         h_init = initial_state.tanh()
         decoder_hidden = (h_init, initial_state)

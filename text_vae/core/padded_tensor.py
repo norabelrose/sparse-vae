@@ -68,10 +68,14 @@ class PaddedTensor(Tensor):
             return None
 
         pad_shape, data_shape = self._padding.shape, self.shape
-        assert pad_shape[0] == data_shape[0] and self._padding.ndim <= self.ndim,\
-            f"Propagated padding mask of shape {pad_shape} cannot be reconciled with data tensor of shape {data_shape}"
-
         scaled_padding = self._padding
+
+        # Expand across batch dimension
+        if pad_shape[0] != data_shape[0]:
+            assert pad_shape[0] == 1, f"Can't expand padding of shape {pad_shape} to shape {data_shape}"
+            return scaled_padding.expand(data_shape[0], *pad_shape[1:])
+
+        assert self._padding.ndim <= self.ndim
         for dim, (pad_size, data_size) in enumerate(zip(pad_shape, data_shape)):
             if pad_size == data_size:
                 continue

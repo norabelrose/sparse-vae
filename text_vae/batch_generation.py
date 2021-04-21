@@ -1,3 +1,5 @@
+from pathlib import Path
+from tokenizers import Tokenizer
 from tqdm import tqdm
 from typing import *
 import torch
@@ -8,7 +10,9 @@ import torch
 def batch_generate_samples(sample_func: Callable, num_samples: int, max_length: int, end_token: Optional[int]):
     # Allocate a big continuous block of pinned memory in the CPU that we can asynchronously copy GPU results into
     output_buffer = torch.empty(num_samples, max_length, device='cpu', dtype=torch.int16, pin_memory=True)
-    pbar = tqdm(desc='Generating samples', total=num_samples, unit='samples')
+    pbar = tqdm(desc='Generating samples', smoothing=0.1, total=num_samples, unit='samples')
+
+    # tokenizer = Tokenizer.from_file(str(Path.cwd() / 'text-vae-pretrained' / 'tokenizers' / 'yelp_review_full.json'))
 
     cur_idx = 0
     while cur_idx < num_samples:

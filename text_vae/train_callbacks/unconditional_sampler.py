@@ -17,7 +17,9 @@ class UnconditionalSampler(AutoencoderCallback):
         if not logger:
             return
 
+        langmodel.eval()
         samples = langmodel.sample(self.sample_max_len, self.num_samples, temperature=self.sampling_temperature)
+        langmodel.train()
         if samples is None:
             return
 

@@ -1,41 +1,39 @@
-from typing import *
 from dataclasses import dataclass
+from datasets import Dataset, DatasetDict
 from itertools import chain
 from math import ceil
 from tokenizers import Tokenizer
 from torch import Tensor
+from typing import Dict, Iterable, List, Tuple, Union
+import numpy as np
 import random
 import torch
 
 
 # Convert text into WordPiece tokens, while also saving some important stats. This is set up as a freestanding
 # function to avoid an annoying crash that happens when dill, a HuggingFace dependency, tries to pickle the function
-def tokenize(batch: Dict[str, list], tokenizer: Tokenizer, should_chunk: bool, min_tokens: int,
-             max_tokens: int) -> Dict[str, list]:
-    if should_chunk:
-        # Tokenizer has had .enable_truncation(max_tokens) called on it
-        encodings = tokenizer.encode_batch(batch['text'])
-        encodings = [[x] + x.overflowing for x in encodings]
-        for sample in encodings:
-            if len(sample[-1].ids) < min_tokens:  # Only the last sequence might possibly be too short
-                encodings.pop()
+def tokenize(batch, tokenizer: Tokenizer, chunk: bool, min_tokens: int, max_tokens: int) -> Dict[str, list]:
+    raw_encodings = tokenizer.encode_batch(batch['text'])
+    if chunk:
+        raw_encodings = [[x] + x.overflowing for x in raw_encodings]
+        raw_encodings = list(chain.from_iterable(raw_encodings))
 
-        encodings = list(chain.from_iterable(encodings))
-    else:
-        encodings = tokenizer.encode_batch(batch['text'])
-        encodings = [x for x in encodings if min_tokens <= len(x.ids) <= max_tokens]
+    char_counts, token_ids, word_ids = [], [], []
+    for encoding, original in zip(raw_encodings, batch['text']):
+        ids = encoding.ids
+        if min_tokens <= len(ids) <= max_tokens:
+            char_counts.append(len(original))
+            token_ids.append(ids)
 
-    token_batches = [x.ids for x in encodings]
-
-    # The Encoding.word_ids property has a None element for special tokens, but it's easier to work with if we use -1
-    word_batches = [[-1 if w is None else w for w in x.word_ids]
-                    for x in encodings]
+            # The Encoding.word_ids property has a None element for special tokens,
+            # but it's easier to work with if we use -1
+            word_ids.append([-1 if w is None else w for w in encoding.word_ids])
 
     return {
-        'text': token_batches,
-        'word_ids': word_batches,
-        'num_tokens': [len(x) for x in token_batches],
-        'num_words': [max(word_ids) for word_ids in word_batches]
+        'text': token_ids,
+        'num_char': char_counts,
+        'num_tokens': [len(x) for x in token_ids],
+        'num_words': [max(words) for words in word_ids]
     }
 
 
@@ -83,13 +81,12 @@ class ContiguousRandomSampler:
 
         return list(range(start_idx, end))
 
+
 @dataclass
-class UniformSizeRandomSampler:
-    sample_lengths: List[int]
-    max_tokens_per_batch: int
+class PrebatchedRandomSampler:
+    batches: List[Tuple[int, int]]
 
     def __post_init__(self):
-        self.batches = compute_uniform_sized_batches(self.sample_lengths, self.max_tokens_per_batch)
         self.remaining_batches = self.batches.copy()
         random.shuffle(self.remaining_batches)
 
@@ -106,47 +103,47 @@ class UniformSizeRandomSampler:
             raise StopIteration
 
         start, length = self.remaining_batches.pop()
+        while length <= 0:
+            start, length = self.remaining_batches.pop()
+            print(f"Warning: Found zero-length batch w/ start index {start}. Skipping...")
+
         return list(range(start, start + length))
 
 
-def compute_uniform_sized_batches(lengths: List[int], max_size: int) -> List[Tuple[int, int]]:
-    cur_num_tokens = 0  # Running total of the number of tokens in this batch
-    cur_num_samples = 0  # Length in *number of samples*
-    cur_start = 0  # Index of the first *sample* in this batch
-    batches = []  # List of tuples of the form (first sample index, num samples)
+# Get a list of the columns in a Dataset or DatasetDict, asserting that they are the same across splits if the latter
+def get_columns_all_equal(dataset: Union[Dataset, DatasetDict]) -> List[str]:
+    if isinstance(dataset, DatasetDict):
+        cols_by_split = dataset.column_names.values()
+        columns = next(iter(cols_by_split))
 
-    for i, num_tokens in enumerate(lengths):
-        # If adding this sample to the current batch would make it too big, end the current batch
-        # and add the sample to a new batch
-        if cur_num_tokens + num_tokens > max_size:
-            if cur_num_samples > 0:
-                batches.append((cur_start, cur_num_samples))
+        assert all(cols == columns for cols in cols_by_split), "All splits must have the same columns"
+        return columns
 
-            # If this sample is so huge that it exceeds the maximum number of tokens by itself,
-            # then just skip it and see if the next sample is of a more manageable size
-            if num_tokens > max_size:
-                cur_start = i + 1
-                cur_num_samples = 0
-                cur_num_tokens = 0
-            else:
-                cur_start = i
-                cur_num_samples = 1
-                cur_num_tokens = num_tokens
-        else:
-            cur_num_tokens += num_tokens
-            cur_num_samples += 1
+    return dataset.column_names
 
-    # Take care of whatever is left over when we're done iterating over all the samples
-    if cur_num_samples > 0:
-        batches.append((cur_start, cur_num_samples))
 
-    return batches
+# Get a list of the features in a Dataset or DatasetDict, asserting that they are the same across splits if the latter
+def get_features_all_equal(dataset: Union[Dataset, DatasetDict]) -> dict:
+    if isinstance(dataset, DatasetDict):
+        features_list = [split.features for split in dataset.values()]
+        first_features = features_list[0]
 
-# Actually chunk large batches of samples from a HuggingFace dataset into uniformly sized minibatches.
-# Designed to be used with the dataset.map() method.
-def perform_uniform_size_batching(batch: Dict[str, list], max_size: int, length_key: str) -> Dict[str, list]:
-    batch_tuples = compute_uniform_sized_batches(batch[length_key], max_size)
-    return {
-        key: [value[start:start + length] for start, length in batch_tuples]
-        for key, value in batch.items()
-    }
+        assert all(features == first_features for features in features_list), "All splits must have the same features"
+        return first_features
+
+    return dataset.features
+
+def total_dataset_len(dataset: Union[Dataset, DatasetDict]) -> int:
+    return sum(len(split) for split in dataset.values()) if isinstance(dataset, DatasetDict) else len(dataset)
+
+def compute_uniform_sized_batches(lengths: Iterable[int], indices: List[int], max_size: int) -> Dict[str, list]:
+    # We're assuming the lengths are already sorted
+    token_cumcounts = np.cumsum(lengths)
+    starts, batch_sizes = [indices[0]], []
+
+    while len(token_cumcounts) > 0:
+        batch_size = np.searchsorted(token_cumcounts, token_cumcounts[0] + max_size) - 1
+        token_cumcounts = token_cumcounts[batch_size + 1:]
+        batch_sizes.append(batch_size); starts.append(starts[-1] + batch_size)
+
+    return {'start': starts[:-1], 'length': batch_sizes}
