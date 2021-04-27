@@ -12,7 +12,7 @@ def batch_generate_samples(sample_func: Callable, num_samples: int, max_length: 
     output_buffer = torch.empty(num_samples, max_length, device='cpu', dtype=torch.int16, pin_memory=True)
     pbar = tqdm(desc='Generating samples', smoothing=0.1, total=num_samples, unit='samples')
 
-    # tokenizer = Tokenizer.from_file(str(Path.cwd() / 'text-vae-pretrained' / 'tokenizers' / 'yelp_review_full.json'))
+    # tokenizer = Tokenizer.from_file(str(Path.cwd() / 'sparse-vae-pretrained' / 'tokenizers' / 'yelp_review_full.json'))
 
     cur_idx = 0
     while cur_idx < num_samples:

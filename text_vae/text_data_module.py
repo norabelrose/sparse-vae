@@ -30,7 +30,7 @@ class TextDataModuleHparams:
     max_tokens_per_sample: int = 512
     split: Optional[str] = None                 # Any string of the format supported by the HuggingFace datasets library
     vocab_size: int = 2 ** 15
-    dataset_save_dir: str = os.path.join(os.getcwd(), 'text-vae-datasets')
+    dataset_save_dir: str = os.path.join(os.getcwd(), 'sparse-vae-datasets')
 
 
 # Base class for Text VAE data modules- takes care of boilerplate
@@ -125,7 +125,7 @@ class TextDataModule(pl.LightningDataModule):
             if chunk_strategy == 'sentence':
                 # The NLTK Punkt tokenizer is actually a fancy learned model that needs to be downloaded
                 import nltk.data
-                nltk_dir = os.path.join(os.getcwd(), 'text-vae-pretrained/nltk/')
+                nltk_dir = os.path.join(os.getcwd(), 'sparse-vae-pretrained/nltk/')
                 punkt_dir = os.path.join(nltk_dir, 'tokenizers/punkt/english.pickle')
                 os.makedirs(nltk_dir, exist_ok=True)
 
@@ -246,7 +246,7 @@ class TextDataModule(pl.LightningDataModule):
 
     # Called from prepare_data, as well as from setup when we load from a checkpoint
     def setup_tokenizer(self):
-        tokenizers_dir = Path.cwd() / 'text-vae-pretrained' / 'tokenizers'
+        tokenizers_dir = Path.cwd() / 'sparse-vae-pretrained' / 'tokenizers'
         tokenizers_dir.mkdir(parents=True, exist_ok=True)
         vocab_path = tokenizers_dir / (self.hparams.dataset_name + '.json')
 

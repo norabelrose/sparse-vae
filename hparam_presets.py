@@ -142,7 +142,7 @@ hparam_presets = {
             chunking_strategy='none',
             dataset_name='wikipedia',
             dataset_config='20200501.en',
-            tokens_per_batch=62_500,
+            tokens_per_batch=31_250,
             # Stub articles (< 160 tokens) make up nearly 1/4 of the dataset and don't help
             # the model learn long range dependencies. This way we force the model to get used
             # to not having the whole document in its sliding window attention window
@@ -152,7 +152,7 @@ hparam_presets = {
         'model': dict(
             divide_loss_by_length=True,
             d_model=512,
-            grad_checkpointing=False,
+            grad_checkpointing=True,
             grad_clip_threshold=5.0,
             init_scale=0.02,
             kl_weight_start=0.2,

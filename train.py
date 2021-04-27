@@ -1,4 +1,5 @@
 from pytorch_lightning import seed_everything
+from pytorch_lightning.profiler import PyTorchProfiler
 from text_vae import *
 from hparam_presets import hparam_presets
 import sys
@@ -79,16 +80,25 @@ def main(args):
     warnings.filterwarnings('ignore', module='pytorch_lightning')
     warnings.filterwarnings('ignore', module='torch')  # Bug in PL
 
+    if config.get('fp16_weights'):
+        torch.set_default_dtype(torch.float16)
+
     if config.get('no_log'):
         logger = False
     else:
         logger = TensorBoardLogger(
-            save_dir='text-vae-logs',
+            save_dir='sparse-vae-logs',
             name=experiment,
             version=config.get('name')
         )
 
-    trainer = Trainer(**config.trainer, logger=logger)
+    profiler = PyTorchProfiler(
+        profile_memory=True,
+        sort_by_key='cuda_memory_usage',
+        use_cuda=True
+    ) if config.get('profile') else None
+
+    trainer = Trainer(**config.trainer, logger=logger, profiler=profiler)
     trainer.fit(model, datamodule=data)
 
 

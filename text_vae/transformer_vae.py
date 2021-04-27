@@ -82,11 +82,12 @@ class TransformerVAE(Transformer, ContinuousVAE):
         if z.shape[0] > x.shape[0]:
             x = x.expand(z.shape[0], *x.shape[1:])
 
+        should_checkpoint = self.hparams.grad_checkpointing
         for layer in self.decoder_layers:
             x = torch.cat([x[..., 0, None, :] + z_hidden, x[..., 1:, :]], dim=-2)
-            x = layer(x) if not self.hparams.grad_checkpointing else checkpoint(layer, x)
+            x = layer(x) if not should_checkpoint else checkpoint(layer, x)
 
-        return self.output_layer(x)
+        return self.output_layer(x) if not should_checkpoint else checkpoint(self.output_layer, x)
 
     @torch.cuda.amp.autocast()
     def sample(self, max_length: int, batch_size: int = 1, **kwargs):

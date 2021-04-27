@@ -14,7 +14,7 @@ def main(args):
     version_name = args[1]
     sampler = QuantizedVAESampler.for_vae(version_name)
 
-    vocab_path = Path.cwd() / 'text-vae-pretrained' / 'tokenizers' / 'yelp_polarity.json'
+    vocab_path = Path.cwd() / 'sparse-vae-pretrained' / 'tokenizers' / 'yelp_polarity.json'
     assert vocab_path.exists(), f"Couldn't find pretrained tokenizer for yelp_polarity"
 
     tokenizer = Tokenizer.from_file(str(vocab_path))

@@ -30,7 +30,7 @@ class QuantizedVAESampler:
 
     @staticmethod
     def for_vae(name: str):
-        sampler_path = Path.cwd() / 'text-vae-samplers' / name
+        sampler_path = Path.cwd() / 'sparse-vae-samplers' / name
         ckpt_path, hparams_path = sampler_path / 'vae.ckpt', sampler_path / 'hparams.yaml'
 
         # We haven't trained prior models for this VAE yet- prepare to train some
@@ -39,7 +39,7 @@ class QuantizedVAESampler:
             old_ckpt_path = get_checkpoint_path_for_name('vq-vae', name)
             old_hparams_path = old_ckpt_path.parent.parent / 'hparams.yaml'
 
-            # Create hard link to the checkpoint and hparams in the text-vae-samplers folder
+            # Create hard link to the checkpoint and hparams in the sparse-vae-samplers folder
             os.makedirs(sampler_path, exist_ok=True)
             if not ckpt_exists:
                 old_ckpt_path.link_to(ckpt_path)
@@ -75,7 +75,7 @@ class QuantizedVAESampler:
         if datamodule.dataset:
             return
 
-        latent_dir = os.path.join(os.getcwd(), 'text-vae-datasets', 'latents', dataset_name, self.vae_name)
+        latent_dir = os.path.join(os.getcwd(), 'sparse-vae-datasets', 'latents', dataset_name, self.vae_name)
         try:
             datamodule.dataset = load_from_disk(latent_dir)
         except:
@@ -156,7 +156,7 @@ class QuantizedVAESampler:
             hparams.trainer.gpus = [select_best_gpu()]
 
         trainer = Trainer(**hparams.trainer, logger=TensorBoardLogger(
-            save_dir='text-vae-logs',
+            save_dir='sparse-vae-logs',
             name='vq-vae-prior'
         ))
 
@@ -169,7 +169,7 @@ class QuantizedVAESampler:
             print("Training seems to have failed.")
             return
 
-        dest_path = os.path.join(os.getcwd(), 'text-vae-samplers', self.vae_name, f'prior_{level}.ckpt')
+        dest_path = os.path.join(os.getcwd(), 'sparse-vae-samplers', self.vae_name, f'prior_{level}.ckpt')
         print(f"Fitted {prior_name} prior with val loss {ckpt_monitor.best_model_score}. "
               f"Creating hard link to checkpoint at {dest_path}.")
 
@@ -202,7 +202,7 @@ class QuantizedVAESampler:
                 torch.profiler.ProfilerActivity.CUDA
             ],
             with_stack=True, record_shapes=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(os.getcwd(), 'text-vae-profiling'))
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(os.getcwd(), 'sparse-vae-profiling'))
         ) if options.profile else nullcontext()
 
         with profiler:
@@ -221,7 +221,7 @@ class QuantizedVAESampler:
         if datamodule.dataset:
             return
 
-        sample_dir = os.path.join(os.getcwd(), 'text-vae-datasets', 'samples', dataset_name, self.vae_name)
+        sample_dir = os.path.join(os.getcwd(), 'sparse-vae-datasets', 'samples', dataset_name, self.vae_name)
         try:
             datamodule.dataset = load_from_disk(sample_dir)
         except:
@@ -231,7 +231,7 @@ class QuantizedVAESampler:
 
         os.makedirs(sample_dir, exist_ok=True)
 
-        original_dataset = load_dataset(dataset_name, cache_dir='text-vae-datasets')
+        original_dataset = load_dataset(dataset_name, cache_dir='sparse-vae-datasets')
         if not isinstance(original_dataset, DatasetDict):
             num_samples = len(original_dataset)
         else:

@@ -19,7 +19,7 @@ def main(args):
     # outputs = batch_generate_samples2(generator, num_samples=700_000, max_length=512, end_token=3)
 
     print("Saving to disk...")
-    dataset_path = Path.cwd() / 'text-vae-datasets' / 'samples' / model_name
+    dataset_path = Path.cwd() / 'sparse-vae-datasets' / 'samples' / model_name
     dataset = Dataset.from_dict({'text': outputs})
     dataset = dataset.train_test_split(test_size=50_000)
     dataset.save_to_disk(str(dataset_path))

@@ -13,7 +13,7 @@ class LambdaLayer(nn.Module):
 
 
 def get_checkpoint_path_for_name(experiment: str, ckpt_name: str) -> Path:
-    ckpt_path = Path.cwd() / 'text-vae-logs' / experiment / ckpt_name / "checkpoints"
+    ckpt_path = Path.cwd() / 'sparse-vae-logs' / experiment / ckpt_name / "checkpoints"
     try:
         # Open the most recent checkpoint
         ckpt = max(ckpt_path.glob('*.ckpt'), key=lambda file: file.lstat().st_mtime)
