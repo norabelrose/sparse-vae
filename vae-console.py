@@ -1,5 +1,5 @@
 import sys
-from text_vae import *
+from sparse_vae import *
 
 
 user_env = {}

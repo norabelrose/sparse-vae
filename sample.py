@@ -1,4 +1,4 @@
-from text_vae import *
+from sparse_vae import *
 import sys
 
 

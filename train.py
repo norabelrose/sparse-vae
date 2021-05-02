@@ -1,7 +1,9 @@
-from pytorch_lightning import seed_everything
+from pytorch_lightning import seed_everything, Trainer
+from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.profiler import PyTorchProfiler
-from text_vae import *
+from sparse_vae import *
 from hparam_presets import hparam_presets
+from omegaconf import OmegaConf
 import sys
 import torch
 
@@ -42,10 +44,6 @@ def main(args):
         model_class = TransformerVAE
         experiment = 'transformer-vae'
 
-    elif model_str == 'vq-vae':
-        hparam_class = QuantizedVAEHparams
-        model_class = QuantizedVAE
-        experiment = 'vq-vae'
     else:
         print(f"Unrecognized model type '{model_str}'.")
         exit(1)
@@ -77,8 +75,8 @@ def main(args):
         trainer = Trainer(**config.trainer)
         trainer.tune(model, datamodule=data)
 
-    warnings.filterwarnings('ignore', module='pytorch_lightning')
-    warnings.filterwarnings('ignore', module='torch')  # Bug in PL
+    # warnings.filterwarnings('ignore', module='pytorch_lightning')
+    # warnings.filterwarnings('ignore', module='torch')  # Bug in PL
 
     if config.get('fp16_weights'):
         torch.set_default_dtype(torch.float16)

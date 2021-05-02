@@ -129,7 +129,7 @@ class LSTMVAE(ContinuousVAE):
                 x = self.decoder_embedding(original)
 
             logits = self.reconstruct(self.dropout_in(x), z)[..., :-1, :]  # Remove [SEP]
-            nll = self.get_nll(logits, batch['token_ids'][..., 1:], word_counts=batch['num_words'])
+            nll = self.get_nll(logits, batch['token_ids'][..., 1:])
 
             loss = (nll + self.hparams.kl_weight * kl)
             if stage == 'train':

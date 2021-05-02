@@ -5,6 +5,7 @@ from pathlib import Path
 from tokenizers.implementations import ByteLevelBPETokenizer
 from tokenizers.processors import RobertaProcessing
 from torch.utils.data import DataLoader  # noqa
+from torch import Tensor
 from typing import Optional
 from .core import PaddedTensor
 from .data_utils import *
@@ -12,7 +13,6 @@ import os
 import numpy as np
 import pytorch_lightning as pl
 import torch
-import warnings
 
 
 @dataclass
@@ -22,13 +22,13 @@ class TextDataModuleHparams:
     tokens_per_batch: Optional[int] = 12_500
     uniform_length_batches: bool = True
 
-    chunking_strategy: str = 'none'             # 'sentence', 'token', or 'none'
+    chunk_documents: bool = False
     dataset_name: str = 'yelp_review_full'
     dataset_config: Optional[str] = None
     dataset_path: Optional[str] = None
     min_tokens_per_sample: int = 16
     max_tokens_per_sample: int = 512
-    split: Optional[str] = None                 # Any string of the format supported by the HuggingFace datasets library
+    split: Optional[str] = None         # Any string of the format supported by the HuggingFace datasets library
     vocab_size: int = 2 ** 15
     dataset_save_dir: str = os.path.join(os.getcwd(), 'sparse-vae-datasets')
 
@@ -39,15 +39,8 @@ class TextDataModule(pl.LightningDataModule):
     def __init__(self, hparams: DictConfig):
         super(TextDataModule, self).__init__()
 
-        # These warnings are spurious and seem to pop up due to a bug in PyTorch which was fixed in PR #47160
-        warnings.filterwarnings('ignore', message='The given NumPy array is not writeable')
-        warnings.filterwarnings('ignore', message='Loading cached dataset')
-
-        # We should make sure that we filter out any samples that are larger than the max number of tokens
-        # we can fit in an entire batch- this could happen with some Wikipedia articles or books
-        max_per_batch, max_per_sample = hparams.tokens_per_batch, hparams.max_tokens_per_sample
-        if max_per_batch and (not max_per_sample or max_per_sample > max_per_batch):
-            hparams.max_tokens_per_sample = max_per_batch
+        # Avoid running out of shared memory for IPC between dataloader workers and the main process
+        torch.multiprocessing.set_sharing_strategy('file_system')
 
         self.batches = {}
         self.batch_size = hparams.batch_size
@@ -120,47 +113,32 @@ class TextDataModule(pl.LightningDataModule):
             cols_to_remove = list(features.keys())
             cols_to_remove.remove('text')
 
-            # We're generating single-sentence samples
-            chunk_strategy = self.hparams.chunking_strategy
-            if chunk_strategy == 'sentence':
-                # The NLTK Punkt tokenizer is actually a fancy learned model that needs to be downloaded
-                import nltk.data
-                nltk_dir = os.path.join(os.getcwd(), 'sparse-vae-pretrained/nltk/')
-                punkt_dir = os.path.join(nltk_dir, 'tokenizers/punkt/english.pickle')
-                os.makedirs(nltk_dir, exist_ok=True)
-
-                if not os.path.exists(os.path.join(nltk_dir, 'tokenizers/punkt/')):
-                    nltk.download('punkt', download_dir=nltk_dir)
-
-                def sentence_split(batch: Dict[str, list]) -> Dict[str, list]:
-                    sent_tokenizer = nltk.data.load(punkt_dir, cache=True)
-                    sentences = sent_tokenizer.tokenize_sents(batch['text'])
-                    return {'text': list(chain.from_iterable(sentences))}
-
-                print(f"Finding sentence boundaries for '{self.hparams.dataset_name}'...")
-                self.dataset = self.dataset.map(
-                    sentence_split, batched=True, batch_size=self.preproc_batch_size, remove_columns=cols_to_remove
-                )
-                cols_to_remove.clear()
-
             print(f"Tokenizing '{self.hparams.dataset_name}'...")
             self.dataset = self.dataset.map(
                 tokenize,
                 batched=True, batch_size=1000,
                 remove_columns=cols_to_remove,
                 features=Features({
+                    'num_bytes': Value('int32'),
                     'num_char': Value('int32'),
                     'num_tokens': Value('int32'),
                     'num_words': Value('int32'),
                     'text': Sequence(Value('uint16'))
                 }),
                 fn_kwargs=dict(
-                    chunk=self.hparams.chunking_strategy == 'token',
-                    min_tokens=self.hparams.min_tokens_per_sample,
-                    max_tokens=self.hparams.max_tokens_per_sample,
+                    chunk=self.hparams.chunk_documents,
+                    # min_tokens=self.hparams.min_tokens_per_sample,
+                    # max_tokens=self.hparams.max_tokens_per_sample,
                     tokenizer=self.tokenizer
                 )
             )
+
+        print("Filtering by article length...")
+        min_tokens = self.hparams.min_tokens_per_sample
+        max_tokens = self.hparams.max_tokens_per_sample
+        self.dataset = self.dataset.filter(
+            lambda n: min_tokens <= n <= max_tokens, input_columns='num_tokens', num_proc=min(10, cpu_count()),
+        )
 
         # Silence annoying warnings from the tokenizers package after we spawn DataLoader processes
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -200,15 +178,13 @@ class TextDataModule(pl.LightningDataModule):
 
         if self.batches:
             sampler = PrebatchedRandomSampler(batches=self.batches[split])
-        elif self.hparams.uniform_length_batches:
-            sampler = ContiguousRandomSampler(dataset_length=len(self.dataset[split]), batch_size=self.batch_size)
         else:
             shuffle = True
             batch_size = self.batch_size
 
         return DataLoader(
             self.dataset[split], batch_sampler=sampler, batch_size=batch_size,
-            shuffle=shuffle, collate_fn=self.collate, pin_memory=True, num_workers=max(20, cpu_count())
+            shuffle=shuffle, collate_fn=self.collate, pin_memory=True, num_workers=min(10, cpu_count())
         )
 
     def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
@@ -280,5 +256,5 @@ class TextDataModule(pl.LightningDataModule):
 
         # This hyperparameter could change every run of the application so we don't want to save
         # the truncation policy with the tokenizer
-        if self.hparams.chunking_strategy == 'token':
+        if self.hparams.chunk_documents:
             self._tokenizer.enable_truncation(self.hparams.max_tokens_per_sample)

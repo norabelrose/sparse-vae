@@ -15,7 +15,7 @@ import torch
 @dataclass
 class TransformerVAEHparams(TransformerHparams, ContinuousVAEHparams):
     latent_depth: int = 64
-    num_latent_vectors: int = 16
+    num_latent_vectors: int = 1
 
 
 class TransformerVAE(Transformer, ContinuousVAE):
@@ -44,7 +44,7 @@ class TransformerVAE(Transformer, ContinuousVAE):
     def encode(self, tokens: Tensor):
         x = self.input_layer(tokens)
         encoder_out = self.encoder(x)
-        return self.q_of_z_given_x(encoder_out).flatten(-2)
+        return self.q_of_z_given_x(encoder_out)
 
     def training_step(self, batch: Dict[str, PaddedTensor], batch_index: int, stage: str = 'train'):
         original = batch['token_ids'].long()
@@ -52,13 +52,13 @@ class TransformerVAE(Transformer, ContinuousVAE):
         x = self.input_layer(original)
         encoder_out = self.encoder(x).flatten(-2)
 
-        z, kl = self.sample_z(encoder_out, token_counts=batch['token_count'], stage=stage)
+        z, kl, posterior = self.sample_z(encoder_out, token_counts=batch['token_count'], stage=stage)
         logits = self.reconstruct(x, z)[..., :-1, :]
-        nll = self.get_nll(logits, original[..., 1:], lengths=batch.get('num_char'), stage=stage)
+        nll = self.get_nll(logits, original[..., 1:], stage=stage)
 
         loss = (nll + self.hparams.kl_weight * kl)
         if stage == 'train':
-            return loss
+            return {'loss': loss, 'posterior': posterior}
         elif stage == 'val':
             self.log('val_loss', nll + kl)
 
@@ -82,12 +82,12 @@ class TransformerVAE(Transformer, ContinuousVAE):
         if z.shape[0] > x.shape[0]:
             x = x.expand(z.shape[0], *x.shape[1:])
 
-        should_checkpoint = self.hparams.grad_checkpointing
+        should_checkpoint = self.hparams.grad_checkpointing and x.requires_grad
         for layer in self.decoder_layers:
             x = torch.cat([x[..., 0, None, :] + z_hidden, x[..., 1:, :]], dim=-2)
             x = layer(x) if not should_checkpoint else checkpoint(layer, x)
 
-        return self.output_layer(x) if not should_checkpoint else checkpoint(self.output_layer, x)
+        return self.output_layer(x)
 
     @torch.cuda.amp.autocast()
     def sample(self, max_length: int, batch_size: int = 1, **kwargs):
@@ -95,7 +95,7 @@ class TransformerVAE(Transformer, ContinuousVAE):
         if self.hparams.kl_weight < 1.0:
             return None
 
-        z = kwargs.get('z')
+        z = kwargs.pop('z', None)
         if z is None:
             z = torch.randn(batch_size, self.hparams.num_latent_vectors, self.hparams.latent_depth, device=self.device)
 

@@ -12,8 +12,8 @@ class ContinuousVAEHparams(LanguageModelHparams, ABC):
     train_mc_samples: int = 0  # Number of Monte Carlo samples used when training. If 0, use single-sample VAE estimator
 
     # Ignored when using multi-sample Monte Carlo objectives
-    kl_annealing_steps: int = 10_000
-    kl_weight_start: float = 0.3
+    kl_annealing_steps: int = 0
+    kl_weight_start: float = 1.0
     kl_weight_end: float = 1.0
     kl_weight: float = 1.0
 
@@ -47,7 +47,7 @@ class ContinuousVAE(LanguageModel, ABC):
         self.hparams.kl_weight = self.hparams.kl_weight_start + total_distance * progress
 
     # Returns the latent tensor and the KL
-    def sample_z(self, encoder_out: Tensor, token_counts: Tensor, stage: str = 'train') -> Tuple[Tensor, Tensor]:
+    def sample_z(self, encoder_out: Tensor, token_counts: Tensor, stage: str = 'train'):
         q_of_z, kl = self.q_of_z_given_x(encoder_out, get_kl=True)
         z = q_of_z.rsample()
 
@@ -63,7 +63,7 @@ class ContinuousVAE(LanguageModel, ABC):
         if stage == 'val':
             self.log('val_active_units', q_of_z.mean, reduce_fx=self.compute_num_active_units)
 
-        return z, kl
+        return z, kl, q_of_z
 
     # 'Active' latent dimensions are those whose variance across a batch/epoch exceeds 0.01
     @staticmethod

@@ -1,4 +1,4 @@
-from text_vae import *
+from sparse_vae import *
 import sys
 
 
@@ -14,8 +14,6 @@ def main(args):
         model_class = Transformer
     elif model_str == 'transformer-vae':
         model_class = TransformerVAE
-    elif model_str == 'vq-vae':
-        model_class = QuantizedVAE
     else:
         print(f"Unrecognized model type '{model_str}'.")
         return

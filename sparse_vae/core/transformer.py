@@ -78,14 +78,16 @@ class Transformer(LanguageModel):
         return self.context_layer(context) if self.context_layer else self.input_layer(context)
 
     def forward(self, batch: Dict[str, PaddedTensor]):
-        x, context = batch['token_ids'], batch.get('context')
+        x, context = batch['token_ids'].long(), batch.get('context')
         if context is not None:
-            context = self.embed_context(context)
+            raise NotImplementedError
+            # context = self.embed_context(context)
 
         x = self.input_layer(x)
+
+        should_checkpoint = self.hparams.grad_checkpointing and x.requires_grad
         for layer in self.decoder_layers:
-            closure = lambda: layer(x, context=context)
-            x = checkpoint(closure) if self.hparams.grad_checkpointing else closure()
+            x = checkpoint(layer, x) if should_checkpoint else layer(x)
 
         return self.output_layer(x)
 

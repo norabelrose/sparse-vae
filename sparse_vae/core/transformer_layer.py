@@ -7,15 +7,13 @@ class TransformerLayer(nn.Module):
         d_model: int,
         num_heads: int,
         causal: bool = False,
-        rel_pos_attn: bool = False,
         use_cross_attention: bool = False,
-        sparse_self_attention: bool = False,
+        sparse_self_attention: Union[bool, SlidingWindowSparsityConfig] = False,
         learned_queries: int = None,
-        grad_checkpointing: bool = False
     ):
         super(TransformerLayer, self).__init__()
 
-        self.attention = Attention(d_model, num_heads, causal, rel_pos_attn=rel_pos_attn, sparse=sparse_self_attention,
+        self.attention = Attention(d_model, num_heads, causal, sparse=sparse_self_attention,
                                    learned_queries=learned_queries)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
@@ -26,7 +24,6 @@ class TransformerLayer(nn.Module):
         self.attn_layer_norm = nn.LayerNorm(d_model)
         self.ffn_layer_norm = nn.LayerNorm(d_model)
         self.use_cross_attention = use_cross_attention
-        self.grad_checkpointing = grad_checkpointing
 
     @property
     def use_cross_attention(self):
@@ -38,24 +35,23 @@ class TransformerLayer(nn.Module):
             self_attn = self.attention
             self.cross_attention = Attention(
                 d_model=self_attn.d_model,
-                num_heads=self_attn.num_heads,
-                rel_pos_attn=self_attn.rel_pos_attn
+                num_heads=self_attn.num_heads
             )
             self.cross_attn_layer_norm = nn.LayerNorm(self_attn.d_model)
             self.context_layer_norm = nn.LayerNorm(self_attn.d_model)
         else:
             self.cross_attention = None
 
-    def forward(self, x: PaddedTensor, context: PaddedTensor = None, pos_enc = None) -> Tensor:
+    def forward(self, x: PaddedTensor, context: PaddedTensor = None) -> Tensor:
         # We use the pre-LayerNorm variant of the Transformer architecture because it tends to train more
         # stably across a wider range of hyperparameter configurations
         y = self.attn_layer_norm(x)
-        y = self.attention(y, y, y, pos_enc=pos_enc)
+        y = self.attention(y, y, y)
         x = x + y if x.shape == y.shape else y
 
         if self.cross_attention and context is not None:
             context, y = self.context_layer_norm(context), self.cross_attn_layer_norm(x)
-            y = self.cross_attention(y, context, context, pos_enc=pos_enc)
+            y = self.cross_attention(y, context, context)
             x = x + y
 
         y = self.ffn_layer_norm(x)

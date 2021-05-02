@@ -12,15 +12,15 @@ from torch import nn, Tensor
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from typing import *
 from .padded_tensor import PaddedTensor
-from ..train_callbacks import UnconditionalSampler
+from .text_sampling_callback import TextSamplingCallback
 
 
 @dataclass
 class LanguageModelHparams(ABC):
     batch_size: int = 0                 # Just for compatibility with pl.Trainer's auto_scale_batch_size feature
-    grad_clip_threshold: float = 50.0
+    grad_clip_threshold: float = 5.0
     init_scale: Optional[float] = 0.02  # Stddev of Gaussian weight initialization. If None, default PyTorch init. is used
-    lr: float = 2.5e-4                  # GPT-2 learning rate
+    lr: float = 3e-4
     lr_decay_steps: Optional[int] = 250_000
     lr_plateau_patience: Optional[int] = None  # If non-None, ReduceLROnPlateau scheduler is used w/ specified patience
     warmup_steps: int = 1000
@@ -29,7 +29,6 @@ class LanguageModelHparams(ABC):
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-6              # We need to use 1e-6 since 1e-8 underflows to 0 on fp16
-    lasso_penalty: float = 0.0          # L1 norm penalty
     weight_decay: float = 0.01
 
     vocab_size: int = 2 ** 15           # Maximum number of tokens representable with signed 16-bit integers
@@ -60,7 +59,7 @@ class LanguageModel(pl.LightningModule, ABC):
             EarlyStopping(monitor=metric, mode='min'),
             ModelCheckpoint(monitor=metric, mode='min')
         ]
-        return callbacks + [UnconditionalSampler()] if self.hparams.log_samples else callbacks
+        return callbacks + [TextSamplingCallback()] if self.hparams.log_samples else callbacks
 
     # The callbacks need to have access to a tokenizer, so let's get a reference to the datamodule's tokenizer.
     def setup(self, stage: str):
@@ -131,7 +130,8 @@ class LanguageModel(pl.LightningModule, ABC):
             if bias is not None:
                 bias.zero_()
 
-    def get_nll(self, logits: Tensor, labels: Tensor, lengths: Tensor = None, stage: str = 'train'):
+    def get_nll(self, logits: Tensor, labels: Tensor, byte_counts: Tensor = None, char_counts: Tensor = None,
+                stage: str = 'train'):
         # Expand the labels across any extra batch dimensions that might exist in the logits tensor
         if extra_dims := logits.ndim - labels.ndim - 1:
             labels = labels.expand(*logits.shape[:extra_dims], *labels.shape)
@@ -145,13 +145,17 @@ class LanguageModel(pl.LightningModule, ABC):
         else:
             nll = F.nll_loss(log_probs, labels, ignore_index=0)
 
-        if stage == 'val' and lengths is not None:
+        if stage == 'val' and char_counts is not None:
             # We have to do this ugly hack because nll_loss() throws an error when reduction='none' and the
             # logits tensor has more than 2 ** 31 elements; see PyTorch issue #24401
             log_probs[..., 0] = 0.0
             nll_sum = -log_probs.gather(dim=1, index=labels.unsqueeze(1)).squeeze(1).sum(dim=0)
-            bits_per_char = (nll_sum / math.log(2)) / lengths
+            bits = nll_sum / math.log(2)
+            bits_per_char = bits / char_counts
             self.log('val_bpc', bits_per_char.mean())
+            if byte_counts is not None:
+                bits_per_byte = bits / byte_counts
+                self.log('val_bpb', bits_per_byte.mean())
 
         self.log(stage + '_nll', nll)
         return nll
@@ -159,24 +163,7 @@ class LanguageModel(pl.LightningModule, ABC):
     # These implementations are used by LSTMLanguageModel and TransformerLanguageModel, but are overriden by others
     def training_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         logits = self.forward(batch)[..., :-1, :]
-        return self.get_nll(logits, batch['token_ids'][..., 1:])
-
-    # def optimizer_step(self, *args, **kwargs):
-    #     # We apply the LASSO penalty here and not in on_after_backward to make sure that we don't apply the
-    #     # penalty more than once when using gradient accumulation
-    #     if penalty := self.hparams.lasso_penalty:
-    #         for module in self.modules():
-    #             # Don't shrink the LayerNorm parameters (especially the scale parameters) because the
-    #             # 'default' configuration is 1.0, not zero. Also, empirically, including these parameters
-    #             # tends to reduce performance quite considerably and makes training less stable.
-    #             if isinstance(module, nn.LayerNorm):
-    #                 continue
-#
-    #             for param in module.parameters(recurse=False):
-    #                 if (grad := param.grad) is not None:
-    #                     grad.add_(grad.sign(), alpha=penalty)  # d/dx[abs(x)] = sign(x)
-#
-    #     super().optimizer_step(*args, **kwargs)
+        return self.get_nll(logits, batch['token_ids'][..., 1:].long())
 
     def on_after_backward(self):
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
@@ -184,7 +171,8 @@ class LanguageModel(pl.LightningModule, ABC):
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         logits = self.forward(batch)[..., :-1, :]
-        return self.get_nll(logits, batch['token_ids'][..., 1:], lengths=batch.get('num_char'), stage='val')
+        return self.get_nll(logits, batch['token_ids'][..., 1:].long(), byte_counts=batch.get('num_bytes'),
+                            char_counts=batch.get('num_char'), stage='val')
 
     def test_step(self, batch: Dict[str, Tensor], batch_index: int):
         return self.validation_step(batch, batch_index)

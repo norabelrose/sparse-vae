@@ -17,19 +17,15 @@ class GenerationState:
     top_p: float = 0.9
     temperature: float = 1.0
     length_penalty: float = 1.0
-    rolling: bool = False
 
     def __post_init__(self, max_length: int, batch_size: int, device: torch.device, dtype: torch.dtype):
         self.output_ids = torch.zeros(batch_size, max_length, device=device, dtype=dtype)
         self.output_ids[:, 0] = self.start_token
 
-        self.live_sample_mask = torch.ones(batch_size, device=device, dtype=torch.bool) if not self.rolling else None
-        self.current_index = 1 if not self.rolling else torch.ones(batch_size, device=device, dtype=torch.long)
+        self.live_sample_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+        self.current_index = 1
 
     def prev_tokens(self) -> Tensor:
-        if self.rolling:
-            return self.output_ids.gather(dim=-1, index=self.current_index[:, None] - 1)
-
         return self.output_ids[self.live_sample_mask, self.current_index - 1, None]
 
     def process_logits(self, logits: Tensor):
@@ -77,7 +73,6 @@ class GenerationState:
         return continuing_sample_mask
 
     def should_stop(self) -> bool:
-        assert not self.rolling
         return self.current_index >= self.output_ids.shape[-1] - 1 or not self.live_sample_mask.any()
 
     def final_output(self) -> Tensor:
