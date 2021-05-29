@@ -50,9 +50,9 @@ class Transformer(LanguageModel):
 
         output_embedding = nn.Linear(d_model, vocab_size)
         self.output_layer = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
             nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
             output_embedding
         )
         if hparams.tie_embedding_weights and d_embedding == d_model:
@@ -102,14 +102,18 @@ class Transformer(LanguageModel):
 
         with Attention.kv_cache(max_length):
             while not state.should_stop():
-                x = self.input_layer(state.prev_tokens())
+                inputs = state.prev_tokens()
+                x = self.input_layer(inputs)
+                if z is not None:
+                    x = x + z[state.live_sample_mask, :]
+
                 for layer in self.decoder_layers:
-                    if z is not None and state.current_index == 1:
-                        x += z
+                    # if z is not None and state.current_index == 1:
+                    #     x += z
 
                     x = layer(x, context=context)
 
-                next_logits = self.output_layer(x).squeeze(-2)
+                next_logits = self.output_layer(x.squeeze(1))
                 continuing_mask = state.process_logits(next_logits)
 
                 Attention.update_kv_cache(continuing_mask)

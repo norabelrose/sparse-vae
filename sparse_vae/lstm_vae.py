@@ -44,7 +44,7 @@ class LSTMVAE(ContinuousVAE):
             batch_first=True,
             num_layers=hparams.num_layers
         )
-        self.c0 = nn.Parameter(torch.randn(hparams.num_layers, 1, hparams.d_model))
+        # self.c0 = nn.Parameter(torch.randn(hparams.num_layers, 1, hparams.d_model))
 
         if hparams.tie_logit_weights:
             output_embedding = nn.Linear(hparams.d_embedding, hparams.vocab_size)
@@ -66,14 +66,14 @@ class LSTMVAE(ContinuousVAE):
         else:
             self.encoder = nn.LSTM(
                 input_size=hparams.d_embedding,
-                hidden_size=hparams.d_model,
+                hidden_size=hparams.d_model // 4,
                 bidirectional=hparams.bidirectional_encoder,
                 num_layers=hparams.num_layers,
                 batch_first=True
             )
             num_directions = 2 if hparams.bidirectional_encoder else 1
-            hidden_size = hparams.d_model * num_directions
-            self.c0 = nn.Parameter(torch.randn(num_directions, 1, hparams.d_model))
+            hidden_size = (hparams.d_model // 4) * num_directions
+            self.c0 = nn.Parameter(torch.randn(num_directions, 1, hparams.d_model // 4))
 
         self.automatic_optimization = hparams.train_mc_samples == 0
 
@@ -110,7 +110,7 @@ class LSTMVAE(ContinuousVAE):
         return last_state
 
     def training_step(self, batch: Dict[str, Tensor], batch_index: int, stage: str = 'train'):
-        original = batch['token_ids']
+        original = batch['token_ids'].long()
 
         x = self.encoder_embedding(original)
         last_state = self.forward(x)
@@ -124,16 +124,19 @@ class LSTMVAE(ContinuousVAE):
 
         # Single-sample VAE objective
         else:
-            z, kl = self.sample_z(last_state, token_counts=batch['token_count'], stage=stage)
+            z, kl, posterior = self.sample_z(last_state, token_counts=batch['token_count'], stage=stage)
             if not self.hparams.tie_embedding_weights:
                 x = self.decoder_embedding(original)
 
             logits = self.reconstruct(self.dropout_in(x), z)[..., :-1, :]  # Remove [SEP]
-            nll = self.get_nll(logits, batch['token_ids'][..., 1:])
+            nll = self.get_nll(logits, original[..., 1:])
 
             loss = (nll + self.hparams.kl_weight * kl)
+
+            mutual_info = self.estimate_mutual_info(posterior)
+            self.log(stage + '_mutual_info', mutual_info)
             if stage == 'train':
-                return {'logits': logits, 'loss': loss}
+                return {'logits': logits, 'loss': loss, 'posterior': posterior}
             elif stage == 'val':
                 self.log('val_loss', nll + kl)
 

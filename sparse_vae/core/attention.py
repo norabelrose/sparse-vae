@@ -15,13 +15,15 @@ class Attention(nn.Module):
         num_heads: int,
         causal = False,
         sparse: Union[bool, SlidingWindowSparsityConfig] = False,
-        learned_queries: int = None
+        learned_queries: int = None,
+        # num_special_tokens: int = 1     # Number of leading special tokens exempted from causal masking
     ):
         super().__init__()
 
         self.causal = causal
         self.d_model = d_model
         self.num_heads = num_heads
+        # self.num_special_tokens = num_special_tokens
         assert d_model % num_heads == 0, "num_heads must divide d_model evenly"
 
         # We can use learned queries to extract a single vector or a fixed size sequence of vectors out of a sequence
@@ -36,7 +38,6 @@ class Attention(nn.Module):
         self.output_linear = nn.Linear(d_model, d_model)
 
         self.cache_index = 0
-        self.precomputed_kv = False
         self.key_cache = None
         self.value_cache = None
 
@@ -45,7 +46,6 @@ class Attention(nn.Module):
             if isinstance(sparse, SlidingWindowSparsityConfig):
                 config = sparse
             else:
-                # config = FixedSparsityConfig(num_heads=num_heads, attention='unidirectional')
                 config = SlidingWindowSparsityConfig(num_heads=num_heads, window_size=4)
 
             self.sparse_attention = SparseSelfAttention(
@@ -65,34 +65,31 @@ class Attention(nn.Module):
             q = q + positional_encodings_like(q, self.cache_index)
             q = self.q_linear(q)
 
-        # This will be True only when we're using cached keys and values with cross attention
-        if self.precomputed_kv:
-            k, v = self.key_cache, self.value_cache
-
-        # Normal case
-        else:
-            k = k + positional_encodings_like(k, self.cache_index)
-
-            k, v = self.k_linear(k), self.v_linear(v)
-            if self.kv_cache_length:
-                k, v = self._update_kv_cache(k, v)
+        k = k + positional_encodings_like(k, self.cache_index)
+        k, v = self.k_linear(k), self.v_linear(v)
+        if self.kv_cache_length:
+            k, v = self._update_kv_cache(k, v)
 
         mask = getattr(k, 'padding', None)
         q, k, v = (rearrange(x, '... l (h d) -> ... h l d', h=self.num_heads) for x in (q, k, v))
-        if self.sparse_attention and self.key_cache is None:
-            q_len = q.shape[-2]
 
+        if self.causal and self.key_cache is None:
+            q_len = q.shape[-2]
+            causal_mask = torch.ones(q_len, q_len, device=q.device, dtype=torch.bool).triu(1)
+        else:
+            causal_mask = None
+
+        if self.sparse_attention and self.key_cache is None:
             mask = mask * -1e7 if mask is not None else None  # DeepSpeed *adds* this mask to the attn scores
-            attn_mask = torch.ones(q_len, q_len, device=q.device, dtype=torch.bool).triu(1) * -1e7 if self.causal else None
-            output = self.sparse_attention(q, k, v, attn_mask=attn_mask, key_padding_mask=mask)
+            causal_mask = causal_mask * -1e7 if causal_mask is not None else None
+            output = self.sparse_attention(q, k, v, attn_mask=causal_mask, key_padding_mask=mask)
         else:
             scores = q @ k.transpose(-1, -2) * k.shape[-1] ** -0.5
 
             # Note that we only apply the upper triangular causal mask during training;
             # during autoregressive decoding there's no "right context" to mask out
             mask = mask[..., None, None, :] if mask is not None and mask.ndim >= 2 else mask
-            if self.causal and self.key_cache is None:
-                causal_mask = torch.ones(*scores.shape[-2:], device=scores.device, dtype=torch.bool).triu(1)
+            if causal_mask is not None:
                 mask = mask | causal_mask if mask is not None else causal_mask
 
             if mask is not None:
@@ -109,50 +106,38 @@ class Attention(nn.Module):
         # Register for automatic cache cleanup when we exit the cached kv context
         self.live_attention_modules.add(self)
 
-        # We're being fed new keys and values one token at a time- self-attention case
-        if k.shape[-2] == 1:
-            # When we're using sparse attention, we only need to cache the keys and values that are
-            # actually going to be attended to
-            if self.sparse_attention:
-                config = self.sparse_attention.sparsity_config
-                num_blocks = config.window_size + int(config.include_cls)
-                block_size = config.block
-                cache_length, cache_offset = num_blocks * block_size, int(config.include_cls) * block_size
-            else:
-                cache_length, cache_offset = self.kv_cache_length, 0
-                block_size = 0
-
-            if self.key_cache is None:
-                if k.shape[0] == 1:
-                    breakpoint()
-                self.key_cache = k.new_zeros([k.shape[0], cache_length, k.shape[-1]])
-                self.value_cache = v.new_zeros([v.shape[0], cache_length, v.shape[-1]])
-
-            # We've overshot the kv cache size
-            if self.sparse_attention and self.cache_index >= cache_length:
-                local_index = self.cache_index % block_size
-                kv_index = cache_length - block_size + local_index
-
-                # Shift the kv cache leftward by one block, discarding the leftmost one
-                if local_index == 0:
-                    self.key_cache[:, cache_offset:kv_index] = self.key_cache[:, cache_offset + block_size:].clone()
-                    self.value_cache[:, cache_offset:kv_index] = self.value_cache[:, cache_offset + block_size:].clone()
-            else:
-                kv_index = self.cache_index
-
-            self.key_cache[:, kv_index] = k.squeeze(-2)
-            self.value_cache[:, kv_index] = v.squeeze(-2)
-            self.cache_index += 1
-
-            return self.key_cache[:, :kv_index + 1], self.value_cache[:, :kv_index + 1]
-
-        # We're being fed a bunch of keys and values all at once- cross-attention case.
+        # When we're using sparse attention, we only need to cache the keys and values that are
+        # actually going to be attended to
+        if self.sparse_attention:
+            config = self.sparse_attention.sparsity_config
+            num_blocks = config.window_size + int(config.include_cls)
+            block_size = config.block
+            cache_length, cache_offset = num_blocks * block_size, int(config.include_cls) * block_size
         else:
-            breakpoint()
-            self.key_cache = k
-            self.value_cache = v
-            self.precomputed_kv = True
-            return k, v
+            cache_length, cache_offset = self.kv_cache_length, 0
+            block_size = 0
+
+        if self.key_cache is None:
+            self.key_cache = k.new_zeros([k.shape[0], cache_length, k.shape[-1]])
+            self.value_cache = v.new_zeros([v.shape[0], cache_length, v.shape[-1]])
+
+        # We've overshot the kv cache size
+        if self.sparse_attention and self.cache_index >= cache_length:
+            local_index = self.cache_index % block_size
+            kv_index = cache_length - block_size + local_index
+
+            # Shift the kv cache leftward by one block, discarding the leftmost one
+            if local_index == 0:
+                self.key_cache[:, cache_offset:kv_index] = self.key_cache[:, cache_offset + block_size:].clone()
+                self.value_cache[:, cache_offset:kv_index] = self.value_cache[:, cache_offset + block_size:].clone()
+        else:
+            kv_index = self.cache_index
+
+        self.key_cache[:, kv_index] = k.squeeze(-2)
+        self.value_cache[:, kv_index] = v.squeeze(-2)
+        self.cache_index += 1
+
+        return self.key_cache[:, :kv_index + 1], self.value_cache[:, :kv_index + 1]
 
     # Class variables
     kv_cache_length: int = None
@@ -169,7 +154,6 @@ class Attention(nn.Module):
         cls.kv_cache_length = None
         for module in cls.live_attention_modules:
             module.cache_index = 0
-            module.precomputed_kv = False
             module.key_cache = None
             module.value_cache = None
 

@@ -15,17 +15,16 @@ class ConditionalGaussian(nn.Module):
 
         self.linear = linear
 
-    def forward(self, x: Tensor, temperature: float = 1.0, get_kl: bool = False) -> Union[Normal, Tuple[Normal, Tensor]]:
-        mu, logsigma = self.linear(x).chunk(2, dim=-1)
-        sigma = logsigma.exp()
+    def forward(self, x: Tensor, get_kl: bool = False) -> Union[Normal, Tuple[Normal, Tensor]]:
+        mu, logvar = self.linear(x).chunk(2, dim=-1)
+        var = logvar.exp()
 
         # We do NOT validate the parameters here because this raises an error if any of the sigma values
         # are exactly zero. This should yield an infinite KL divergence and therefore an infinite loss,
         # but the AMP grad scaler will take care of that.
-        gaussian = Normal(loc=mu, scale=sigma * temperature, validate_args=False)
+        gaussian = Normal(loc=mu, scale=var.sqrt(), validate_args=False)
         if get_kl:
-            # Analytical formula for the KL divergence p -> q, where p is a standard unit variance Gaussian.
-            kl = -0.5 + logsigma + 0.5 * (1.0 + mu ** 2) / (sigma ** 2)
+            kl = 0.5 * (mu ** 2 + var - logvar - 1.0)
             return gaussian, kl
         else:
             return gaussian

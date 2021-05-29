@@ -7,3 +7,5 @@ tokenizers>=0.9.4
 omegaconf>=2.0.5
 deepspeed>=0.3.13
 pynvml>=8.0.4
+torchtext>=0.9.1
+tqdm>=4.49.0

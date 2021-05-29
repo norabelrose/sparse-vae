@@ -1,18 +1,18 @@
 from dataclasses import asdict, dataclass
 from pytorch_lightning import Callback
-from torch.distributions import Normal
+from torchtext.data.metrics import bleu_score
 from typing import *
 
 
 @dataclass
 class TextSamplingCallback(Callback):
-    num_reconstructions: int = 2
+    num_reconstructions: int = 1
     sample_max_len: int = 512
-    train_step_interval: int = 1000
+    train_step_interval: int = 500
 
     def on_train_batch_end(self, trainer, langmodel, outputs, batch, batch_idx, dataloader_idx):
         cur_step = langmodel.global_step
-        if cur_step % self.train_step_interval != 0:
+        if cur_step % self.train_step_interval != 0 or not outputs:
             return
 
         logger = trainer.logger
@@ -38,22 +38,29 @@ class TextSamplingCallback(Callback):
             outputs = outputs['extra']
 
         if 'posterior' in outputs:
-            posterior = outputs['posterior']
-            posterior = Normal(loc=posterior.loc[0], scale=posterior.scale[0])
-            langmodel.eval()
+            z = outputs['posterior'].mean[0, None]
+        elif 'z' in outputs:
+            z = outputs['z'][0].unsqueeze(0)
+        else:
+            z = None
 
-            # This adds a new leading dimension for the different samples from the posterior, but we now
-            # squeeze away the original batch dimension, so to the decoder the different latent samples
-            # just look like different elements in a batch
-            z = posterior.rsample([self.num_reconstructions, 1])
+        if z is not None:
+            langmodel.eval()
             reconstructions = langmodel.sample(self.sample_max_len, z.shape[0], z=z)
             langmodel.train()
 
             original = batch['token_ids'][0]
             original_len = min(len(original), self.sample_max_len)
-            logged_msg = "**Original**:  \n" + tokenizer.decode(original[:original_len].tolist())
-            for i, reconstruction in enumerate(reconstructions, start=1):
-                logged_msg += f"  \n**Reconstruction {i}**:  \n" + tokenizer.decode(reconstruction.tolist())
+            original_str = tokenizer.decode(original[:original_len].tolist())
+            reconstructed_strs = tokenizer.decode_batch(reconstructions.tolist())
+            langmodel.log('train_bleu', bleu_score(
+                [x.split(' ') for x in reconstructed_strs], [[original_str.split(' ')]],
+                max_n=3, weights=[1.0 / 3.0] * 3
+            ), on_step=True)
+
+            logged_msg = "**Original**:  \n" + original_str
+            for i, reconstruction in enumerate(reconstructed_strs, start=1):
+                logged_msg += f"  \n**Reconstruction {i}**:  \n" + reconstruction
 
             logger.add_text('reconstruction', logged_msg, global_step=langmodel.global_step)
 

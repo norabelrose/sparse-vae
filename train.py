@@ -70,14 +70,6 @@ def main(args):
     model = model_class(config.model)
     data = TextDataModule(hparams=config.data)
 
-    # Find the appropriate batch size for this machine and task
-    if config.trainer.auto_scale_batch_size or config.trainer.auto_lr_find:
-        trainer = Trainer(**config.trainer)
-        trainer.tune(model, datamodule=data)
-
-    # warnings.filterwarnings('ignore', module='pytorch_lightning')
-    # warnings.filterwarnings('ignore', module='torch')  # Bug in PL
-
     if config.get('fp16_weights'):
         torch.set_default_dtype(torch.float16)
 

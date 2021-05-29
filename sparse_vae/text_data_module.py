@@ -19,15 +19,15 @@ import torch
 class TextDataModuleHparams:
     # These two options are mutually exclusive
     batch_size: Optional[int] = None
-    tokens_per_batch: Optional[int] = 12_500
+    tokens_per_batch: Optional[int] = 50_000
     uniform_length_batches: bool = True
 
     chunk_documents: bool = False
-    dataset_name: str = 'yelp_review_full'
-    dataset_config: Optional[str] = None
+    dataset_name: str = 'wikipedia'
+    dataset_config: Optional[str] = '20200501.en'
     dataset_path: Optional[str] = None
-    min_tokens_per_sample: int = 16
-    max_tokens_per_sample: int = 512
+    min_tokens_per_sample: int = 512
+    max_tokens_per_sample: int = 25_000
     split: Optional[str] = None         # Any string of the format supported by the HuggingFace datasets library
     vocab_size: int = 2 ** 15
     dataset_save_dir: str = os.path.join(os.getcwd(), 'sparse-vae-datasets')
@@ -45,9 +45,10 @@ class TextDataModule(pl.LightningDataModule):
         self.batches = {}
         self.batch_size = hparams.batch_size
         self.dataset = None  # HuggingFace Dataset object, possibly with both train and test splits
+        self.extra_start_tokens = 0
         self.hparams = hparams
         self.pad_to_multiple_of = 1
-        self.special_token_threshold = 5
+        self.start_token = None
 
         self._preproc_batch_size = None
         self._tokenizer = None
@@ -184,7 +185,7 @@ class TextDataModule(pl.LightningDataModule):
 
         return DataLoader(
             self.dataset[split], batch_sampler=sampler, batch_size=batch_size,
-            shuffle=shuffle, collate_fn=self.collate, pin_memory=True, num_workers=min(10, cpu_count())
+            shuffle=shuffle, collate_fn=self.collate, pin_memory=True
         )
 
     def val_dataloader(self, *args, **kwargs) -> Union[DataLoader, List[DataLoader]]:
@@ -198,6 +199,7 @@ class TextDataModule(pl.LightningDataModule):
         # int16; if so we copy into an int32 tensor, otherwise we do a no-copy reinterpret cast to int16
         upcast = self.tokenizer.get_vocab_size() > 2 ** 15
         return {
+            'num_bytes': torch.tensor([x['num_bytes'] for x in inputs]),
             'num_char': torch.tensor([x['num_char'] for x in inputs]),
             'token_ids': PaddedTensor.from_raw(self.pad_pack([
                 torch.from_numpy(x['text'].view(np.int16) if not upcast else x['text'].astype(np.int32))
@@ -207,7 +209,8 @@ class TextDataModule(pl.LightningDataModule):
         }
 
     def pad_pack(self, batch: List[Tensor], pad_value: int = 0) -> Tensor:
-        buffer_len = max(len(x) for x in batch)
+        extras = self.extra_start_tokens
+        buffer_len = max(len(x) for x in batch) + extras
 
         factor = self.pad_to_multiple_of
         if factor > 1:
@@ -215,8 +218,11 @@ class TextDataModule(pl.LightningDataModule):
             buffer_len += factor - remainder if remainder else 0
 
         buffer = torch.full([len(batch), buffer_len], pad_value, dtype=batch[0].dtype)
+        if extras:
+            buffer[:, extras:] = self.start_token
+
         for i, sequence in enumerate(batch):
-            buffer[i, :len(sequence)] = sequence
+            buffer[i, extras:len(sequence) + extras] = sequence
 
         return buffer
 
@@ -256,5 +262,6 @@ class TextDataModule(pl.LightningDataModule):
 
         # This hyperparameter could change every run of the application so we don't want to save
         # the truncation policy with the tokenizer
+        self.start_token = self.tokenizer.get_vocab()['[CLS]']
         if self.hparams.chunk_documents:
             self._tokenizer.enable_truncation(self.hparams.max_tokens_per_sample)

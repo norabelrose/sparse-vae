@@ -1,7 +1,9 @@
 from abc import abstractmethod
 from contextlib import contextmanager
+
 from torch.distributions import Normal
 from .language_model import *
+from .math_utils import pairwise_gaussian_kl
 import math
 
 
@@ -57,8 +59,8 @@ class ContinuousVAE(LanguageModel, ABC):
 
         log_prefix = stage + '_'
         self.log_dict({
-            log_prefix + 'kl': raw_kl.mean(),
-            log_prefix + 'mutual_info': self.estimate_mutual_info(q_of_z, z)
+            log_prefix + 'kl': raw_kl.mean()
+            # log_prefix + 'mutual_info': self.estimate_mutual_info(q_of_z)
         })
         if stage == 'val':
             self.log('val_active_units', q_of_z.mean, reduce_fx=self.compute_num_active_units)
@@ -153,13 +155,19 @@ class ContinuousVAE(LanguageModel, ABC):
         return torch.cat(log_ws).logsumexp(dim=0) - math.log(num_samples)
 
     @staticmethod
-    def estimate_mutual_info(conditional_q: Normal, z: Tensor):
-        unsqueezed = Normal(loc=conditional_q.loc[:, None], scale=conditional_q.scale[:, None], validate_args=False)
-        cross_densities = unsqueezed.log_prob(z[None]).sum(dim=-1)     # [batch, batch]
+    def estimate_mutual_info(posteriors: Normal):
+        # Mutual info = E_p(x)[KL(q(z|x)|q(z))]. Since q(z) = E_p(x)[q(z|x)], we can view each minibatch of
+        # posteriors as a mixture of Gaussians with equal component weights that approximates q(z). While there
+        # is no closed form solution for the KL P -> Q where Q is a Gaussian mixture, there is an analytic formula
+        # for an upper bound on this quantity, and we use it here.
+        neg_pairwise_kl = -pairwise_gaussian_kl(posteriors)
+        batch = neg_pairwise_kl.shape[1]
+        lower = -neg_pairwise_kl.logsumexp(dim=-1).mean() - math.log(batch)
 
-        # Approximate q(z) by averaging over the densities assigned to each z by the other q(z|x)s in the minibatch
-        marginal_q = cross_densities.logsumexp(dim=0) - math.log(cross_densities.shape[0])
-        return -conditional_q.entropy().sum(dim=-1).mean() - marginal_q.mean()
+        tiny = torch.finfo(neg_pairwise_kl.dtype).min
+        loo_neg_pairwise_kl = neg_pairwise_kl.clone().fill_diagonal_(tiny)
+        upper = -loo_neg_pairwise_kl.logsumexp(dim=-1).mean() - math.log(batch - 1)
+        return (lower + upper) / 2.0
 
     # Returns log p(x|z) summed (not averaged!) over the sequence length, for each element in the batch
     def p_of_x_given_z(self, x, z, labels) -> Tensor:

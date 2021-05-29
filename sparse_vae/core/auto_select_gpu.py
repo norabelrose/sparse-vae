@@ -1,6 +1,6 @@
 # Uses pynvml to select the index of the least-used GPU with sufficient free memory.
 # The `min_free_memory` argument is interpreted in gigabytes
-def select_best_gpu(min_free_memory: float = 40.0) -> int:
+def select_best_gpu(min_free_memory: float = 35.0) -> int:
     from pynvml import (
         nvmlInit,
         nvmlDeviceGetCount,

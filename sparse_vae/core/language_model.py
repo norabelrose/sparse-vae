@@ -9,7 +9,7 @@ from functools import partial
 from omegaconf import DictConfig
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from torch import nn, Tensor
-from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import LambdaLR
 from typing import *
 from .padded_tensor import PaddedTensor
 from .text_sampling_callback import TextSamplingCallback
@@ -73,44 +73,25 @@ class LanguageModel(pl.LightningModule, ABC):
 
     def configure_optimizers(self, lr: float = None, params = None):
         beta1, beta2 = self.hparams.adam_beta1, self.hparams.adam_beta2
-        if beta2 == 0.0:
-            opt = torch.optim.SGD(
-                params or self.parameters(),
-                lr=lr or self.hparams.lr,
-                momentum=beta1
-            )
-        else:
-            try:
-                from deepspeed.ops.adam import FusedAdam as Adam
-            except ImportError:
-                print("Couldn't import fused Adam kernel from DeepSpeed, falling back on PyTorch version.")
-                from torch.optim import Adam
+        try:
+            from deepspeed.ops.adam import FusedAdam as Adam
+        except ImportError:
+            print("Couldn't import fused Adam kernel from DeepSpeed, falling back on PyTorch version.")
+            from torch.optim import Adam
 
-            opt = Adam(
-                params or self.parameters(),
-                lr=lr or self.hparams.lr,
-                betas=(beta1, beta2),
-                weight_decay=self.hparams.weight_decay,
-                eps=self.hparams.adam_eps
-            )
+        adam = Adam(
+            params or self.parameters(),
+            lr=lr or self.hparams.lr,
+            betas=(beta1, beta2),
+            weight_decay=self.hparams.weight_decay,
+            eps=self.hparams.adam_eps
+        )
 
-        # This is mainly just here to reproduce the Lagging Inference Networks paper (He et al. 2019) which uses a
-        # ReduceLROnPlateau-type learning rate schedule
-        on_plateau_patience = self.hparams.lr_plateau_patience
-        if on_plateau_patience is not None:
-            lr_dict = {
-                'scheduler': ReduceLROnPlateau(opt, factor=0.5, patience=on_plateau_patience),
-                'monitor': self.hparams.early_stopping_metric,
-                'interval': 'epoch'
-            }
-        else:
-            lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, self.hparams.warmup_steps)
-            lr_dict = {
-                'scheduler': LambdaLR(opt, lr_lambda),
-                'interval': 'step'
-            }
-
-        return [opt], [lr_dict]
+        lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, self.hparams.warmup_steps)
+        return [adam], [{
+            'scheduler': LambdaLR(adam, lr_lambda),
+            'interval': 'step'
+        }]
 
     def initialize_weights(self):
         scale = self.hparams.init_scale
@@ -119,7 +100,7 @@ class LanguageModel(pl.LightningModule, ABC):
 
         # Default BERT weight initialization
         for module in self.modules():
-            if isinstance(module, nn.LayerNorm):
+            if isinstance(module, (nn.BatchNorm1d, nn.LayerNorm)):
                 continue
 
             if hasattr(module, 'weight'):
