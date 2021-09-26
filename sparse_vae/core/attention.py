@@ -4,7 +4,7 @@ from einops import rearrange
 from torch import nn, Tensor
 from typing import *
 from .padded_tensor import PaddedTensor
-from .sliding_window_sparsity_config import SlidingWindowSparsityConfig
+from .sparse_attention import SparseAttention
 import torch
 
 
@@ -14,16 +14,14 @@ class Attention(nn.Module):
         d_model: int,
         num_heads: int,
         causal = False,
-        sparse: Union[bool, SlidingWindowSparsityConfig] = False,
+        sparse: Union[bool, int] = False,
         learned_queries: int = None,
-        # num_special_tokens: int = 1     # Number of leading special tokens exempted from causal masking
     ):
         super().__init__()
 
         self.causal = causal
         self.d_model = d_model
         self.num_heads = num_heads
-        # self.num_special_tokens = num_special_tokens
         assert d_model % num_heads == 0, "num_heads must divide d_model evenly"
 
         # We can use learned queries to extract a single vector or a fixed size sequence of vectors out of a sequence
@@ -36,23 +34,14 @@ class Attention(nn.Module):
         self.k_linear = nn.Linear(d_model, d_model)
         self.v_linear = nn.Linear(d_model, d_model)
         self.output_linear = nn.Linear(d_model, d_model)
+        self.pos_linear = nn.Linear(d_model, d_model)
 
         self.cache_index = 0
         self.key_cache = None
         self.value_cache = None
 
         if sparse:
-            from deepspeed.ops.sparse_attention import SparseSelfAttention
-            if isinstance(sparse, SlidingWindowSparsityConfig):
-                config = sparse
-            else:
-                config = SlidingWindowSparsityConfig(num_heads=num_heads, window_size=4)
-
-            self.sparse_attention = SparseSelfAttention(
-                sparsity_config=config,
-                attn_mask_mode='add',
-                max_seq_length=25_008
-            )
+            self.sparse_attention = SparseAttention(window_size=sparse if isinstance(sparse, int) else 4)
         else:
             self.sparse_attention = None
 
@@ -62,11 +51,13 @@ class Attention(nn.Module):
             q = self.learned_queries.expand(k.shape[0], *self.learned_queries.shape[1:])
         else:
             # Position-Infused Attention from "Shortformer" paper
-            q = q + positional_encodings_like(q, self.cache_index)
-            q = self.q_linear(q)
+            q = self.q_linear(q + positional_encodings_like(q, self.cache_index))
+            # q = self.q_linear(q)
+            # q = encode_position_rotary(q)
 
         k = k + positional_encodings_like(k, self.cache_index)
         k, v = self.k_linear(k), self.v_linear(v)
+        # k = encode_position_rotary(k)
         if self.kv_cache_length:
             k, v = self._update_kv_cache(k, v)
 
@@ -109,9 +100,9 @@ class Attention(nn.Module):
         # When we're using sparse attention, we only need to cache the keys and values that are
         # actually going to be attended to
         if self.sparse_attention:
-            config = self.sparse_attention.sparsity_config
+            config = self.sparse_attention
             num_blocks = config.window_size + int(config.include_cls)
-            block_size = config.block
+            block_size = config.block_size
             cache_length, cache_offset = num_blocks * block_size, int(config.include_cls) * block_size
         else:
             cache_length, cache_offset = self.kv_cache_length, 0
@@ -179,10 +170,31 @@ def get_positional_encodings(start: int, end: int, d_model: int, device, dtype) 
 def gather_positional_encodings(positions: Tensor, d_model: int, device: torch.device, dtype: torch.dtype) -> Tensor:
     d_model_half = d_model // 2
     frequencies = torch.arange(d_model_half, dtype=dtype, device=device)
-    periods = 1 / (10000 ** (frequencies / d_model_half))
+    periods = 10000 ** (-frequencies / d_model_half)
 
     angles = positions[:, None] * periods[None]  # noqa; Outer product
     encodings = torch.empty(positions.shape[0], d_model, dtype=dtype, device=device)
     encodings[:, ::2] = angles.sin()
     encodings[:, 1::2] = angles.cos()
     return encodings
+
+
+# Encode positional information in a sequence of query or key vectors by *rotating* each vector
+# by an angle proportional to their position in the sequence. This has the effect that inner
+# products between queries and keys are scaled in proportion to the cosine of their scaled
+# relative distances.
+def encode_position_rotary(x: Tensor):
+    d_model_half = x.shape[-1] // 2
+    frequencies = torch.arange(d_model_half, dtype=x.dtype, device=x.device)
+    positions = torch.arange(x.shape[-2], dtype=x.dtype, device=x.device)
+    theta = 10000 ** (-frequencies / d_model_half)  # [d_model_half]
+    angles = positions[:, None] * theta             # [seq_len, d_model_half]
+
+    x_grouped = x.unflatten(-1, (d_model_half, 2))  # [...seq_len, d_model_half, 2]
+    x_swapped = x_grouped.roll(1, dims=-1)
+    x_swapped[..., 0].neg_()
+    x_grouped *= angles[..., None].cos()
+    x_swapped *= angles[..., None].sin()
+
+    x_grouped += x_swapped
+    return x_grouped.flatten(-2)

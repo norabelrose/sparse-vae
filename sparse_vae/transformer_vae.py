@@ -1,135 +1,106 @@
 from .core import (
     Attention, GenerationState,
     ConditionalGaussian, ContinuousVAE, ContinuousVAEHparams, PaddedTensor, Perceiver,
-    Transformer, TransformerHparams, custom_gaussian_rbf_mmd_sq, mutual_info_monte_carlo
+    Transformer, TransformerLanguageModel, TransformerHparams, marginal_kl
 )
 from copy import deepcopy
 from dataclasses import dataclass
-from itertools import chain
 from omegaconf import DictConfig
 from torch import nn, Tensor
 from torch.utils.checkpoint import checkpoint
 from typing import *
 import torch
-import torch.nn.functional as F
 
 
 @dataclass
 class TransformerVAEHparams(TransformerHparams, ContinuousVAEHparams):
     latent_depth: int = 64
-    mutual_info_mean: float = 100.0
-    mutual_info_sd: float = 4.0
-    mmd: bool = False
+    pretrained_encoder: bool = False
+    pretrained_decoder: bool = False
+    use_gpt2: bool = False
     early_stopping_metric: str = 'val_nll'
 
 
-class TransformerVAE(Transformer, ContinuousVAE):
+class TransformerVAE(TransformerLanguageModel, ContinuousVAE):
     def __init__(self, hparams: DictConfig):
         super().__init__(hparams)
         self.example_input_array = None
 
         self.encoder_input_layer = deepcopy(self.input_layer)
         self.encoder_input_layer[0].weight = self.input_layer[0].weight
+        self.q_of_z_given_x = ConditionalGaussian(hparams.d_model, hparams.latent_depth)
 
-        if self.hparams.mmd:
-            self.bottleneck = nn.Linear(hparams.d_model, hparams.latent_depth)
-
-            # The Langrangian multiplier is optimized "adversarially" to maximize the loss.
-            # To prevent it from diverging to infinity when the MMD isn't exactly zero, we
-            # use a "slack" of 0.05 and decay the multiplier when the MMD is within the slack
-            self.lambda_mmd = nn.Parameter(torch.tensor(0.01))
-            self.lambda_mmd.register_hook(lambda grad: -grad + 3.0)
-        else:
-            self.q_of_z_given_x = ConditionalGaussian(hparams.d_model, hparams.latent_depth)
+        # if hparams.use_gpt2:
+        #     from transformers import GPT2LMHeadModel, GPT2Config
+#
+        #     if hparams.pretrained_decoder:
+        #         # Distilled 6-layer version of GPT-2
+        #         self.decoder = GPT2LMHeadModel.from_pretrained('distilgpt2')
+        #         if hparams.sparse_self_attention:
+        #             from deepspeed.ops.sparse_attention import SparseAttentionUtils
+#
+        #             SparseAttentionUtils.extend_position_embedding(self.decoder, max_position=25_008)
+        #             SparseAttentionUtils.replace_model_self_attention_with_sparse_self_attention(
+        #                 self.decoder, max_position=25_008,
+        #                 sparsity_config=SlidingWindowSparsityConfig(num_heads=8, window_size=hparams.attn_window_size)
+        #             )
+        #     else:
+        #         self.decoder = GPT2LMHeadModel(GPT2Config.from_pretrained('distilgpt2'))
+        # else:
+        #     self.decoder = Transformer(num_layers=hparams.num_layers, d_model=hparams.d_model)
 
         self.encoder = Perceiver(
-            num_layers=min(3, hparams.num_layers), num_latents=64, d_model=hparams.d_model, bottleneck_width=1
+            num_layers=hparams.num_layers // 2, num_latents=64, d_model=hparams.d_model, bottleneck_width=1
         )
         self.z_projections = nn.ModuleList([
             nn.Linear(hparams.latent_depth, hparams.d_model)
             for _ in range(hparams.num_layers)
         ])
 
-    def decoder_params(self) -> Iterable[nn.Parameter]:
-        return chain(
-            self.context_layer.parameters(),
-            self.decoder_layers.parameters(),
-            self.output_layer.parameters()
-        )
-
-    # Returns q(z|x)- only used for the console interface
-    def encode(self, tokens: Tensor):
-        x = self.input_layer(tokens)
-        encoder_out = self.encoder(x)
-        return self.q_of_z_given_x(encoder_out)
-
     def training_step(self, batch: Dict[str, PaddedTensor], batch_index: int, stage: str = 'train'):
         original = batch['token_ids'].long()
-        if original.shape[0] <= 1:
-            return None
+        if original.numel() > 2 ** 16:
+            breakpoint()
 
         x = self.input_layer(original)
         encoder_out = self.encoder(x)
 
-        if self.hparams.mmd:
-            var = self.prior_logvar.exp()
-            z = self.bottleneck(encoder_out)
-            z = F.layer_norm(z, [z.shape[-1]], var.sqrt(), self.prior_mean)
+        z, kl, posterior = self.sample_z(encoder_out, token_counts=batch['num_tokens'], stage=stage)
 
-            # z = self.code_norm(z.squeeze(-2)).unsqueeze(-2)
-            # z = self.code_norm(z)
-            mmd = custom_gaussian_rbf_mmd_sq(z.view(z.shape[0], -1), self.prior_mean, var)
-            # mmd = # analytic_gaussian_rbf_mmd_sq(z.view(z.shape[0], -1))
+        logits = self.reconstruct(x, z)[..., :-1, :]
+        nll = self.get_nll(
+            logits, original[..., 1:], stage=stage,
+            bytes_per_token=batch['num_bytes'] / batch['num_tokens'] if stage == 'val' else None
+        )
+        loss = nll + self.hparams.kl_weight * kl
 
-            logits = self.reconstruct(x, z)[..., :-1, :]
-            nll = self.get_nll(logits, original[..., 1:], stage=stage)
-
-            loss = nll + self.lambda_mmd * mmd  # torch.clamp(mmd - 2.0, 0.0)
-            self.log('lambda_mmd', self.lambda_mmd.data)
-            self.log(stage + '_mmd', mmd)
-
-            var, mean = torch.var_mean(z, dim=0)
-            residuals = z - mean
-
-            self.log('z_mean', mean.mean())
-            self.log('z_var', var.mean())
-            self.log('z_skew', (residuals / var.sqrt()).pow(3.0).mean())
-            self.log('z_kurtosis', (residuals.pow(4.0) / var.pow(2.0)).mean())
-
-            if stage == 'train':
-                return {'loss': loss, 'z': z}
-            elif stage == 'val':
-                self.log('val_loss', loss)
-        else:
-            z, kl, posterior = self.sample_z(encoder_out, token_counts=batch['token_count'], stage=stage)
-
-            logits = self.reconstruct(x, z)[..., :-1, :]
-            nll = self.get_nll(logits, original[..., 1:], byte_counts=batch['num_bytes'], stage=stage)
-            loss = nll + self.hparams.kl_weight * kl
-
-            mutual_info = mutual_info_monte_carlo(posterior)
-            # self.log(stage + '_mutual_info', mutual_info)
+        # There appears to be a minor bug in our batch creation code- there really shouldn't be any
+        # batches that have only one document in them, but there seem to be
+        if original.shape[0] > 1:
+            mutual_info = kl - marginal_kl(posterior)
             self.log(stage + '_mc_mutual_info', mutual_info)
-            if mi_mode := self.hparams.mutual_info_mean:
-                loss = loss + 0.5 * (mutual_info - mi_mode) ** 2 / (x.shape[-2] * self.hparams.mutual_info_sd ** 2)
 
-            if stage == 'train':
-                return {'loss': loss, 'posterior': posterior}
-            elif stage == 'val':
-                self.log('val_loss', nll + kl)
+        if stage == 'train':
+            return {'loss': loss, 'posterior': posterior}
+        elif stage == 'val':
+            self.log('val_loss', nll + kl)
 
     def validation_step(self, batch: Dict[str, PaddedTensor], batch_index: int):
         return self.training_step(batch, batch_index, stage='val')
 
     def test_step(self, batch: Dict[str, PaddedTensor], batch_index: int):
-        original = batch['token_ids']
+        original = batch['token_ids'].long()
         x = self.input_layer(original)
 
-        posterior = self.q_of_z_given_x(self.encoder(x).squeeze(-2))
-        log_prob = self.estimate_log_prob_iw(posterior, x, original, num_samples=100, num_iter=20) / batch['token_count']
+        posterior = self.q_of_z_given_x(self.encoder(x))
+        log_prob = self.estimate_log_prob_iw(posterior, x, original, num_samples=100, num_iter=100) / batch['num_tokens']
         nll_iw = -log_prob.mean()
         self.log('nll_iw', nll_iw, on_step=True)
         return nll_iw
+
+    def predict(self, batch: Any, batch_idx: int, dataloader_idx: Optional[int] = None):
+        x = self.input_layer(batch['token_ids'].long())
+        return self.q_of_z_given_x(self.encoder(x), get_kl=False)
 
     def reconstruct(self, x, z) -> Tensor:
         should_checkpoint = self.hparams.grad_checkpointing and x.requires_grad
@@ -147,6 +118,7 @@ class TransformerVAE(Transformer, ContinuousVAE):
         if self.hparams.kl_weight < 1.0:
             return None
 
+        # noinspection PyUnreachableCode
         z = kwargs.pop('z', None)
         if z is None:
             z = torch.randn(batch_size, 1, self.hparams.latent_depth, device=self.device)
@@ -155,6 +127,7 @@ class TransformerVAE(Transformer, ContinuousVAE):
         state = GenerationState(
             max_length, batch_size, self.start_token, self.end_token, device=self.device, **kwargs
         )
+        state.current_index = 1
         state.output_ids[:, 0] = self.start_token
 
         with Attention.kv_cache(max_length):

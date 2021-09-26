@@ -13,7 +13,7 @@ def reconstruction_bleu(output: Tensor, originals: Tensor):
     def compute_ngram_score(x, ground_truth):
         x, ground_truth = x.sort().values, ground_truth.sort().values
         true_ngrams, true_counts = ground_truth.unique_consecutive(return_counts=True)
-        x_ngrams , x_counts = x.unique_consecutive(return_counts=True)
+        x_ngrams, x_counts = x.unique_consecutive(return_counts=True)
 
         combined = torch.cat([x_ngrams, true_ngrams], dim=-1).sort().values
         matching_ngrams, matching_counts = combined.unique_consecutive(return_counts=True)
@@ -47,87 +47,15 @@ def std_gaussian_kl(p: Normal):
     inv_var = p.variance.reciprocal()
     return 0.5 * (-inv_var.log().sum(dim=-1) + inv_var.sum(dim=-1) + bdot(p.mean ** 2, inv_var) - inv_var.shape[-1])
 
-# Attempt to compute a not-so-biased estimate of the mutual info by averaging a lower and an upper bound
-def mutual_info_monte_carlo(posteriors: Normal, num_samples: int = 10):
+# Approximates KL(q(z)||p(z)) where p(z) is N(0, I)
+def marginal_kl(posteriors: Normal, num_samples: int = 10):
     samples = posteriors.rsample([num_samples])
-    batch, dim = samples.shape[1], samples.shape[-1]
 
-    # Including the posterior from which each sample came from to estimate q(z) gives a lower bound on the MI
     cross_probs = posteriors.log_prob(samples[:, :, None]).sum(dim=-1)
-    full_marginals = cross_probs.logsumexp(dim=2) - math.log(batch)
+    marginal_prob = cross_probs.logsumexp(dim=2) - math.log(samples.shape[1])
 
-    # Use a 'leave-one-out' estimator for the marginal distribution, excluding the posterior from which each
-    # sample came from, in order to get an upper bound on the MI
-    huge = torch.finfo(cross_probs.dtype).max
-    loo_probs = cross_probs - torch.eye(batch, device=cross_probs.device).unsqueeze(-1) * huge
-    loo_marginals = loo_probs.logsumexp(dim=2) - math.log(batch - 1)
-    neg_entropy = -posteriors.entropy().sum(dim=-1).mean()
-
-    return neg_entropy - (full_marginals.mean() + loo_marginals.mean()) / 2
-
-def mutual_info_jackknife(posteriors: Normal, num_samples: int = 10):
-    neg_entropy = -posteriors.entropy().sum(dim=-1).mean()
-    return neg_entropy - marginal_entropy_jackknife(posteriors, num_samples)
-
-def marginal_entropy_jackknife(posteriors: Normal, num_samples: int = 10):
-    samples = posteriors.rsample([num_samples])
-    batch = samples.shape[1]
-
-    cross_log_probs = posteriors.log_prob(samples[:, :, None]).sum(dim=-1)
-    naive_sums = cross_log_probs.logsumexp(dim=2)
-    loo_sums = naive_sums[:, :, None].sub(cross_log_probs).expm1().add(1e-7).log() + cross_log_probs
-
-    naive_marginal = naive_sums.mean() - math.log(batch)
-    loo_marginal = loo_sums.mean() - math.log(batch - 1)
-    jackknife_bias = (batch - 1) * (loo_marginal - naive_marginal)
-    return naive_marginal - jackknife_bias
-
-def mutual_info_variational(posteriors: Normal):
-    mu_var, mu_mean = torch.var_mean(posteriors.mean, dim=0, unbiased=False)
-    var_mean = posteriors.variance.mean(dim=0)
-    q_star = Normal(loc=mu_mean, scale=torch.sqrt(var_mean + mu_var))
-    return kl_divergence(posteriors, q_star).sum(dim=-1).mean()
-
-def gaussian_mixture_std_kl_approx(p: Normal) -> Tensor:
-    batch, dim = p.scale.flatten(1).shape
-    z_a_alpha = pairwise_gaussian_log_product_normalizer(p)
-    lf_f = z_a_alpha.logsumexp(dim=-1) - math.log(batch)
-
-    p_neg_entropy = pairwise_gaussian_kl(p).neg().logsumexp(dim=-1) - math.log(batch)
-    normalizer = -0.5 * (math.log(2.0 * math.pi) * dim - p.variance.log1p().sum(dim=-1) + p.mean.pow(2.0).sum(dim=-1))
-    return (lf_f.mean() + std_gaussian_kl(p).mean() + p_neg_entropy.mean() - normalizer.mean()) / 2
-
-# Upper bound on KL(P || N(0, I)) where P is a Gaussian mixture with equal component weights
-def gaussian_mixture_std_kl_upper_bound(p: Normal) -> Tensor:
-    z_a_alpha = pairwise_gaussian_log_product_normalizer(p)
-    lf_f = z_a_alpha.logsumexp(dim=-1) - math.log(z_a_alpha.shape[0])            # Upper bound
-    lf_g = -std_gaussian_kl(p).mean() - multivariate_gaussian_entropy(p).mean()  # Lower bound
-
-    return lf_f.mean() - lf_g.mean()
-
-def gaussian_mixture_std_kl_lower_bound(p: Normal) -> Tensor:
-    batch, dim = p.scale.flatten(1).shape
-    p_neg_entropy = pairwise_gaussian_kl(p).neg().logsumexp(dim=-1) - math.log(batch)
-    std_normalizer = -0.5 * (math.log(2.0 * math.pi) * dim - p.variance.log1p().sum(dim=-1) + p.mean.pow(2.0).sum(dim=-1))
-    return p_neg_entropy.mean() - std_normalizer.mean()
-
-# Variational approximation to KL(P || N(0, I)) where P is a Gaussian mixture with equal component weights
-def gaussian_mixture_std_kl_variational(p: Normal) -> Tensor:
-    neg_kls = -pairwise_gaussian_kl(p)
-    p_neg_entropy = neg_kls.logsumexp(dim=-1) - math.log(neg_kls.shape[0])
-    return p_neg_entropy.mean() + std_gaussian_kl(p).mean()
-
-# Compute the log of the normalizing constant for all the pairwise products
-def pairwise_gaussian_log_product_normalizer(gaussians: Normal) -> Tensor:
-    var = gaussians.variance                    # [A, dim]
-    var_sums = var[:, None] + var               # [A, B, dim]
-    inv_var_sums = var_sums.reciprocal()
-    log_cov_det = var_sums.log().sum(dim=-1)    # [A, B]
-
-    mean = gaussians.mean                       # [A, dim]
-    mean_diffs = mean[:, None] - mean           # [A, B, dim]
-    quadratic_form = bdot(mean_diffs, mean_diffs * inv_var_sums)
-    return -0.5 * (var.shape[-1] * math.log(2 * math.pi) + log_cov_det + quadratic_form)
+    sample_prob = -0.5 * (samples.pow(2.0).sum(dim=-1).mean() + samples.shape[-1] * math.log(2 * math.pi))
+    return sample_prob - marginal_prob.mean()
 
 # Convenience function to efficiently compute the entropies of a batch of multivariate Gaussians,
 # reducing across the last dimension.
@@ -156,16 +84,6 @@ def pairwise_gaussian_cross_entropy(gaussians: Normal) -> Tensor:
 
     return trace_log_sigma + 0.5 * (var_p @ inv_var_q + weighted_dists + var_p.shape[-1] * math.log(2 * math.pi))
 
-def multivariate_gaussian_kl(p: Normal, q: Normal) -> Tensor:
-    log_sigma_ratio = q.scale.log().sum(dim=-1) - p.scale.log().sum(dim=-1)
-
-    var_p = p.variance.flatten(1)  # Covariance matrix diagonals
-    inv_var_q = q.variance.flatten(1).T.reciprocal()
-
-    mu_p, mu_q = p.mean.view(*var_p.shape), q.mean.view(*var_p.shape)
-    weighted_dists = (mu_p ** 2 @ inv_var_q) - 2 * mu_p @ (mu_p.T * inv_var_q) + (mu_q ** 2 @ inv_var_q)
-
-    return log_sigma_ratio + 0.5 * (var_p @ inv_var_q + weighted_dists - var_p.shape[-1])
 
 # Efficiently compute all the pairwise KL divergences for a batch of multivariate Gaussians. Returns
 # a square matrix of the form [P, Q]; i.e. the KL from the first to the second Gaussian is at [0, 1]

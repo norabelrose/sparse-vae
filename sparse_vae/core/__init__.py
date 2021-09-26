@@ -7,5 +7,7 @@ from .language_model import *
 from .math_utils import *
 from .padded_tensor import PaddedTensor
 from .perceiver import Perceiver
-from .transformer import *
+from .rectified_adam import RAdam
+from .transformer import Transformer
+from .transformer_language_model import *
 from .transformer_layer import *

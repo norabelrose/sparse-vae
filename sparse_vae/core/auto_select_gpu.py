@@ -1,6 +1,11 @@
 # Uses pynvml to select the index of the least-used GPU with sufficient free memory.
 # The `min_free_memory` argument is interpreted in gigabytes
 def select_best_gpu(min_free_memory: float = 35.0) -> int:
+    # There's only one GPU available, just
+    from torch.cuda import device_count
+    if device_count() <= 1:
+        return 0
+
     from pynvml import (
         nvmlInit,
         nvmlDeviceGetCount,
@@ -14,8 +19,10 @@ def select_best_gpu(min_free_memory: float = 35.0) -> int:
 
     nvmlInit()
     num_gpus = nvmlDeviceGetCount()
-    handles = [nvmlDeviceGetHandleByIndex(i) for i in range(num_gpus)]
+    if num_gpus == 1:
+        return 0
 
+    handles = [nvmlDeviceGetHandleByIndex(i) for i in range(num_gpus)]
     polling_msg_shown = False
     while True:
         candidates = list(filter(lambda handle: nvmlDeviceGetMemoryInfo(handle).free >= min_free_memory * 1e9, handles))

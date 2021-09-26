@@ -16,10 +16,6 @@ class LSTMVAEHparams(ContinuousVAEHparams):
 
     bidirectional_encoder: bool = False
     transformer_encoder: bool = False
-    decoder_input_dropout: float = 0.0      # Should make decoder pay more attention to the latents
-    decoder_output_dropout: float = 0.0     # Sort of like label smoothing?
-
-    divide_loss_by_length: bool = True
     tie_embedding_weights: bool = True  # Tie the decoder's embedding weights to the encoder's embedding weights
 
     d_embedding: int = 512  # Dimensionality of the input embedding vectors
@@ -82,17 +78,7 @@ class LSTMVAE(ContinuousVAE):
         self.q_of_z_given_x = ConditionalGaussian(hidden_size, hparams.latent_depth)
         self.z_to_hidden = nn.Linear(hparams.latent_depth, hparams.d_model)
 
-        self.dropout_in = nn.Dropout(hparams.decoder_input_dropout)
-        self.dropout_out = nn.Dropout(hparams.decoder_output_dropout)
-
         self.initialize_weights()
-
-    def decoder_params(self) -> Iterable[nn.Parameter]:
-        return chain(
-            self.decoder.parameters(),
-            self.decoder_embedding.parameters(),
-            self.output_layer.parameters()
-        )
 
     def forward(self, x):
         if self.hparams.transformer_encoder:
@@ -124,11 +110,11 @@ class LSTMVAE(ContinuousVAE):
 
         # Single-sample VAE objective
         else:
-            z, kl, posterior = self.sample_z(last_state, token_counts=batch['token_count'], stage=stage)
+            z, kl, posterior = self.sample_z(last_state, token_counts=batch['num_tokens'], stage=stage)
             if not self.hparams.tie_embedding_weights:
                 x = self.decoder_embedding(original)
 
-            logits = self.reconstruct(self.dropout_in(x), z)[..., :-1, :]  # Remove [SEP]
+            logits = self.reconstruct(x, z)[..., :-1, :]  # Remove [SEP]
             nll = self.get_nll(logits, original[..., 1:])
 
             loss = (nll + self.hparams.kl_weight * kl)
@@ -144,15 +130,19 @@ class LSTMVAE(ContinuousVAE):
         return self.training_step(batch, batch_index, stage='val')
 
     def test_step(self, batch: Dict[str, Tensor], batch_index: int):
-        original = batch['token_ids']
+        original = batch['token_ids'].long()
         x = self.encoder_embedding(original)
 
         posterior = self.q_of_z_given_x(self.forward(x))
         log_prob = self.estimate_log_prob_iw(posterior, x, original, num_samples=100, num_iter=20) / batch[
-            'token_count']
+            'num_tokens']
         nll_iw = -log_prob.mean()
         self.log('nll_iw', nll_iw, on_step=True)
         return nll_iw
+
+    def predict(self, batch: Any, batch_idx: int, dataloader_idx: Optional[int] = None):
+        x = self.encoder_embedding(batch['token_ids'].long())
+        return self.q_of_z_given_x(self.forward(x), get_kl=False)
 
     # x should be a batch of sequences of token embeddings and z a batch of single latent vectors; both
     # tensors may have a leading num_samples dimension if we're using a multi-sample Monte Carlo objective.

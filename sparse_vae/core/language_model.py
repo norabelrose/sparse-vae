@@ -1,47 +1,43 @@
 import math
+from typing import Dict, Optional
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+
 from abc import ABC
 from dataclasses import dataclass
-from einops import rearrange
 from functools import partial
 from omegaconf import DictConfig
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.utilities.parsing import AttributeDict
 from torch import nn, Tensor
 from torch.optim.lr_scheduler import LambdaLR
-from typing import *
 from .padded_tensor import PaddedTensor
+from .rectified_adam import RAdam
 from .text_sampling_callback import TextSamplingCallback
 
 
 @dataclass
 class LanguageModelHparams(ABC):
-    batch_size: int = 0                 # Just for compatibility with pl.Trainer's auto_scale_batch_size feature
     grad_clip_threshold: float = 5.0
-    init_scale: Optional[float] = 0.02  # Stddev of Gaussian weight initialization. If None, default PyTorch init. is used
-    lr: float = 3e-4
-    lr_decay_steps: Optional[int] = 250_000
-    lr_plateau_patience: Optional[int] = None  # If non-None, ReduceLROnPlateau scheduler is used w/ specified patience
-    warmup_steps: int = 1000
+    init_scale: Optional[float] = 0.02  # Stddev of Gaussian weight init. If None, default PyTorch init. is used
 
-    # If beta2 ie set to 0.0, we just use SGD (with momentum set to beta1)- useful for replicating papers that use it
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_eps: float = 1e-6              # We need to use 1e-6 since 1e-8 underflows to 0 on fp16
-    weight_decay: float = 0.01
+    base_batch_size: int = 100_000      # Base batch size for sqrt learning rate scaling
+    lr: float = 2e-4
+    lr_decay_steps: Optional[int] = 250_000
 
     vocab_size: int = 2 ** 15           # Maximum number of tokens representable with signed 16-bit integers
     start_token: Optional[int] = None   # If None, it's read off the datamodule's Tokenizer object
     end_token: Optional[int] = None
 
-    divide_loss_by_length: bool = True
     early_stopping_metric: str = 'val_nll'
     log_samples: bool = True
 
 
 # noinspection PyMethodMayBeStatic
 class LanguageModel(pl.LightningModule, ABC):
+    hparams: AttributeDict  # Make the type checker happy
+    
     def __init__(self, hparams: DictConfig):
         super(LanguageModel, self).__init__()
         self.save_hyperparameters(hparams)
@@ -57,6 +53,7 @@ class LanguageModel(pl.LightningModule, ABC):
         metric = self.hparams.early_stopping_metric
         callbacks = [
             EarlyStopping(monitor=metric, mode='min'),
+            LearningRateMonitor(logging_interval='step'),
             ModelCheckpoint(monitor=metric, mode='min')
         ]
         return callbacks + [TextSamplingCallback()] if self.hparams.log_samples else callbacks
@@ -65,31 +62,22 @@ class LanguageModel(pl.LightningModule, ABC):
     def setup(self, stage: str):
         datamodule = self.trainer.datamodule if stage in ('fit', 'test') else self.datamodule
         self.tokenizer = datamodule.tokenizer
+        self.register_buffer('token_weights', datamodule.bytes_per_token.half())
 
         if not self.start_token and not self.end_token:
             vocab = self.tokenizer.get_vocab()
             self.start_token = vocab['[CLS]']
             self.end_token = vocab['[SEP]']
 
-    def configure_optimizers(self, lr: float = None, params = None):
-        beta1, beta2 = self.hparams.adam_beta1, self.hparams.adam_beta2
-        try:
-            from deepspeed.ops.adam import FusedAdam as Adam
-        except ImportError:
-            print("Couldn't import fused Adam kernel from DeepSpeed, falling back on PyTorch version.")
-            from torch.optim import Adam
-
-        adam = Adam(
-            params or self.parameters(),
-            lr=lr or self.hparams.lr,
-            betas=(beta1, beta2),
-            weight_decay=self.hparams.weight_decay,
-            eps=self.hparams.adam_eps
-        )
-
-        lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, self.hparams.warmup_steps)
-        return [adam], [{
-            'scheduler': LambdaLR(adam, lr_lambda),
+    def configure_optimizers(self):
+        batch_size = self.trainer.datamodule.hparams.tokens_per_batch * self.trainer.accumulate_grad_batches
+        lr_scale_factor = (batch_size / self.hparams.base_batch_size) ** 0.5    # sqrt lr scaling
+        # opt = FusedLamb(self.parameters(), lr=self.hparams.lr * lr_scale_factor, weight_decay=0.01)
+        opt = RAdam(self.parameters(), lr=self.hparams.lr * lr_scale_factor, weight_decay=0.01)
+        lr_lambda = partial(cosine_decay, self.hparams.lr_decay_steps)
+        # lr_lambda = get_cosine_decay_with_warmup_schedule(self.hparams.lr_decay_steps, 4000)
+        return [opt], [{
+            'scheduler': LambdaLR(opt, lr_lambda),
             'interval': 'step'
         }]
 
@@ -103,7 +91,7 @@ class LanguageModel(pl.LightningModule, ABC):
             if isinstance(module, (nn.BatchNorm1d, nn.LayerNorm)):
                 continue
 
-            if hasattr(module, 'weight'):
+            if isinstance(module, (nn.Embedding, nn.Linear)):
                 module.weight.data.normal_(0.0, scale)
 
             bias = getattr(module, 'bias', None)
@@ -111,32 +99,19 @@ class LanguageModel(pl.LightningModule, ABC):
             if bias is not None:
                 bias.zero_()
 
-    def get_nll(self, logits: Tensor, labels: Tensor, byte_counts: Tensor = None, char_counts: Tensor = None,
-                stage: str = 'train'):
+    def get_nll(self, logits: Tensor, labels: Tensor, stage: str = 'train', bytes_per_token: Tensor = None):
         # Expand the labels across any extra batch dimensions that might exist in the logits tensor
         if extra_dims := logits.ndim - labels.ndim - 1:
             labels = labels.expand(*logits.shape[:extra_dims], *labels.shape)
 
-        log_probs = rearrange(logits, '... n c -> n c ...').log_softmax(dim=1)
-        labels = rearrange(labels, '... n -> n ...')
+        nll = robust_cross_entropy(logits, labels)
+        # nll = F.cross_entropy(logits, labels, ignore_index=0)
 
-        divide_by_length = self.hparams.divide_loss_by_length
-        if not divide_by_length:
-            nll = F.nll_loss(log_probs, labels, ignore_index=0, reduction='sum') / labels.shape[1]
-        else:
-            nll = F.nll_loss(log_probs, labels, ignore_index=0)
-
-        if stage == 'val' and char_counts is not None:
-            # We have to do this ugly hack because nll_loss() throws an error when reduction='none' and the
-            # logits tensor has more than 2 ** 31 elements; see PyTorch issue #24401
-            log_probs[..., 0] = 0.0
-            nll_sum = -log_probs.gather(dim=1, index=labels.unsqueeze(1)).squeeze(1).sum(dim=0)
-            bits = nll_sum / math.log(2)
-            bits_per_char = bits / char_counts
-            self.log('val_bpc', bits_per_char.mean())
-            if byte_counts is not None:
-                bits_per_byte = bits / byte_counts
-                self.log('val_bpb', bits_per_byte.mean())
+        if stage == 'val' and bytes_per_token is not None:
+            # logits = rearrange(logits, 'batch length vocab -> batch vocab length')
+            nats_per_byte = robust_cross_entropy(logits, labels, weight=self.token_weights) * bytes_per_token
+            # nats_per_byte = F.cross_entropy(logits, labels, weight=self.token_weights, ignore_index=0)
+            self.log('val_bpb', nats_per_byte / math.log(2))
 
         self.log(stage + '_nll', nll)
         return nll
@@ -146,14 +121,24 @@ class LanguageModel(pl.LightningModule, ABC):
         logits = self.forward(batch)[..., :-1, :]
         return self.get_nll(logits, batch['token_ids'][..., 1:].long())
 
+    # def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int, dataloader_idx: int):
+    #     if self.global_step > 0 and self.global_step % 500 == 0:
+    #         logger = self.logger.experiment
+    #         opt = self.optimizers(use_pl_optimizer=False)
+    #         ratios = [opt.state[param].get('trust_ratio') for param in self.parameters()]
+    #         logger.add_histogram(
+    #             'trust_ratios',
+    #             torch.stack([ratio for ratio in ratios if ratio is not None]),  # noqa
+    #             global_step=self.global_step
+    #         )
+
     def on_after_backward(self):
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
         self.log('grad_norm', grad_norm)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         logits = self.forward(batch)[..., :-1, :]
-        return self.get_nll(logits, batch['token_ids'][..., 1:].long(), byte_counts=batch.get('num_bytes'),
-                            char_counts=batch.get('num_char'), stage='val')
+        return self.get_nll(logits, batch['token_ids'][..., 1:].long(), stage='val')
 
     def test_step(self, batch: Dict[str, Tensor], batch_index: int):
         return self.validation_step(batch, batch_index)
@@ -161,6 +146,14 @@ class LanguageModel(pl.LightningModule, ABC):
     # Called by UnconditionalSampler callback
     def sample(self, max_length: int, batch_size: int = 1, **kwargs):
         return None
+
+def cosine_decay(decay_steps: int, cur_step: int):
+    progress = cur_step / max(1, decay_steps)
+    if progress >= 1.0:
+        print("Learning rate decayed to 0.0. Halting training.")
+        raise KeyboardInterrupt
+
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 # The actual lambda to pass into LambdaLR
 def cosine_decay_with_warmup(decay_steps: int, warmup_steps: int, cur_step: int):
@@ -179,3 +172,14 @@ def cosine_decay_with_warmup(decay_steps: int, warmup_steps: int, cur_step: int)
 # Convenience function
 def get_cosine_decay_with_warmup_schedule(decay_steps: int, warmup_steps: int):
     return partial(cosine_decay_with_warmup, decay_steps, warmup_steps)
+
+def robust_cross_entropy(logits, labels, weight = None):
+    # logits, labels = logits.flatten(end_dim=1), labels.flatten()
+    chunks = (logits.numel() // 2 ** 31) + 1
+    if chunks == 1:
+        return F.cross_entropy(logits.flatten(end_dim=1), labels.flatten(), ignore_index=0, weight=weight)
+    else:
+        return torch.stack([
+            F.cross_entropy(logit_chunk.flatten(end_dim=1), label_chunk.flatten(), ignore_index=0, weight=weight)
+            for logit_chunk, label_chunk in zip(logits.chunk(chunks, dim=-2), labels.chunk(chunks, dim=-1))
+        ]).mean()

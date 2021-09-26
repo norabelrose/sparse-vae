@@ -2,9 +2,11 @@ from dataclasses import dataclass
 from datasets import Dataset, DatasetDict
 from itertools import chain
 from tokenizers import Tokenizer
-from typing import Dict, Iterable, List, Tuple, Union
+from typing import Dict, List, Tuple, Union
 import numpy as np
 import random
+
+from torch.utils.data.sampler import Sampler
 
 
 # Convert text into WordPiece tokens, while also saving some important stats. This is set up as a freestanding
@@ -16,23 +18,11 @@ def tokenize(batch, tokenizer: Tokenizer, chunk: bool) -> Dict[str, list]:
         raw_encodings = [[x] + x.overflowing for x in raw_encodings]
         raw_encodings = list(chain.from_iterable(raw_encodings))
 
-    char_counts, token_ids, word_ids = [], [], []
-    for encoding, original in zip(raw_encodings, raw_text):
-        ids = encoding.ids
-        # if min_tokens <= len(ids) <= max_tokens:
-        char_counts.append(len(original))
-        token_ids.append(ids)
-
-        # The Encoding.word_ids property has a None element for special tokens,
-        # but it's easier to work with if we use -1
-        word_ids.append([-1 if w is None else w for w in encoding.word_ids])
-
+    token_ids = [encoding.ids for encoding in raw_encodings]
     return {
         'text': token_ids,
         'num_bytes': [len(bytes(x, 'utf8')) for x in raw_text],
-        'num_char': char_counts,
-        'num_tokens': [len(x) for x in token_ids],
-        'num_words': [max(words) for words in word_ids]
+        'num_tokens': [len(x) for x in token_ids]
     }
 
 
@@ -57,11 +47,58 @@ class PrebatchedRandomSampler:
             raise StopIteration
 
         start, length = self.remaining_batches.pop()
-        while length <= 0:
-            start, length = self.remaining_batches.pop()
-            print(f"Warning: Found zero-length batch w/ start index {start}. Skipping...")
-
+        assert length > 0, "Something's wrong, found a found zero-length batch"
         return list(range(start, start + length))
+
+
+@dataclass
+class UniformSizeRandomSampler(Sampler):
+    documents: List[Tuple[int, int]]  # (document index, length bin) tuples
+    max_size: int
+
+    def __post_init__(self):
+        assert all(doc_len <= self.max_size for idx, doc_len in self.documents)
+        self._compute_batches()
+
+    def _compute_batches(self):
+        # Python's list.sort() implementation is guaranteed to be stable, so
+        # documents will be shuffled within each length bin
+        random.shuffle(self.documents)
+        self.documents.sort(key=lambda doc: doc[1])
+
+        # Each batch is a list of document indices
+        self.batches = [[]]
+        cur_max_doc_len = 0
+
+        for doc_idx, doc_len in self.documents:
+            # Would adding this sample to the batch cause us to exceed the max token count?
+            # If so, create a new batch and add this sample to it
+            cur_max_doc_len = max(cur_max_doc_len, doc_len)
+            batch_numel = cur_max_doc_len * (len(self.batches[-1]) + 1)
+
+            if batch_numel > self.max_size:
+                cur_max_doc_len = doc_len
+                self.batches.append([doc_idx])
+            else:
+                self.batches[-1].append(doc_idx)
+
+        # Now shuffle the batches so that we visit them in random order
+        random.shuffle(self.batches)
+
+    def __iter__(self):
+        return self
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __next__(self):
+        if not self.batches:
+            self._compute_batches()
+            raise StopIteration
+
+        batch = self.batches.pop()
+        assert batch, "Something's wrong, found a found zero-length batch"
+        return batch
 
 
 # Get a list of the columns in a Dataset or DatasetDict, asserting that they are the same across splits if the latter
@@ -90,19 +127,18 @@ def get_features_all_equal(dataset: Union[Dataset, DatasetDict]) -> dict:
 def total_dataset_len(dataset: Union[Dataset, DatasetDict]) -> int:
     return sum(len(split) for split in dataset.values()) if isinstance(dataset, DatasetDict) else len(dataset)
 
-def compute_uniform_sized_batches(lengths: Iterable[int], indices: List[int], max_size: int) -> Dict[str, list]:
-    # We're assuming the lengths are already sorted
-    token_cumcounts = np.cumsum(lengths)
-    starts, batch_sizes = [indices[0]], []
-    last_cumcount = 0
+def compute_uniform_sized_batches(lengths: List[int], max_size: int) -> Dict[str, list]:
+    starts = [0]
+    cur_token_count = 0
 
-    while len(token_cumcounts) > 0:
-        # searchsorted returns the index `i` s.t. cumcounts[i - 1] <= next cumcount < cumcounts[i]; therefore
-        # a batch from document 0 up to but not including document `i` will be the largest possible batch that
-        # doesn't exceed the max token count, and `i` will be the number of documents in the batch
-        batch_size = np.searchsorted(token_cumcounts, last_cumcount + max_size, side='right')
-        last_cumcount = token_cumcounts[batch_size - 1]
-        token_cumcounts = token_cumcounts[batch_size:]
-        batch_sizes.append(batch_size); starts.append(starts[-1] + batch_size)
+    for i, length in enumerate(lengths):
+        assert length <= max_size, f"Found a document with {length} tokens, but the max tokens per batch is {max_size}"
 
-    return {'start': starts[:-1], 'length': batch_sizes}
+        # Would adding this sample to the batch cause us to exceed the max token count?
+        # If so, create a new batch and add this sample to it
+        cur_token_count += length
+        if cur_token_count > max_size:
+            cur_token_count = length
+            starts.append(i)
+
+    return {'start': starts, 'length': np.diff(starts, append=len(lengths))}

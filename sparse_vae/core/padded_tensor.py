@@ -1,6 +1,7 @@
 from torch import Tensor
 from typing import *
 import logging
+import numpy as np
 
 
 _logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ class PaddedTensor(Tensor):
     def __torch_function__(self, func, types, args=(), kwargs=None):
         results = super().__torch_function__(func, types, args, kwargs)
 
-        if results == NotImplemented:
+        if not isinstance(results, np.ndarray) and results == NotImplemented:
             raw_kwargs = {k: v.as_raw() if isinstance(v, PaddedTensor) else v for k, v in kwargs.items()} if kwargs else {}
             raw_args = [arg.as_raw() if isinstance(arg, PaddedTensor) else arg for arg in args]
             results = func(*raw_args, **raw_kwargs)

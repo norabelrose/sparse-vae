@@ -4,6 +4,7 @@ from pytorch_lightning.profiler import PyTorchProfiler
 from sparse_vae import *
 from hparam_presets import hparam_presets
 from omegaconf import OmegaConf
+from warnings import filterwarnings
 import sys
 import torch
 
@@ -16,9 +17,11 @@ def main(args):
         # Override Trainer defaults but still allow them to be overridden by the command line
         'trainer': {
             'accumulate_grad_batches': 2,
+            'checkpoint_callback': False,
             'precision': 16
         }
     })
+    filterwarnings('ignore', category=UserWarning, module='torch')
 
     hparam_class = None
     model_class = None
@@ -36,7 +39,7 @@ def main(args):
 
     elif model_str == 'transformer-lm':
         hparam_class = TransformerHparams
-        model_class = Transformer
+        model_class = TransformerLanguageModel
         experiment = 'transformer-lm'
 
     elif model_str == 'transformer-vae':
@@ -82,13 +85,13 @@ def main(args):
             version=config.get('name')
         )
 
-    profiler = PyTorchProfiler(
-        profile_memory=True,
-        sort_by_key='cuda_memory_usage',
-        use_cuda=True
-    ) if config.get('profile') else None
+    # profiler = PyTorchProfiler(
+    #     profile_memory=True,
+    #     sort_by_key='cuda_memory_usage',
+    #     use_cuda=True
+    # ) if config.get('profile') else None
 
-    trainer = Trainer(**config.trainer, logger=logger, profiler=profiler)
+    trainer = Trainer(**config.trainer, logger=logger)
     trainer.fit(model, datamodule=data)
 
 

@@ -8,13 +8,12 @@ class TransformerLayer(nn.Module):
         num_heads: int,
         causal: bool = False,
         use_cross_attention: bool = False,
-        sparse_self_attention: Union[bool, SlidingWindowSparsityConfig] = False,
+        sparse_self_attention: Union[bool, int] = False,
         learned_queries: int = None,
     ):
         super(TransformerLayer, self).__init__()
 
-        self.attention = Attention(d_model, num_heads, causal, sparse=sparse_self_attention,
-                                   learned_queries=learned_queries)
+        self.attention = Attention(d_model, num_heads, causal, learned_queries=learned_queries, sparse=sparse_self_attention)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),

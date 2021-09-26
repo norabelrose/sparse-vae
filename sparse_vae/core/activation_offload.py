@@ -1,7 +1,8 @@
+from collections import OrderedDict
+from typing import Any, List, Tuple
 import torch
 from numpy import prod
 from torch import Tensor
-from typing import *
 
 
 # Literally copied from the collections module documentation- used to store CPU buffers
@@ -31,7 +32,7 @@ class ActivationOffloadFunction(torch.autograd.Function):
     max_checkpoints = 5
     offloaded_checkpoints = []  # Used as a stack; allows for prefetching during the backward pass
     prefetched_checkpoint = None
-    unused_cpu_buffers = LRUCache()  # Keys are IDs of Tensors, values are the Tensors themselves
+    free_cpu_buffers = LRUCache()  # Keys are (numel, dtype) tuples, values are CPU tensors
 
     @classmethod
     def forward(cls, ctx, run_function, preserve_rng_state, *args):
@@ -65,8 +66,8 @@ class ActivationOffloadFunction(torch.autograd.Function):
                 buffer = torch.empty_like(arg.flatten(), device='cpu', pin_memory=True)
 
             # Keep track of the shape of the tensor that this buffer is storing- buffers are all 1D
-            buffer.payload_device = arg.device
-            buffer.payload_shape = arg.shape
+            buffer.payload_device = arg.device  # type: ignore
+            buffer.payload_shape = arg.shape    # type: ignore
 
             # Asynchronously copy to CPU memory
             buffer[:arg.numel()].copy_(arg.flatten(), non_blocking=True)
@@ -80,17 +81,10 @@ class ActivationOffloadFunction(torch.autograd.Function):
 
     @classmethod
     def _pop_smallest_compatible_buffer(cls, data):
-        try:
-            # Return the smallest buffer that's big enough
-            candidates = filter(lambda buf: buf.numel() >= data.numel() and buf.dtype == data.dtype,
-                                cls.unused_cpu_buffers)
-            buffer = min(candidates, key=lambda buf: buf.numel())
-        except ValueError:
-            return None
-        else:
-            # Make sure no other op uses this buffer
-            del cls.unused_cpu_buffers[id(buffer)]
-            return buffer
+        # Return the smallest buffer that's big enough
+        candidates = filter(lambda x: x[0] >= data.numel() and x[1] == data.dtype, cls.free_cpu_buffers)
+        buf_key = min(candidates, key=lambda x: x[0], default=None)
+        return cls.free_cpu_buffers.pop(buf_key) if buf_key else None
 
     @classmethod
     def _load_offloaded_checkpoint(cls, offloaded_ckpt: List[Tensor], non_blocking: bool) -> List[Tensor]:
@@ -104,7 +98,7 @@ class ActivationOffloadFunction(torch.autograd.Function):
             gpu_ckpt.append(gpu_tensor.view(*payload_shape))
 
             # Recycle the buffer for future backward passes
-            cls.unused_cpu_buffers[id(buffer)] = buffer
+            cls.free_cpu_buffers[buffer.numel(), buffer.dtype] = buffer
 
         return gpu_ckpt
 
@@ -145,7 +139,7 @@ class ActivationOffloadFunction(torch.autograd.Function):
                 torch.set_rng_state(ctx.fwd_cpu_state)
                 if ctx.had_cuda_in_fwd:
                     set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
-            detached_inputs = detach_variable(inputs)
+            detached_inputs = detach_variable(inputs)   # type: ignore
             with torch.enable_grad(), torch.cuda.amp.autocast(ctx.had_autocast_in_fwd):
                 outputs = ctx.run_function(*detached_inputs)
 
@@ -172,8 +166,7 @@ class ActivationOffloadFunction(torch.autograd.Function):
 def get_device_states(*args) -> Tuple[List[int], List[torch.Tensor]]:
     # This will not error out if "arg" is a CPU tensor or a non-tensor type because
     # the conditionals short-circuit.
-    fwd_gpu_devices = list(set(arg.get_device() for arg in args
-                               if isinstance(arg, torch.Tensor) and arg.is_cuda))
+    fwd_gpu_devices = list(set(arg.get_device() for arg in args if isinstance(arg, torch.Tensor) and arg.is_cuda))
 
     fwd_gpu_states = []
     for device in fwd_gpu_devices:

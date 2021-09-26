@@ -32,11 +32,6 @@ class TextSamplingCallback(Callback):
         for sample in unconditional:
             logger.add_text("unconditional_sample", sample, global_step=langmodel.global_step)
 
-        # Weirdly PL wraps the actual training_step output in two lists and a dict
-        outputs = outputs[0][0]
-        if 'extra' in outputs:
-            outputs = outputs['extra']
-
         if 'posterior' in outputs:
             z = outputs['posterior'].mean[0, None]
         elif 'z' in outputs:
@@ -46,7 +41,7 @@ class TextSamplingCallback(Callback):
 
         if z is not None:
             langmodel.eval()
-            reconstructions = langmodel.sample(self.sample_max_len, z.shape[0], z=z)
+            reconstructions = langmodel.sample(self.sample_max_len, z.shape[0], z=z, temperature=0.7)
             langmodel.train()
 
             original = batch['token_ids'][0]
@@ -55,7 +50,7 @@ class TextSamplingCallback(Callback):
             reconstructed_strs = tokenizer.decode_batch(reconstructions.tolist())
             langmodel.log('train_bleu', bleu_score(
                 [x.split(' ') for x in reconstructed_strs], [[original_str.split(' ')]],
-                max_n=3, weights=[1.0 / 3.0] * 3
+                max_n=2, weights=[0.5] * 2
             ), on_step=True)
 
             logged_msg = "**Original**:  \n" + original_str

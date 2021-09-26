@@ -11,7 +11,7 @@ def main(args):
     elif model_str == 'lstm-lm':
         model_class = LSTMLanguageModel
     elif model_str == 'transformer-lm':
-        model_class = Transformer
+        model_class = TransformerLanguageModel
     elif model_str == 'transformer-vae':
         model_class = TransformerVAE
     else:
@@ -20,11 +20,12 @@ def main(args):
 
     model = model_class.load_from_checkpoint(path)
     model.freeze()
+    model.eval()
     model.start_token = 2
     model.end_token = 3
 
-    device = 'cuda:' + str(select_best_gpu())
-    model = model.to(device)
+    gpu = select_best_gpu()
+    model = model.to(gpu)
 
     hparams = TextDataModuleHparams()
     data = TextDataModule(hparams)
@@ -35,10 +36,10 @@ def main(args):
     pbar = tqdm(dataloader, desc="Testing", unit='batch')
     losses = []
     for i, batch in enumerate(pbar):
-        nll = model.test_step({k: v.to(device) for k, v in batch.items()}, i).item()
+        nll = model.test_step({k: v.to(gpu) for k, v in batch.items()}, i).item()
         losses.append(nll)
 
-        pbar.set_postfix(last=nll, avg=sum(losses) / len(losses))
+        pbar.set_postfix(ordered_dict=dict(last=nll, avg=sum(losses) / len(losses)))
 
     print("Average test loss: ", sum(losses) / len(losses))
 
