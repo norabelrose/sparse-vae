@@ -48,15 +48,8 @@ class ContinuousVAE(LanguageModel, ABC):
 
         log_prefix = stage + '_'
         self.log(log_prefix + 'kl', raw_kl.mean())
-        if stage == 'val':
-            self.log('val_active_units', q_of_z.mean, reduce_fx=self.compute_num_active_units)
-
+        
         return z, kl, q_of_z
-
-    # 'Active' latent dimensions are those whose variance across a batch/epoch exceeds 0.01
-    @staticmethod
-    def compute_num_active_units(z_means: Tensor, threshold = 0.01) -> Tensor:
-        return z_means.flatten(0, -2).var(dim=0).ge(threshold).sum()
 
     # Analytical formula for the joint log probability density of all z_i under a standard unit variance Gaussian.
     @staticmethod

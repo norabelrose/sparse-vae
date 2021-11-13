@@ -1,5 +1,4 @@
 import math
-from typing import Dict, Optional
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
@@ -9,9 +8,10 @@ from dataclasses import dataclass
 from functools import partial
 from omegaconf import DictConfig
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
-from pytorch_lightning.utilities.parsing import AttributeDict
 from torch import nn, Tensor
 from torch.optim.lr_scheduler import LambdaLR
+from triton import cdiv
+from typing import Dict, Optional
 from .padded_tensor import PaddedTensor
 from .rectified_adam import RAdam
 from .text_sampling_callback import TextSamplingCallback
@@ -26,7 +26,6 @@ class LanguageModelHparams(ABC):
     lr: float = 2e-4
     lr_decay_steps: Optional[int] = 250_000
 
-    vocab_size: int = 2 ** 15           # Maximum number of tokens representable with signed 16-bit integers
     start_token: Optional[int] = None   # If None, it's read off the datamodule's Tokenizer object
     end_token: Optional[int] = None
 
@@ -34,10 +33,7 @@ class LanguageModelHparams(ABC):
     log_samples: bool = True
 
 
-# noinspection PyMethodMayBeStatic
 class LanguageModel(pl.LightningModule, ABC):
-    hparams: AttributeDict  # Make the type checker happy
-    
     def __init__(self, hparams: DictConfig):
         super(LanguageModel, self).__init__()
         self.save_hyperparameters(hparams)
@@ -121,20 +117,9 @@ class LanguageModel(pl.LightningModule, ABC):
         logits = self.forward(batch)[..., :-1, :]
         return self.get_nll(logits, batch['token_ids'][..., 1:].long())
 
-    # def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int, dataloader_idx: int):
-    #     if self.global_step > 0 and self.global_step % 500 == 0:
-    #         logger = self.logger.experiment
-    #         opt = self.optimizers(use_pl_optimizer=False)
-    #         ratios = [opt.state[param].get('trust_ratio') for param in self.parameters()]
-    #         logger.add_histogram(
-    #             'trust_ratios',
-    #             torch.stack([ratio for ratio in ratios if ratio is not None]),  # noqa
-    #             global_step=self.global_step
-    #         )
-
     def on_after_backward(self):
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.hparams.grad_clip_threshold)
-        self.log('grad_norm', grad_norm)
+        self.log('grad_norm', grad_norm, on_step=True)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_index: int) -> Tensor:
         logits = self.forward(batch)[..., :-1, :]
@@ -175,7 +160,7 @@ def get_cosine_decay_with_warmup_schedule(decay_steps: int, warmup_steps: int):
 
 def robust_cross_entropy(logits, labels, weight = None):
     # logits, labels = logits.flatten(end_dim=1), labels.flatten()
-    chunks = (logits.numel() // 2 ** 31) + 1
+    chunks = cdiv(logits.numel(), 2 ** 30)
     if chunks == 1:
         return F.cross_entropy(logits.flatten(end_dim=1), labels.flatten(), ignore_index=0, weight=weight)
     else:

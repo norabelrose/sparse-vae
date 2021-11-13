@@ -1,3 +1,4 @@
+from torch.distributions.normal import Normal
 from .core import (
     Attention, GenerationState,
     ConditionalGaussian, ContinuousVAE, ContinuousVAEHparams, PaddedTensor, Perceiver,
@@ -30,25 +31,6 @@ class TransformerVAE(TransformerLanguageModel, ContinuousVAE):
         self.encoder_input_layer[0].weight = self.input_layer[0].weight
         self.q_of_z_given_x = ConditionalGaussian(hparams.d_model, hparams.latent_depth)
 
-        # if hparams.use_gpt2:
-        #     from transformers import GPT2LMHeadModel, GPT2Config
-#
-        #     if hparams.pretrained_decoder:
-        #         # Distilled 6-layer version of GPT-2
-        #         self.decoder = GPT2LMHeadModel.from_pretrained('distilgpt2')
-        #         if hparams.sparse_self_attention:
-        #             from deepspeed.ops.sparse_attention import SparseAttentionUtils
-#
-        #             SparseAttentionUtils.extend_position_embedding(self.decoder, max_position=25_008)
-        #             SparseAttentionUtils.replace_model_self_attention_with_sparse_self_attention(
-        #                 self.decoder, max_position=25_008,
-        #                 sparsity_config=SlidingWindowSparsityConfig(num_heads=8, window_size=hparams.attn_window_size)
-        #             )
-        #     else:
-        #         self.decoder = GPT2LMHeadModel(GPT2Config.from_pretrained('distilgpt2'))
-        # else:
-        #     self.decoder = Transformer(num_layers=hparams.num_layers, d_model=hparams.d_model)
-
         self.encoder = Perceiver(
             num_layers=hparams.num_layers // 2, num_latents=64, d_model=hparams.d_model, bottleneck_width=1
         )
@@ -59,9 +41,7 @@ class TransformerVAE(TransformerLanguageModel, ContinuousVAE):
 
     def training_step(self, batch: Dict[str, PaddedTensor], batch_index: int, stage: str = 'train'):
         original = batch['token_ids'].long()
-        if original.numel() > 2 ** 16:
-            breakpoint()
-
+        
         x = self.input_layer(original)
         encoder_out = self.encoder(x)
 
@@ -81,7 +61,7 @@ class TransformerVAE(TransformerLanguageModel, ContinuousVAE):
             self.log(stage + '_mc_mutual_info', mutual_info)
 
         if stage == 'train':
-            return {'loss': loss, 'posterior': posterior}
+            return {'loss': loss, 'posterior': Normal(loc=posterior.loc.detach(), scale=posterior.scale.detach())}
         elif stage == 'val':
             self.log('val_loss', nll + kl)
 
@@ -118,7 +98,6 @@ class TransformerVAE(TransformerLanguageModel, ContinuousVAE):
         if self.hparams.kl_weight < 1.0:
             return None
 
-        # noinspection PyUnreachableCode
         z = kwargs.pop('z', None)
         if z is None:
             z = torch.randn(batch_size, 1, self.hparams.latent_depth, device=self.device)

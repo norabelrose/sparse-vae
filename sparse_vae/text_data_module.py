@@ -1,6 +1,5 @@
 from datasets import Features, Value, Sequence, concatenate_datasets, load_dataset
 from multiprocessing import cpu_count
-from omegaconf import DictConfig
 from pathlib import Path
 from tokenizers.implementations import ByteLevelBPETokenizer
 from tokenizers.processors import RobertaProcessing
@@ -17,25 +16,23 @@ import pytorch_lightning as pl
 import torch
 
 
-@dataclass
-class TextDataModuleHparams:
-    tokens_per_batch: Optional[int] = 50_000
-
-    chunk_documents: bool = False
-    dataset_name: str = 'wikipedia'
-    dataset_config: Optional[str] = '20200501.en'
-    dataset_path: Optional[str] = None
-    min_tokens_per_sample: int = 512
-    max_tokens_per_sample: int = 25_000
-    split: Optional[str] = None         # Any string of the format supported by the HuggingFace datasets library
-    vocab_size: int = 2 ** 15
-
-
 # Base class for Text VAE data modules- takes care of boilerplate
-# noinspection PyAbstractClass
 class TextDataModule(pl.LightningDataModule):
-    def __init__(self, hparams: DictConfig):
+    def __init__(
+        self,
+        tokens_per_batch: Optional[int] = 50_000,
+
+        chunk_documents: bool = False,
+        dataset_name: str = 'wikipedia',
+        dataset_config: Optional[str] = '20200501.en',
+        dataset_path: Optional[str] = None,
+        min_tokens_per_sample: int = 512,
+        max_tokens_per_sample: int = 25_000,
+        split: Optional[str] = None,         # Any string of the format supported by the HuggingFace datasets library
+        vocab_size: int = 2 ** 15
+    ):
         super(TextDataModule, self).__init__()
+        self.save_hyperparameters()
 
         # Silence the very annoying wall of "Loading cached processed dataset" messages from HuggingFace datasets
         handler = logging.StreamHandler()
@@ -46,7 +43,6 @@ class TextDataModule(pl.LightningDataModule):
         # torch.multiprocessing.set_sharing_strategy('file_system')
         # self.dataset: Optional[Union[Dataset, DatasetDict]] = None
         self.extra_start_tokens = 0
-        self.hparams = hparams
 
         # This needs to be a multiple of the sparse attention block size (usually set to 16). Larger
         # padding multiples have the benefit of requiring fewer lookup tables to be computed, load-
@@ -55,7 +51,7 @@ class TextDataModule(pl.LightningDataModule):
 
         self._preproc_batch_size = None
         self._tokenizer = None
-        self.bytes_per_token = torch.ones(hparams.vocab_size)
+        self.bytes_per_token = torch.ones(vocab_size)
 
         # Make sure dataset save dir exists
         (Path.cwd() / 'sparse-vae-datasets').mkdir(exist_ok=True)
@@ -128,7 +124,7 @@ class TextDataModule(pl.LightningDataModule):
             # is terrible- val and test splits are too small- so we redo the split
             if self.hparams.dataset_name == 'pg19':
                 self.dataset = concatenate_datasets(list(self.dataset.values()))
-                self.dataset = self.dataset.rename_column('short_book_title', 'title')  # type: ignore
+                self.dataset = self.dataset.rename_column('short_book_title', 'title')
                 self.dataset = self.dataset.remove_columns(['publication_date', 'url'])
 
             # For PG19 & Wikipedia articles
@@ -144,14 +140,13 @@ class TextDataModule(pl.LightningDataModule):
                 tokenize, batched=True, batch_size=1000, features=Features(feat_dtypes),
                 fn_kwargs=dict(chunk=self.hparams.chunk_documents, tokenizer=self.tokenizer)
             )
-
+        
         total_docs = len(self.dataset)
         min_tokens = self.hparams.min_tokens_per_sample
         max_tokens = self.hparams.max_tokens_per_sample
         self.dataset = self.dataset.filter(
             lambda n: min_tokens <= n <= max_tokens, input_columns='num_tokens', num_proc=min(10, cpu_count()),
         )
-        print(f"Training on {len(self.dataset)} of {total_docs} documents.")
 
         # Silence annoying warnings from the tokenizers package after we spawn DataLoader processes
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -164,7 +159,9 @@ class TextDataModule(pl.LightningDataModule):
         # Annoyingly the wikipedia dataset *is* a DatasetDict but it only has a 'train' split
         elif 'test' not in self.dataset:
             self.dataset = self.dataset['train'].train_test_split(test_size=50_000, shuffle=True)  # noqa
-
+        
+        print(f"Training on {len(self.dataset['train'])} of {total_docs} documents.")
+        
         # Round up all the token counts to the nearest block size, to account for padding
         with self.dataset.formatted_as('numpy'):
             self.dataset = self.dataset.map(

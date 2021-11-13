@@ -1,3 +1,4 @@
+from .rotary_embedding import RotaryEmbedding
 from .transformer_layer import *
 
 
@@ -11,19 +12,20 @@ class Perceiver(nn.Module):
         assert num_layers > 1
         num_heads = d_model // 64
 
-        self.first_layer = TransformerLayer(d_model, num_heads, learned_queries=num_latents)
-        if bottleneck_width:
-            self.bottleneck = TransformerLayer(
-                d_model, num_heads, learned_queries=bottleneck_width
-            )
-            num_layers -= 1
-        else:
-            self.bottleneck = None
+        with RotaryEmbedding.embedding_context(d_model):
+            self.first_layer = TransformerLayer(d_model, num_heads, learned_queries=num_latents)
+            if bottleneck_width:
+                self.bottleneck = TransformerLayer(
+                    d_model, num_heads, learned_queries=bottleneck_width
+                )
+                num_layers -= 1
+            else:
+                self.bottleneck = None
 
-        self.middle_layers = nn.ModuleList([
-            TransformerLayer(d_model, num_heads, use_cross_attention=True)
-            for _ in range(num_layers - 1)
-        ])
+            self.middle_layers = nn.ModuleList([
+                TransformerLayer(d_model, num_heads, use_cross_attention=True)
+                for _ in range(num_layers - 1)
+            ])
         # self.self_attention = nn.Sequential(*[
         #     TransformerLayer(
         #         d_model, num_heads,

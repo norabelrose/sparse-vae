@@ -1,6 +1,9 @@
 # Based on the GitHub default .gitignore file for Python at
 # https://github.com/github/gitignore/blob/master/Python.gitignore
 
+# Don't include my silly Jupyter notebooks for playing around
+*.ipynb
+
 # Don't include OS and IDE-specific stuff
 .DS_Store
 .idea/

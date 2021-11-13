@@ -51,7 +51,7 @@ def main(args):
         print(f"Unrecognized model type '{model_str}'.")
         exit(1)
 
-    config.data = OmegaConf.structured(TextDataModuleHparams)
+    # config.data = OmegaConf.structured(TextDataModuleHparams)
     config.model = OmegaConf.structured(hparam_class)
 
     config.merge_with_dotlist(args[2:])
@@ -71,7 +71,7 @@ def main(args):
         config.trainer.resume_from_checkpoint = str(get_checkpoint_path_for_name(experiment, ckpt_name))
 
     model = model_class(config.model)
-    data = TextDataModule(hparams=config.data)
+    data = TextDataModule(**config.get('data', {}))
 
     if config.get('fp16_weights'):
         torch.set_default_dtype(torch.float16)

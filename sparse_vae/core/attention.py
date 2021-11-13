@@ -16,12 +16,14 @@ class Attention(nn.Module):
         causal = False,
         sparse: Union[bool, int] = False,
         learned_queries: int = None,
+        max_length: int = 10000,
     ):
         super().__init__()
 
         self.causal = causal
         self.d_model = d_model
         self.num_heads = num_heads
+        self.max_length = max_length
         assert d_model % num_heads == 0, "num_heads must divide d_model evenly"
 
         # We can use learned queries to extract a single vector or a fixed size sequence of vectors out of a sequence
@@ -35,6 +37,7 @@ class Attention(nn.Module):
         self.v_linear = nn.Linear(d_model, d_model)
         self.output_linear = nn.Linear(d_model, d_model)
         self.pos_linear = nn.Linear(d_model, d_model)
+        # self.rotary_embedding = RotaryEmbedding.current_embedding
 
         self.cache_index = 0
         self.key_cache = None
@@ -46,17 +49,25 @@ class Attention(nn.Module):
             self.sparse_attention = None
 
     def forward(self, q: Optional[Tensor], k: PaddedTensor, v: Tensor):
+        max_pos = self.max_length if not self.sparse_attention else 2 * self.sparse_attention.window_size * self.sparse_attention.block_size
+
         # When using learned queries, we ignore the q argument- it's expected that you'll set that to None
         if self.learned_queries is not None:
             q = self.learned_queries.expand(k.shape[0], *self.learned_queries.shape[1:])
         else:
             # Position-Infused Attention from "Shortformer" paper
-            q = self.q_linear(q + positional_encodings_like(q, self.cache_index))
-            # q = self.q_linear(q)
-            # q = encode_position_rotary(q)
+            # q = self.q_linear(q + positional_encodings_like(q, self.cache_index, max_pos=self.max_length))
+            q = self.q_linear(q)
+            q = encode_position_rotary(q, self.cache_index, max_pos=max_pos)
 
-        k = k + positional_encodings_like(k, self.cache_index)
+            # freqs = self.rotary_embedding(torch.arange(q.shape[1], device=q.device), cache_key = q.shape[1])
+            # q = apply_rotary_emb(freqs, q)
+
+        # k = k + positional_encodings_like(k, self.cache_index, max_pos=self.max_length)
         k, v = self.k_linear(k), self.v_linear(v)
+
+        # freqs = self.rotary_embedding(torch.arange(k.shape[1], device=k.device), cache_key = k.shape[1])
+        k = encode_position_rotary(k, self.cache_index, max_pos=max_pos)
         # k = encode_position_rotary(k)
         if self.kv_cache_length:
             k, v = self._update_kv_cache(k, v)
@@ -64,18 +75,18 @@ class Attention(nn.Module):
         mask = getattr(k, 'padding', None)
         q, k, v = (rearrange(x, '... l (h d) -> ... h l d', h=self.num_heads) for x in (q, k, v))
 
-        if self.causal and self.key_cache is None:
-            q_len = q.shape[-2]
-            causal_mask = torch.ones(q_len, q_len, device=q.device, dtype=torch.bool).triu(1)
-        else:
-            causal_mask = None
-
         if self.sparse_attention and self.key_cache is None:
-            mask = mask * -1e7 if mask is not None else None  # DeepSpeed *adds* this mask to the attn scores
-            causal_mask = causal_mask * -1e7 if causal_mask is not None else None
-            output = self.sparse_attention(q, k, v, attn_mask=causal_mask, key_padding_mask=mask)
+            mask = mask * -1e7 if mask is not None else None
+            # causal_mask = causal_mask * -1e7 if causal_mask is not None else None
+            output = self.sparse_attention(q, k, v, key_padding_mask=mask)
         else:
             scores = q @ k.transpose(-1, -2) * k.shape[-1] ** -0.5
+
+            if self.causal and self.key_cache is None:
+                q_len = q.shape[-2]
+                causal_mask = torch.ones(q_len, q_len, device=q.device, dtype=torch.bool).triu(1)
+            else:
+                causal_mask = None
 
             # Note that we only apply the upper triangular causal mask during training;
             # during autoregressive decoding there's no "right context" to mask out
@@ -157,23 +168,20 @@ class Attention(nn.Module):
             module.value_cache = module.value_cache[live_sample_mask, ...]
 
 
-def positional_encodings_like(x: Tensor, start: int = 0):
+def positional_encodings_like(x: Tensor, start: int = 0, max_pos: int = 10000) -> Tensor:
     length = x.shape[-2]
-    return get_positional_encodings(start, start + length, x.shape[-1], x.device, x.dtype)
+    return get_positional_encodings(start, start + length, x.shape[-1], x.device, x.dtype, max_pos=max_pos)
 
 @lru_cache(maxsize=10)
-def get_positional_encodings(start: int, end: int, d_model: int, device, dtype) -> Tensor:
+def get_positional_encodings(start: int, end: int, d_model: int, device, dtype, max_pos: int = 10000) -> Tensor:
     position_ids = torch.arange(start, end, 1.0, dtype=dtype, device=device)
-    return gather_positional_encodings(position_ids, d_model, device, dtype)
 
-# Gather positional encodings for a tensor of positional indices
-def gather_positional_encodings(positions: Tensor, d_model: int, device: torch.device, dtype: torch.dtype) -> Tensor:
     d_model_half = d_model // 2
     frequencies = torch.arange(d_model_half, dtype=dtype, device=device)
-    periods = 10000 ** (-frequencies / d_model_half)
+    periods = max_pos ** (-frequencies / d_model_half)
 
-    angles = positions[:, None] * periods[None]  # noqa; Outer product
-    encodings = torch.empty(positions.shape[0], d_model, dtype=dtype, device=device)
+    angles = position_ids[:, None] * periods[None]
+    encodings = torch.empty(position_ids.shape[0], d_model, dtype=dtype, device=device)
     encodings[:, ::2] = angles.sin()
     encodings[:, 1::2] = angles.cos()
     return encodings
@@ -183,18 +191,18 @@ def gather_positional_encodings(positions: Tensor, d_model: int, device: torch.d
 # by an angle proportional to their position in the sequence. This has the effect that inner
 # products between queries and keys are scaled in proportion to the cosine of their scaled
 # relative distances.
-def encode_position_rotary(x: Tensor):
+def encode_position_rotary(x: Tensor, start: int = 0, max_pos: int = 10000) -> Tensor:
     d_model_half = x.shape[-1] // 2
     frequencies = torch.arange(d_model_half, dtype=x.dtype, device=x.device)
-    positions = torch.arange(x.shape[-2], dtype=x.dtype, device=x.device)
-    theta = 10000 ** (-frequencies / d_model_half)  # [d_model_half]
+    positions = torch.arange(start, start + x.shape[-2], dtype=x.dtype, device=x.device)
+    theta = max_pos ** (-frequencies / d_model_half)  # [d_model_half]
     angles = positions[:, None] * theta             # [seq_len, d_model_half]
 
-    x_grouped = x.unflatten(-1, (d_model_half, 2))  # [...seq_len, d_model_half, 2]
+    x_grouped = rearrange(x, '... (d r) -> ... d r', r=2)
     x_swapped = x_grouped.roll(1, dims=-1)
     x_swapped[..., 0].neg_()
     x_grouped *= angles[..., None].cos()
     x_swapped *= angles[..., None].sin()
 
     x_grouped += x_swapped
-    return x_grouped.flatten(-2)
+    return rearrange(x_grouped, '... d r -> ... (d r)')

@@ -123,17 +123,17 @@ hparam_presets = {
         'data': dict(
             dataset_name='wikipedia',
             dataset_config='20200501.en',
-            tokens_per_batch=50_000,
+            tokens_per_batch=100_000,
             min_tokens_per_sample=512,
-            max_tokens_per_sample=25_000
+            max_tokens_per_sample=50_000
         ),
         'model': dict(
             d_model=512,
             grad_checkpointing=True,
             grad_clip_threshold=150.0,
             init_scale=0.02,
-            attn_window_size=12,
-            kl_weight_start=0.2,
+            attn_window_size=8,
+            kl_weight_start=0.1,
             kl_weight_end=1.0,
             kl_annealing_steps=8000,
             latent_depth=64,
@@ -151,9 +151,9 @@ hparam_presets = {
         'data': dict(
             dataset_name='pg19',
             dataset_config=None,
-            tokens_per_batch=55_296,
+            tokens_per_batch=102_912,
             min_tokens_per_sample=512,
-            max_tokens_per_sample=55_296
+            max_tokens_per_sample=102_400
         ),
         'model': dict(
             # adam_beta1=0.95,
@@ -161,12 +161,12 @@ hparam_presets = {
             grad_checkpointing=True,
             grad_clip_threshold=150.0,
             init_scale=0.02,
-            attn_window_size=16,
-            kl_weight_start=0.3,
+            attn_window_size=6,
+            kl_weight_start=0.1,
             kl_weight_end=1.0,
             kl_annealing_steps=8000,
             latent_depth=64,
-            lr=1e-3,
+            lr=3e-4,
             num_layers=6,
             sparse_self_attention=True,
             tie_embedding_weights=True
@@ -176,4 +176,27 @@ hparam_presets = {
             val_check_interval=0.5
         )
     },
+    'nonvae-pg19': {
+        'data': dict(
+            dataset_name='pg19',
+            dataset_config=None,
+            tokens_per_batch=92_672,
+            min_tokens_per_sample=512,
+            max_tokens_per_sample=92_160
+        ),
+        'model': dict(
+            d_model=512,
+            grad_checkpointing=True,
+            grad_clip_threshold=150.0,
+            init_scale=0.02,
+            lr=3e-4,
+            num_layers=6,
+            sparse_self_attention=True,
+            tie_embedding_weights=True
+        ),
+        'trainer': dict(
+            accumulate_grad_batches=4,
+            val_check_interval=0.5
+        )
+    }
 }
